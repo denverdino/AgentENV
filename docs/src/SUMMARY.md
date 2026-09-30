@@ -80,6 +80,8 @@
 # Developer Internals
 
 - [System Architecture](./internals/architecture.md)
+- [Dragonball Hypervisor Replacement (Approved Design)](./internals/dragonball-hypervisor-design.md)
+- [Dragonball M0 Implementation Plan](./internals/dragonball-m0-implementation-plan.md)
 - [Sandbox Network Architecture](./internals/networking.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
