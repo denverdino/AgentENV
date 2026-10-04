@@ -91,10 +91,30 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
         bail!("PVM virtualization mode is only supported on x86_64 hosts");
     }
 
-    std::fs::create_dir_all(deps_path)?;
-
-    ensure_firecracker(config, manifest, &arch).await?;
-    ensure_kernel(config, manifest, &arch).await?;
+    if crate::sandbox::selected::BACKEND == "firecracker" {
+        std::fs::create_dir_all(deps_path)?;
+        ensure_firecracker(config, manifest, &arch).await?;
+        ensure_kernel(config, manifest, &arch).await?;
+    } else {
+        anyhow::ensure!(
+            config.virtualization_mode == VirtualizationMode::Kvm,
+            "Dragonball requires KVM"
+        );
+        let runner = config
+            .dragonball
+            .binary_path
+            .as_deref()
+            .context("Dragonball requires dragonball.binary_path")?;
+        let kernel = config
+            .kernel
+            .image_path
+            .as_deref()
+            .context("Dragonball requires an explicit kernel.image_path")?;
+        validate_explicit_file("dragonball.binary_path", runner, true)?;
+        validate_explicit_file("kernel.image_path", kernel, false)?;
+        validate_dragonball_tools(config)?;
+        std::fs::create_dir_all(deps_path)?;
+    }
 
     // regctl is a runtime dependency for all registry access, not just tools
     // drive extraction, so it remains provisioned for explicit tools drives.
@@ -111,6 +131,23 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
 
     info!(path = %deps_path.display(), "dependencies ready");
     Ok(())
+}
+
+fn validate_dragonball_tools(config: &AppConfig) -> Result<()> {
+    let tools = config
+        .tools
+        .drive_path
+        .as_deref()
+        .context("Dragonball requires an explicit qualified tools.drive_path (plain ext4)")?;
+    anyhow::ensure!(
+        config
+            .tools
+            .version
+            .as_deref()
+            .is_some_and(|version| !version.trim().is_empty()),
+        "Dragonball requires tools.version for the qualified tools image"
+    );
+    validate_explicit_file("tools.drive_path", tools, false)
 }
 
 async fn ensure_firecracker(
@@ -895,6 +932,9 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
         // endpoint, matching the snapshot repository client's behavior.
         "defaultAddressingStyle": addressing_style,
     });
+    if let Some(timeout) = oss.timeout_secs {
+        config["timeoutSecs"] = timeout.get().into();
+    }
 
     match credential_source {
         CredentialSource::Static(credential) => {
@@ -934,6 +974,48 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        feature = "hypervisor-dragonball",
+        not(feature = "hypervisor-firecracker")
+    ))]
+    #[tokio::test]
+    async fn dragonball_setup_rejects_missing_assets_without_provisioning_firecracker() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let deps = root.path().join("deps");
+        let mut config = crate::cfg::AppConfig::default();
+        config.firecracker.binary_path = Some(root.path().join("missing-firecracker"));
+        let error = super::ensure(&config, &deps).await.unwrap_err();
+        assert!(error.to_string().contains("dragonball.binary_path"));
+        assert!(!deps.exists());
+        let runner = root.path().join("runner");
+        std::fs::write(&runner, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        config.dragonball.binary_path = Some(runner);
+        let error = super::ensure(&config, &deps).await.unwrap_err();
+        assert!(error.to_string().contains("kernel.image_path"));
+        assert!(!deps.exists());
+        let kernel = root.path().join("kernel");
+        std::fs::write(&kernel, b"kernel").unwrap();
+        config.kernel.image_path = Some(kernel);
+        let error = super::validate_dragonball_tools(&config).unwrap_err();
+        assert!(error.to_string().contains("tools.drive_path"));
+        let tools = root.path().join("tools.ext4");
+        std::fs::write(&tools, b"tools").unwrap();
+        config.tools.drive_path = Some(tools);
+        config.tools.version = None;
+        assert!(super::validate_dragonball_tools(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("tools.version"));
+        config.tools.version = Some("qualified-test".into());
+        super::validate_dragonball_tools(&config).unwrap();
+        config.virtualization_mode = crate::virtualization::VirtualizationMode::Pvm;
+        let error = super::ensure(&config, &deps).await.unwrap_err();
+        assert!(error.to_string().contains("KVM"));
+        assert!(!deps.exists());
+    }
+
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_legacy_tools_drive,
         ensure_tools, file_exists_nonempty, overlaybd_credential_fields,
@@ -958,6 +1040,7 @@ mod tests {
             region: Some(" cn-hangzhou ".to_string()),
             addressing_style: None,
             cache_max_size_gb: Some(4),
+            timeout_secs: None,
         }
     }
 
@@ -994,6 +1077,38 @@ mod tests {
             r#"{"p2pConfig":{"enable":false,"address":"http://old"},"registryFsVersion":"v2"}"#,
         )
         .expect("write global config");
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_propagates_timeout() {
+        let config: OssBackendConfig = toml::from_str(
+            r#"
+endpoint = "http://127.0.0.1:9000"
+bucket = "snapshots"
+region = "us-east-1"
+access_key_id = "test"
+access_key_secret = "test-secret"
+timeout_secs = 120
+"#,
+        )
+        .expect("parse explicit OSS timeout");
+        let runtime = overlaybd_runtime_oss_config(&config).expect("derive runtime config");
+        assert_eq!(runtime["timeoutSecs"], 120);
+    }
+
+    #[test]
+    fn oss_config_rejects_zero_timeout() {
+        let result = toml::from_str::<OssBackendConfig>(
+            r#"
+endpoint = "http://127.0.0.1:9000"
+bucket = "snapshots"
+timeout_secs = 0
+"#,
+        );
+        assert!(
+            result.is_err(),
+            "zero must not disable the storage deadline"
+        );
     }
 
     #[test]

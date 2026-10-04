@@ -1,19 +1,35 @@
 mod access;
 mod backend;
 pub(crate) mod custom_extension;
+#[cfg(all(
+    feature = "hypervisor-dragonball",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub mod dragonball;
 mod envd;
 mod extra_drive;
+#[cfg(feature = "hypervisor-firecracker")]
 mod firecracker;
 mod guest_volumes;
 pub(crate) mod logs;
+pub mod selected;
+pub use selected::SelectedSandboxFactory;
+pub(crate) mod memory_snapshot;
+pub(crate) mod metadata;
 mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
 mod process;
+mod process_vm_reader;
+pub mod restore_identity;
 mod runtime_versions;
+pub(crate) mod startup_pack;
+pub(crate) mod storage_snapshot;
 mod tools_image;
 mod ublk;
+mod volume_snapshot;
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -34,16 +50,19 @@ pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
     publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo, TemplateSandboxFactory,
 };
 pub use envd::EnvdApi;
+#[cfg(feature = "hypervisor-firecracker")]
 pub(crate) use firecracker::record_startup_pack;
+#[cfg(feature = "hypervisor-firecracker")]
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use logs::SandboxLogEntry;
+pub use metadata::SandboxMetadataDocument;
 pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{

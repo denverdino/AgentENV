@@ -50,6 +50,12 @@ socket_poll_ms = 1
 # Setting serial_dir alone does not enable logging.
 # log_level = "Info"
 
+[dragonball]
+# Used only by a Dragonball-only build. No automatic runner download.
+# binary_path = "/opt/agentenv/bin/aenv-dragonball"
+# Dragonball also requires an explicit, qualified kernel.image_path and
+# tools.drive_path with tools.version below (plain ext4, not OCI image.json).
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
@@ -285,6 +291,7 @@ workers = 1
 # access_key_secret = "..."
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
+# timeout_secs = 30                  # Per-attempt OSS operation/I/O timeout; positive seconds
 
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.

@@ -7,7 +7,11 @@ mod version;
 pub use crate::types::{ExternalLayer, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId};
 pub use artifacts::SNAPSHOT_ARTIFACT_LAYOUT;
 pub use drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
-pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub(crate) use manifest::{default_backend, MANIFEST_FORMAT_VERSION};
+pub use manifest::{
+    SandboxSnapshotManifest, SnapshotVolumeDevice, SnapshotVolumeSlot, DRAGONBALL_BACKEND,
+    FIRECRACKER_BACKEND,
+};
 pub(crate) use snapshot::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use snapshot::{
     CommandContext, CommittedSnapshot, PersistedDiskImagePublication, RunnableSnapshot,

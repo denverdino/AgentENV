@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -24,6 +25,7 @@ use crate::types::SandboxResources;
 /// Tie a template startup recording to its temporary build workspace. Both
 /// the recorder task and the detached repository continuation receive a lease,
 /// so either can safely outlive synchronous publication.
+#[cfg(test)]
 fn spawn_template_startup_recording<F>(
     recorder: F,
     workspace: Arc<TempDir>,
@@ -135,7 +137,6 @@ impl TemplateBuilder {
                 .into());
             }
         };
-        let workspace_lease = Arc::new(context.workspace);
         let mut resources = context.resources;
         resources.disk_size_mib = build_execution
             .manifest
@@ -151,44 +152,27 @@ impl TemplateBuilder {
         // no-op task when the feature is disabled or the backend carries no
         // capture payload); a detached continuation uploads the manifest once
         // the trace lands.
-        let recording = build_execution
-            .capture_artifacts
-            .and_then(|artifacts| {
-                artifacts
-                    .downcast::<crate::sandbox::FirecrackerSnapshotConfig>()
-                    .ok()
-            })
-            .map(|snapshot_config| {
-                spawn_template_startup_recording(
-                    crate::sandbox::record_startup_pack(
-                        *snapshot_config,
-                        build_execution.output_dir.clone(),
-                    ),
-                    Arc::clone(&workspace_lease),
-                )
-            });
-        let record = snapshot_manager
-            .publish(
-                SnapshotPublishMetadata {
-                    id: context.build_snapshot_id.clone(),
-                    alias: context.alias.clone(),
-                    source: SnapshotPublishSource::Template,
-                    context: build_execution.build_context,
-                    startup: build_execution.startup,
-                    resources,
-                    runtime_versions: build_execution.runtime_versions,
-                    virtualization_mode: context.virtualization_mode,
-                    image_configs: build_execution.image_configs,
-                    volume_snapshots: Vec::new(),
-                    // Template builds intentionally do not propagate the base
-                    // snapshot's extension custom config: it is a per-sandbox
-                    // user setting, not part of the built image content.
-                    custom_extension_params: None,
-                },
-                build_execution.manifest,
-                recording,
-            )
-            .await?;
+        let record = crate::sandbox::publish_captured(
+            snapshot_manager,
+            SnapshotPublishMetadata {
+                id: context.build_snapshot_id.clone(),
+                alias: context.alias.clone(),
+                source: SnapshotPublishSource::Template,
+                context: build_execution.build_context,
+                startup: build_execution.startup,
+                resources,
+                runtime_versions: build_execution.runtime_versions,
+                virtualization_mode: context.virtualization_mode,
+                image_configs: build_execution.image_configs,
+                volume_snapshots: Vec::new(),
+                // Template builds intentionally do not propagate the base
+                // snapshot's extension custom config: it is a per-sandbox
+                // user setting, not part of the built image content.
+                custom_extension_params: None,
+            },
+            build_execution.capture,
+        )
+        .await?;
 
         info!("template snapshot published");
         Ok(record)
@@ -273,7 +257,7 @@ impl TemplateBuilder {
             startup: Self::startup_from_spec(spec),
             override_startup: spec.overrides_startup(),
             resources,
-            workspace,
+            workspace: Arc::new(workspace),
             steps: spec.steps().to_vec(),
             base,
             cpu_config_json: self.current_cpu_config(),
@@ -345,7 +329,7 @@ impl TemplateBuilder {
             startup,
             override_startup,
             resources,
-            workspace,
+            workspace: Arc::new(workspace),
             steps: spec.steps().to_vec(),
             base: TemplateBuildBase::Snapshot {
                 base_snapshot: Box::new(base_snapshot.clone()),

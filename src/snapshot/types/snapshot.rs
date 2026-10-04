@@ -57,6 +57,9 @@ impl SnapshotPublishMetadata {
             startup: None,
             resources: SandboxResources::default(),
             runtime_versions: SnapshotRuntimeVersions {
+                backend: crate::sandbox::FIRECRACKER_BACKEND.into(),
+                vmm_version: None,
+                restore_identity: None,
                 kernel_version: "kernel".to_string(),
                 firecracker_version: "firecracker".to_string(),
                 envd_version: "envd".to_string(),
@@ -370,6 +373,9 @@ impl CommittedSnapshot {
             context: CommandContext::default(),
             startup: None,
             runtime_versions: SnapshotRuntimeVersions {
+                backend: crate::sandbox::FIRECRACKER_BACKEND.into(),
+                vmm_version: None,
+                restore_identity: None,
                 kernel_version: "kernel".to_string(),
                 firecracker_version: "firecracker".to_string(),
                 envd_version: "envd".to_string(),
@@ -614,6 +620,7 @@ impl RunnableSnapshot {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "hypervisor-firecracker")]
     pub(crate) fn from_test_legacy_manifest(
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,

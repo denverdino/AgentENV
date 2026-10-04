@@ -329,16 +329,13 @@ impl SandboxBackend for MockSandboxBackend {
     async fn capture_to_dir(
         &mut self,
         _at: &std::path::Path,
-    ) -> SandboxCaptureResult<(
-        crate::sandbox::SandboxSnapshotManifest,
-        Option<Box<dyn std::any::Any + Send>>,
-    )> {
+    ) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         self.behavior
             .apply_capture_result(MockOperation::CaptureToDir)
             .await?;
-        Ok((
+        Ok(CapturedSandboxSnapshot::new(
             crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]),
-            None,
+            MockCapturedSnapshot,
         ))
     }
 
@@ -454,6 +451,14 @@ impl Default for MockBackendFactory {
 }
 
 impl SandboxBackendFactory for MockBackendFactory {
+    fn backend(&self) -> &str {
+        crate::sandbox::FIRECRACKER_BACKEND
+    }
+
+    fn validate_snapshot(&self, _snapshot: &RunnableSnapshot) -> Result<()> {
+        Ok(())
+    }
+
     fn build(
         &self,
         _build_spec: FreshSandboxBuildSpec,

@@ -17,15 +17,16 @@ use super::config::{
     PersistentSnapshotRootGuard, MAX_EXTRA_DRIVES,
 };
 use super::mmds::MmdsMetadata;
-use super::overlaybd_snapshot::{
-    build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
-};
+use super::overlaybd_snapshot::convert_dirty_memory_to_overlaybd;
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
+};
+use crate::sandbox::storage_snapshot::{
+    build_mem_snapshot_image_config, restack_snapshot_overlaybd_device,
+    restack_snapshot_overlaybd_rootfs,
 };
 use crate::snapshot::SandboxSnapshotManifest;
 
@@ -153,20 +154,7 @@ fn reconcile_disk_rate_limiter(
     Ok(Box::new(rl))
 }
 
-pub(super) fn managed_snapshot_base() -> PathBuf {
-    ConfigManager::global_config()
-        .firecracker
-        .work_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("aenv"))
-        .join("managed-snapshots")
-}
-
-const VOLUME_DRIVE_PLACEHOLDER_SIZE: u64 = 4096;
-
-fn volume_drive_slot_id(index: usize) -> String {
-    format!("{VOLUME_DRIVE_SLOT_PREFIX}{index}")
-}
+use crate::sandbox::storage_snapshot::{managed_snapshot_base, StorageCaptureOwner};
 
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
 
@@ -195,6 +183,7 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    template_build: bool,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -206,8 +195,7 @@ pub struct FirecrackerSandbox {
 #[derive(Debug)]
 pub struct FirecrackerCaptureArtifacts {
     snapshot_config: FirecrackerSnapshotConfig,
-    snapshot_dir: PathBuf,
-    snapshot_root: Arc<PersistentSnapshotRootGuard>,
+    storage: StorageCaptureOwner,
 }
 
 #[derive(Clone, Debug)]
@@ -259,8 +247,7 @@ impl FirecrackerCaptureArtifacts {
     ) -> Self {
         Self {
             snapshot_config,
-            snapshot_dir,
-            snapshot_root,
+            storage: StorageCaptureOwner::new(snapshot_dir, snapshot_root),
         }
     }
 
@@ -273,14 +260,14 @@ impl FirecrackerCaptureArtifacts {
 
     /// Directory holding this capture's artifacts (vm_state.bin's parent).
     pub fn snapshot_dir(&self) -> &Path {
-        &self.snapshot_dir
+        &self.storage.snapshot_dir
     }
 
     /// Clone of the lease keeping the capture directory alive. Moved into
     /// the detached startup-manifest recording/upload task, which can
     /// outlive the synchronous publish flow.
     pub(crate) fn snapshot_root_guard(&self) -> Arc<PersistentSnapshotRootGuard> {
-        Arc::clone(&self.snapshot_root)
+        Arc::clone(&self.storage.snapshot_root)
     }
 }
 
@@ -385,18 +372,17 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(CapturedSandboxSnapshot::new(
             manifest,
             FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
-        ))
+        )
+        .with_recording_factory(super::startup_pack::startup_recording))
     }
 
-    async fn capture_to_dir(
-        &mut self,
-        at: &Path,
-    ) -> SandboxCaptureResult<(
-        SandboxSnapshotManifest,
-        Option<Box<dyn std::any::Any + Send>>,
-    )> {
+    async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         match self.pause_to_dir(at).await {
-            Ok((snapshot_config, manifest)) => Ok((manifest, Some(Box::new(snapshot_config)))),
+            Ok((snapshot_config, manifest)) => Ok(CapturedSandboxSnapshot::new(
+                manifest,
+                (snapshot_config, at.to_path_buf()),
+            )
+            .with_recording_factory(super::startup_pack::template_startup_recording)),
             Err(error) => self.recover_capture_failure("capture", error).await,
         }
     }
@@ -620,6 +606,17 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    /// Template work is internal and must not create an extension lifecycle.
+    pub(super) fn for_template_build(mut self) -> Self {
+        self.template_build = true;
+        self.current_custom_extension_params = None;
+        match &mut self.launch {
+            LaunchMode::Fresh(config) => config.common.custom_extension_params = None,
+            LaunchMode::Resume(config) => config.common.custom_extension_params = None,
+        }
+        self
+    }
+
     /// Identity of this sandbox, including for capture provenance.
     pub fn sandbox_id(&self) -> SandboxId {
         self.id
@@ -1504,6 +1501,7 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
+            template_build: false,
         })
     }
 
@@ -1583,7 +1581,7 @@ impl FirecrackerSandbox {
         append_boot_arg(&mut boot_args, GUEST_ARP_NOTIFY_BOOT_ARG);
 
         // ── Custom extension hook: start-fresh (may contribute extra boot args) ──
-        if let Some(client) = CustomExtensionClient::global() {
+        if let Some(client) = CustomExtensionClient::global().filter(|_| !self.template_build) {
             let mut guard = CustomExtensionHookGuard::new(client, self.id);
             let extra_boot_args = guard
                 .start_fresh(
@@ -1692,7 +1690,7 @@ impl FirecrackerSandbox {
         // ── Custom extension hook: start-resume ──
         // Pack-recording VMs are throwaway recorders: hooks must not fire
         // for them (the extension would see a phantom sandbox start/stop).
-        if !config.pack_recording {
+        if !config.pack_recording && !self.template_build {
             if let Some(client) = CustomExtensionClient::global() {
                 let mut guard = CustomExtensionHookGuard::new(client, self.id);
                 guard
@@ -2309,36 +2307,11 @@ impl FirecrackerSandbox {
         physical_extra_drive_count: usize,
         count: usize,
     ) -> Result<Vec<DriveMount>> {
-        let mut slots = Vec::with_capacity(count);
-        for index in 0..count {
-            let drive_id = volume_drive_slot_id(index);
-            let attachment_name = format!("{drive_id}.img");
-            let attachment_path = self.work_dir.path().join(&attachment_name);
-            let file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&attachment_path)
-                .with_context(|| {
-                    format!("create reserved volume drive {}", attachment_path.display())
-                })?;
-            file.set_len(VOLUME_DRIVE_PLACEHOLDER_SIZE)
-                .with_context(|| {
-                    format!("size reserved volume drive {}", attachment_path.display())
-                })?;
-            slots.push(DriveMount {
-                drive_id,
-                attachment_path: PathBuf::from(attachment_name),
-                read_only: false,
-            });
-        }
-        anyhow::ensure!(
-            physical_extra_drive_count + slots.len() <= MAX_EXTRA_DRIVES,
-            "{} physical extra drives plus {} volume slots exceed Firecracker's {}-drive limit",
+        crate::sandbox::extra_drive::prepare_volume_drive_slots(
             physical_extra_drive_count,
-            slots.len(),
-            MAX_EXTRA_DRIVES
-        );
-        Ok(slots)
+            count,
+            self.work_dir.path(),
+        )
     }
 
     fn bind_volume_drive_slot(&self, slot: &DriveMount, drive: &DriveMount) -> Result<()> {
@@ -2440,37 +2413,11 @@ impl FirecrackerSandbox {
     }
 
     async fn snapshot_persistent_volume_drives(&self) -> Result<()> {
-        let extra_drives = &self.launch.common().extra_drives;
-        anyhow::ensure!(
-            extra_drives.len() == self.resources.extra_drive_runtimes.len(),
-            "extra drive bookkeeping mismatch: {} configured drives but {} prepared devices",
-            extra_drives.len(),
-            self.resources.extra_drive_runtimes.len()
-        );
-
-        for (drive, runtime) in extra_drives
-            .iter()
-            .zip(&self.resources.extra_drive_runtimes)
-        {
-            let Some(output_dir) = drive.snapshot_output_dir() else {
-                continue;
-            };
-            if drive.read_only() {
-                continue;
-            }
-            let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
-            restack_snapshot_overlaybd_device(
-                &runtime.device,
-                false,
-                &runtime.image_config_path,
-                output_dir,
-                &snapshot_layer_file_name,
-                "volume",
-            )
-            .await
-            .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
-        }
-        Ok(())
+        crate::sandbox::volume_snapshot::snapshot_persistent_volume_drives(
+            &self.launch.common().extra_drives,
+            &self.resources.extra_drive_runtimes,
+        )
+        .await
     }
 
     fn runtime_image_config_paths(&self) -> Vec<PathBuf> {

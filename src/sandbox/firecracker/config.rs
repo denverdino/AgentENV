@@ -54,40 +54,7 @@ const DEFAULT_BOOT_ARGS: &str = "\
     damon_reclaim.wmarks_interval=1000000";
 pub(super) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
 
-#[derive(Debug)]
-pub(crate) struct PersistentSnapshotRootGuard {
-    path: PathBuf,
-}
-
-impl PersistentSnapshotRootGuard {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub(crate) async fn prepare(&self) -> Result<()> {
-        tokio::fs::create_dir_all(&self.path)
-            .await
-            .with_context(|| format!("create managed snapshot root {}", self.path.display()))
-    }
-}
-
-impl Drop for PersistentSnapshotRootGuard {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_dir_all(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    snapshot_root = %self.path.display(),
-                    error = %err,
-                    "failed to clean up managed snapshot root"
-                );
-            }
-        }
-    }
-}
+pub(crate) use crate::sandbox::storage_snapshot::PersistentSnapshotRootGuard;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct FirecrackerRuntimePolicy {

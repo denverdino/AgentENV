@@ -40,6 +40,7 @@ impl OssRepository {
             config.prefix().to_string(),
             config.credential_source(),
             config.addressing_style(),
+            config.timeout(),
         )?);
         Ok(Self::new(
             client,
@@ -208,6 +209,7 @@ mod tests {
             "region".to_string(),
             "prefix".to_string(),
             CredentialSource::Anonymous,
+            None,
             None,
         )
         .expect("oss client");

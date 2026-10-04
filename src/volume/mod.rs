@@ -960,6 +960,116 @@ mod tests {
             .expect("volume manager")
     }
 
+    #[tokio::test]
+    async fn volume_mount_rejects_uploading_and_failed_without_ownership_changes() {
+        for status in [VolumeStatus::Uploading, VolumeStatus::Failed] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager_at(root.path()).await;
+            let mut record = published_volume(root.path(), &manager).await;
+            record.status = status;
+            manager.persist_catalog(&record).await.unwrap();
+            manager.cache_record(record.clone()).await;
+            let error = manager.reserve(&record.id, "new-owner").await.unwrap_err();
+            match status {
+                VolumeStatus::Uploading => assert!(matches!(error, VolumeError::Uploading(_))),
+                VolumeStatus::Failed => assert!(matches!(error, VolumeError::Failed(_))),
+                VolumeStatus::Ready => unreachable!(),
+            }
+            assert!(manager
+                .get(&record.id)
+                .await
+                .unwrap()
+                .reserved_by_sandbox_id
+                .is_none());
+            assert!(manager
+                .create_child_for_owner(
+                    &record.id,
+                    "child".into(),
+                    VolumeMode::Exclusive,
+                    1024,
+                    "source",
+                    "child"
+                )
+                .await
+                .is_err());
+            assert_eq!(manager.list_page(None, 100).await.unwrap().records.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn volume_fork_partial_allocation_rollback_preserves_source_and_shared_ro_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager_at(root.path()).await;
+        let parent = published_volume(root.path(), &manager).await;
+        manager.reserve(&parent.id, "source").await.unwrap();
+        let first = manager
+            .create_child_for_owner(
+                &parent.id,
+                "first".into(),
+                VolumeMode::Exclusive,
+                1024,
+                "source",
+                "first-owner",
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .create_child_for_owner(
+                &parent.id,
+                "bad".into(),
+                VolumeMode::Exclusive,
+                1025,
+                "source",
+                "bad-owner"
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            manager
+                .get(&parent.id)
+                .await
+                .unwrap()
+                .reserved_by_sandbox_id
+                .as_deref(),
+            Some("source")
+        );
+        assert_eq!(
+            manager
+                .get(&first.id)
+                .await
+                .unwrap()
+                .reserved_by_sandbox_id
+                .as_deref(),
+            Some("first-owner")
+        );
+        assert!(manager.delete(&first.id).await.is_err());
+        manager
+            .replace_owner_for("first-owner", None, std::slice::from_ref(&first.id))
+            .await
+            .unwrap();
+        manager.delete(&first.id).await.unwrap();
+        assert_eq!(manager.list_page(None, 100).await.unwrap().records.len(), 1);
+        let ro = manager
+            .create_child_for_owner(
+                &parent.id,
+                "ro".into(),
+                VolumeMode::ReadOnly,
+                1024,
+                "source",
+                "first-owner",
+            )
+            .await
+            .unwrap();
+        manager.reserve(&ro.id, "second-owner").await.unwrap();
+        manager
+            .replace_owner_for("first-owner", None, std::slice::from_ref(&ro.id))
+            .await
+            .unwrap();
+        let ro = manager.get(&ro.id).await.unwrap();
+        assert_eq!(ro.read_only_mounts, ["second-owner"]);
+        assert!(manager.delete(&ro.id).await.is_err());
+    }
+
     async fn published_volume(root: &Path, manager: &VolumeManager) -> VolumeRecord {
         let layer = root.join("base.commit");
         std::fs::write(&layer, b"published volume layer").unwrap();

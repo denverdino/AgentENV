@@ -8,6 +8,72 @@ use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 use crate::types::ExtraDrive;
+pub(crate) use crate::types::{
+    validate_mount_path, validate_sub_path, ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID,
+    VOLUME_DRIVE_SLOT_PREFIX,
+};
+
+pub(crate) fn prepare_volume_drive_slots(
+    physical_extra_drive_count: usize,
+    count: usize,
+    work_dir: &Path,
+) -> Result<Vec<DriveMount>> {
+    let mut slots = Vec::with_capacity(count);
+    for index in 0..count {
+        let drive_id = format!("{VOLUME_DRIVE_SLOT_PREFIX}{index}");
+        let attachment_name = format!("{drive_id}.img");
+        let attachment_path = work_dir.join(&attachment_name);
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&attachment_path)
+            .with_context(|| {
+                format!("create reserved volume drive {}", attachment_path.display())
+            })?;
+        file.set_len(4096)
+            .with_context(|| format!("size reserved volume drive {}", attachment_path.display()))?;
+        slots.push(DriveMount {
+            drive_id,
+            attachment_path: PathBuf::from(attachment_name),
+            read_only: false,
+        });
+    }
+    anyhow::ensure!(
+        physical_extra_drive_count + slots.len() <= 24,
+        "{} physical extra drives plus {} volume slots exceed Firecracker's {}-drive limit",
+        physical_extra_drive_count,
+        slots.len(),
+        24
+    );
+    Ok(slots)
+}
+
+/// vda = tools, vdb = user rootfs, vdc onward = physical extras, then reserved slots.
+pub(crate) fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
+    if extra_drives.is_empty() {
+        return None;
+    }
+    assert!(
+        extra_drives.len() <= 24,
+        "too many extra drives for guest naming: {} > {}",
+        extra_drives.len(),
+        24
+    );
+    let entries: Vec<String> = extra_drives
+        .iter()
+        .enumerate()
+        .map(|(i, drive)| {
+            let dev_letter = (b'c' + i as u8) as char;
+            let mut entry = format!("vd{}:{}", dev_letter, drive.mount_path().display());
+            if let Some(sub_path) = drive.sub_path() {
+                entry.push(':');
+                entry.push_str(&sub_path.display().to_string());
+            }
+            entry
+        })
+        .collect();
+    Some(format!("agentenv_drives={}", entries.join(",")))
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DriveMount {

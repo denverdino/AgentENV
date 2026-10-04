@@ -88,6 +88,37 @@ build-server:
 build-server-release:
 	$(CARGO) build --release -p agentenv --bin server
 
+.PHONY: build-server-dragonball
+build-server-dragonball:
+	$(CARGO) build -p agentenv --bin server --no-default-features --features hypervisor-dragonball
+	$(CARGO) build -p agentenv-dragonball-runner --bin aenv-dragonball --locked
+
+.PHONY: build-server-dragonball-release package-dragonball test-package-dragonball
+build-server-dragonball-release:
+	$(CARGO) build --release --locked -p agentenv --bin server --no-default-features --features hypervisor-dragonball
+	$(CARGO) build --release --locked -p agentenv-dragonball-runner --bin aenv-dragonball -p uvm-ublk-daemon --bin uvm-ublk-daemon
+
+# Qualified input hashes/versions/licenses must be provided explicitly.
+package-dragonball:
+	bash scripts/release/package-dragonball.sh "$(DRAGONBALL_PACKAGE_INPUTS)" "$(DRAGONBALL_PACKAGE_OUTPUT)"
+
+test-package-dragonball:
+	bash scripts/tests/verify-package-dragonball.sh
+
+.PHONY: test-hypervisor-packaging
+test-hypervisor-packaging: test-package-dragonball
+	bash scripts/tests/verify-package-firecracker.sh
+
+# Capability-independent contracts, including each compile-time product.
+.PHONY: test-hypervisor-regression
+test-hypervisor-regression: test-hypervisor-packaging test-dragonball-m4-unit
+	for backend in firecracker dragonball; do \
+		for filter in orchestrator::persistence::file_backed sandbox::restore_identity; do \
+			$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv --lib --no-default-features --features hypervisor-$$backend $$filter --locked; \
+		done; \
+	done
+	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv --example recovery_inventory --locked
+
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
 
@@ -122,7 +153,11 @@ coverage:
 
 test: test-agent test-envd test-ublk
 
-test-unit:
+.PHONY: test-vmm-unit
+test-vmm-unit:
+	$(CARGO) test -p agentenv-vmm-protocol -p agentenv-dragonball-runner --locked
+
+test-unit: test-vmm-unit
 	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
 	$(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
@@ -130,6 +165,107 @@ test-unit:
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
 	bash scripts/tests/verify-install-buildctl.sh
+
+.PHONY: test-dragonball-m0
+test-dragonball-m0: prepare-agent-test-state
+	$(MAKE) build-ublk PROFILE=debug
+	$(CARGO) build -p agentenv-dragonball-runner --locked
+	$(CARGO) test -p agentenv-vmm-protocol -p agentenv-dragonball-runner --locked
+	$(CARGO) test -p agentenv --features hypervisor-dragonball --lib dragonball:: --locked
+	$(CAPABILITY_TEST_ENV) $(CARGO) run --example dragonball_m0_assets -- \
+		"$(DEBUG_PROFILE_DIR)/aenv-dragonball" "$(AENV_TEST_STATE_DIR)/m0-assets.json"
+	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
+	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
+	AENV_DRAGONBALL_M0_ASSETS="$(AENV_TEST_STATE_DIR)/m0-assets.json" \
+	$(CAPABILITY_TEST_ENV) $(subst scripts/run-with-capabilities.sh,scripts/tests/run-dragonball-m0.sh,$(CAPABILITY_RUNNER)) \
+	$(CARGO) test -p agentenv --features hypervisor-dragonball --test integration dragonball_m0 --locked -- --ignored --test-threads=1 --nocapture
+
+# Opt-in qualification only: the configured kernel/tools must be the qualified
+# Dragonball profile. The default test target above continues to use Firecracker.
+.PHONY: test-dragonball-m1
+test-dragonball-m1: prepare-agent-test-state
+	$(MAKE) build-ublk PROFILE=debug
+	$(CARGO) build -p agentenv-dragonball-runner --locked
+	$(CARGO) build -p agentenv-dragonball-runner --example reply-fault --locked
+	$(CARGO) test -p agentenv-vmm-protocol -p agentenv-dragonball-runner --locked
+	$(CARGO) test -p agentenv-dragonball-runner --lib runtime_adapter_preserves_full_memory_export_budget --locked -- --ignored
+	$(CARGO) test -p agentenv --features hypervisor-dragonball --lib dragonball:: --locked
+	$(CAPABILITY_TEST_ENV) $(CARGO) run --example dragonball_m0_assets -- \
+		"$(DEBUG_PROFILE_DIR)/aenv-dragonball" "$(AENV_TEST_STATE_DIR)/m1-assets.json"
+	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
+	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
+	AENV_DRAGONBALL_M0_ASSETS="$(AENV_TEST_STATE_DIR)/m1-assets.json" \
+	AENV_DRAGONBALL_FAULT_RUNNER="$(DEBUG_PROFILE_DIR)/examples/reply-fault" \
+	$(CAPABILITY_TEST_ENV) $(subst scripts/run-with-capabilities.sh,scripts/tests/run-dragonball-m1.sh,$(CAPABILITY_RUNNER)) \
+	$(CARGO) test -p agentenv --features hypervisor-dragonball --test integration dragonball_m1 --locked -- --ignored --test-threads=1 --nocapture
+
+# Independent DB-only qualification. Runner/kernel/tools are explicit assets;
+# setup must not provision a Firecracker binary for this product configuration.
+.PHONY: test-dragonball-m2
+test-dragonball-m2:
+	test "$$(id -u)" != 0
+	test -n "$${AENV_CONFIG_PATH:-}" && test -r "$$AENV_CONFIG_PATH"
+	$(CARGO) build -p agentenv-dragonball-runner --bin aenv-dragonball --example reply-fault --locked
+	$(CAPABILITY_TEST_ENV) $(CARGO) run -p agentenv --no-default-features --features hypervisor-dragonball --bin server -- --setup-only
+	$(MAKE) build-ublk PROFILE=debug
+	$(CARGO) test -p agentenv-vmm-protocol -p agentenv-dragonball-runner --locked
+	$(CARGO) test -p agentenv-dragonball-runner --test runtime_cli --locked -- --ignored --test-threads=1
+	$(CARGO) test -p agentenv --no-default-features --features hypervisor-dragonball --lib --locked
+	$(CAPABILITY_TEST_ENV) $(CARGO) run -p agentenv --no-default-features --features hypervisor-dragonball --example dragonball_m0_assets -- \
+		"$(DEBUG_PROFILE_DIR)/aenv-dragonball" "$(AENV_TEST_STATE_DIR)/m2-assets.json"
+	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
+	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
+	AENV_DRAGONBALL_M0_ASSETS="$(AENV_TEST_STATE_DIR)/m2-assets.json" \
+	AENV_DRAGONBALL_RUNTIME_RUNNER="$(DEBUG_PROFILE_DIR)/aenv-dragonball" \
+	AENV_DRAGONBALL_FAULT_RUNNER="$(DEBUG_PROFILE_DIR)/examples/reply-fault" \
+	$(CAPABILITY_TEST_ENV) $(subst scripts/run-with-capabilities.sh,scripts/tests/run-dragonball-m2.sh,$(CAPABILITY_RUNNER)) \
+	$(CARGO) test -p agentenv --no-default-features --features hypervisor-dragonball --test integration --locked -- dragonball_m1 dragonball_m2 --ignored --test-threads=1 --nocapture
+
+# Native S3/registry fixtures are explicitly provisioned, never silently skipped.
+.PHONY: test-dragonball-m3
+test-dragonball-m3:
+	test "$$(id -u)" != 0
+	test -n "$${AENV_TEST_STATE_DIR:-}" && test -d "$$AENV_TEST_STATE_DIR"
+	test -n "$${AENV_CONFIG_PATH:-}" && test -r "$$AENV_CONFIG_PATH"
+	test -n "$${AENV_M3_S3_SERVER:-}" && test -x "$$AENV_M3_S3_SERVER"
+	test -n "$${AENV_M3_REGISTRY_SERVER:-}" && test -x "$$AENV_M3_REGISTRY_SERVER"
+	$(MAKE) build-server-dragonball build-ublk PROFILE=debug
+	$(CAPABILITY_TEST_ENV) $(CARGO) run -p agentenv --no-default-features --features hypervisor-dragonball --bin server -- --setup-only
+	$(CAPABILITY_TEST_ENV) $(CARGO) run -p agentenv --no-default-features --features hypervisor-dragonball --example dragonball_m0_assets -- \
+		"$(DEBUG_PROFILE_DIR)/aenv-dragonball" "$(AENV_TEST_STATE_DIR)/m3-assets.json"
+	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
+	AENV_DRAGONBALL_SERVER="$(DEBUG_PROFILE_DIR)/server" \
+	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
+	AENV_DRAGONBALL_M0_ASSETS="$(AENV_TEST_STATE_DIR)/m3-assets.json" \
+	$(CAPABILITY_TEST_ENV) $(subst scripts/run-with-capabilities.sh,scripts/tests/run-dragonball-m3.sh,$(CAPABILITY_RUNNER)) \
+	$(CARGO) test -p agentenv --no-default-features --features hypervisor-dragonball --test integration dragonball_m3 --locked -- --ignored --test-threads=1 --nocapture
+
+# Opt-in: root only orchestrates isolated namespaces; all workloads use aenv.
+# Explicit immutable binaries/assets in JSON; no build or installation here.
+.PHONY: test-dragonball-m4 test-dragonball-m4-unit test-dragonball-m4-physical test-dragonball-m4-performance
+test-dragonball-m4-unit:
+	python3 scripts/tests/test_dragonball_m4_lab.py
+	python3 scripts/tests/test_dragonball_m4_scenarios.py
+	python3 scripts/tests/test_dragonball_m4_metrics.py
+	python3 scripts/tests/test_dragonball_m4_cleanup.py
+	python3 scripts/tests/test_dragonball_m4_physical.py
+	python3 scripts/tests/test_dragonball_m4_performance.py
+	python3 scripts/tests/test_dragonball_m4_entries.py
+
+test-dragonball-m4:
+	@test -n "$(AENV_M4_INPUTS)" -a -f "$(AENV_M4_INPUTS)" || { echo "AENV_M4_INPUTS must name an explicit JSON input file" >&2; exit 1; }
+	python3 scripts/tests/dragonball_m4_scenarios.py --inputs "$(AENV_M4_INPUTS)" --scenario "$(or $(AENV_M4_SCENARIO),restore)"
+
+test-dragonball-m4-physical:
+	@test -n "$(AENV_M4_HOSTS)" -a -f "$(AENV_M4_HOSTS)" || { echo "AENV_M4_HOSTS must name an explicit two-host JSON file" >&2; exit 1; }
+	@test -n "$(AENV_M4_OUTPUT)" || { echo "AENV_M4_OUTPUT must name a new evidence directory" >&2; exit 1; }
+	python3 scripts/tests/dragonball_m4_physical.py --hosts "$(AENV_M4_HOSTS)" --output "$(AENV_M4_OUTPUT)"
+
+# Default to a capacity plan; launching the matrix requires explicit CLI arguments.
+AENV_M4_PERF_ARGS ?= --plan-only
+test-dragonball-m4-performance:
+	@test -n "$(AENV_M4_INPUTS)" -a -f "$(AENV_M4_INPUTS)" || { echo "AENV_M4_INPUTS must name an explicit JSON input file" >&2; exit 1; }
+	python3 scripts/tests/dragonball_m4_performance.py --inputs "$(AENV_M4_INPUTS)" $(AENV_M4_PERF_ARGS)
 
 test-integration: test-agent-integration test-envd test-ublk
 

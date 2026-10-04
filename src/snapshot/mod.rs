@@ -23,6 +23,7 @@ pub use startup_pack::{
     ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,
     MEMORY_STARTUP_TRACE_ARTIFACT,
 };
+pub(crate) use types::{default_backend, MANIFEST_FORMAT_VERSION};
 pub(crate) use types::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
@@ -31,4 +32,7 @@ pub use types::{
     SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand,
     TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
-pub use types::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use types::{
+    SandboxSnapshotManifest, SnapshotVolumeDevice, SnapshotVolumeSlot, DRAGONBALL_BACKEND,
+    FIRECRACKER_BACKEND,
+};

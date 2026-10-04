@@ -2,6 +2,8 @@ mod address_plan;
 mod egress_proxy;
 mod iptables_util;
 mod manager;
+#[cfg(feature = "hypervisor-dragonball")]
+pub(crate) mod metadata;
 mod policy;
 mod resolver;
 mod slot;

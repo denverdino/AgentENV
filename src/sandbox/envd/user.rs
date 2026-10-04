@@ -93,6 +93,35 @@ struct ResolvedUser {
     passwd_entry: Option<String>,
 }
 
+fn append_passwd_script(entry: &str, passwd: &str, busybox: &str) -> String {
+    // Cooperate with shadow's passwd.lock protocol. A plain append can be lost
+    // when guest init's usermod replaces the inode from an earlier read.
+    // Publish a complete PID with a hard link; never remove another writer's lock.
+    format!(
+        r#"set -eu
+passwd={passwd}
+bb={busybox}
+ticket="$passwd.agentenv.$$"
+locked=no
+umask 077
+(set -C; printf '%s\000' "$$" > "$ticket")
+trap '[ "$locked" != yes ] || $bb rm -f -- "$passwd.lock"; $bb rm -f -- "$ticket"' EXIT
+trap 'exit 1' HUP INT TERM
+attempt=0
+until $bb ln -T -- "$ticket" "$passwd.lock" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || {{ echo 'timed out acquiring passwd lock' >&2; exit 1; }}
+    $bb sleep 0.05
+done
+locked=yes
+printf '\n%s\n' {entry} >> "$passwd"
+"#,
+        passwd = shell_quote(passwd),
+        busybox = shell_quote(busybox),
+        entry = shell_quote(entry),
+    )
+}
+
 fn parse_id(value: &[u8]) -> Result<u32> {
     let value = std::str::from_utf8(value).context("invalid Dockerfile user/group ID")?;
     let id = value
@@ -337,6 +366,74 @@ mod tests {
 
     const PASSWD: &str =
         "root:x:0:0:root:/root:/bin/sh\nnonroot:x:65532:65532::/home/nonroot:/sbin/nologin\n";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_append_serializes_with_shadow_passwd_replacement() -> Result<()> {
+        use std::{
+            fs,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let directory = tempfile::tempdir()?;
+        let passwd = directory.path().join("passwd");
+        let lock = directory.path().join("passwd.lock");
+        fs::write(&passwd, PASSWD)?;
+        fs::write(&lock, format!("{}\0", std::process::id()))?;
+        let entry = "aenv-1000-1000:x:1000:1000::/:/bin/sh";
+        // Empty busybox prefix uses host utilities for the exact guest script.
+        let mut child = Command::new("sh")
+            .args([
+                "-ec",
+                &append_passwd_script(entry, passwd.to_str().unwrap(), ""),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let result = (|| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                ensure!(
+                    child.try_wait()?.is_none(),
+                    "account append ignored an existing passwd writer lock"
+                );
+                if fs::read_dir(directory.path())?.any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("passwd.agentenv.")
+                }) {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "account writer did not reach lock acquisition"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ensure!(
+                fs::read_to_string(&passwd)? == PASSWD,
+                "wrote through another writer's lock"
+            );
+            // usermod commits by replacing the inode after reading its old contents.
+            let external = format!("{PASSWD}external:x:123:123::/:/bin/sh\n");
+            let replacement = directory.path().join("replacement");
+            fs::write(&replacement, &external)?;
+            fs::rename(replacement, &passwd)?;
+            fs::remove_file(&lock)?;
+            ensure!(child.wait()?.success(), "account append failed");
+            ensure!(
+                fs::read_to_string(&passwd)? == format!("{external}\n{entry}\n"),
+                "concurrent passwd replacement lost an account"
+            );
+            ensure!(!lock.exists(), "account writer retained passwd lock");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        result
+    }
 
     #[test]
     fn numeric_users_resolve_to_existing_guest_accounts() {

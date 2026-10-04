@@ -10,6 +10,7 @@ members = [
     "adev",
     "crates/aenv",
     "crates/benchmarks",
+    "crates/dragonball-runner",
     "crates/e2e-tests",
     "crates/linux-cap",
     "crates/observability",
@@ -17,6 +18,7 @@ members = [
     "crates/test-support",
     "crates/shell-util",
     "crates/warm-pool",
+    "crates/vmm-protocol",
     "src/api/generated",
     "src/custom_extension_api/generated",
     "thirdparty/firecracker-client",
@@ -34,6 +36,9 @@ version = "0.2.4"
 path = "src/lib.rs"
 
 [features]
+default = ["hypervisor-firecracker"]
+hypervisor-firecracker = ["dep:firecracker_client"]
+hypervisor-dragonball = []
 vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 
 [dev-dependencies]
@@ -42,7 +47,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
-firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }
+agentenv-vmm-protocol = { path = "crates/vmm-protocol" }
+firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client", optional = true }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }
 tokio = { version = "1", features = ["full"] }

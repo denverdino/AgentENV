@@ -114,6 +114,7 @@ mod tests {
             "prefix".to_string(),
             CredentialSource::Anonymous,
             None,
+            None,
         )
         .expect("oss client");
         OssRepository::new(

@@ -44,6 +44,59 @@ impl Default for FirecrackerSandboxFactory {
     }
 }
 
+#[async_trait::async_trait(?Send)]
+impl crate::sandbox::TemplateSandboxFactory for FirecrackerSandboxFactory {
+    type Sandbox = FirecrackerSandbox;
+
+    fn build_template(
+        &self,
+        spec: FreshSandboxBuildSpec,
+        launch: SandboxLaunchConfig,
+        ublk: Option<UblkConfig>,
+    ) -> Result<Self::Sandbox> {
+        let mut config =
+            FirecrackerSandboxConfig::from_global_config_with_user_image(OverlaybdConfig {
+                image_config_path: spec.image_config_path,
+                read_only: false,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            })?;
+        config.vcpu_count = spec.resources.cpu_count;
+        config.mem_size_mib = spec.resources.memory_mib;
+        config.common.ublk_config = ublk;
+        config.common.cpu_config_json = self
+            .cpu_config_arc
+            .as_ref()
+            .and_then(|cpu| cpu.read().unwrap().clone());
+        config.common.env_vars =
+            (!spec.context.env_vars.is_empty()).then_some(spec.context.env_vars);
+        config.common.default_user = spec.context.user;
+        config.common.default_workdir = Some(spec.context.workdir);
+        config = config.apply_launch_config(&launch);
+        Ok(FirecrackerSandbox::new_with_id(config, launch.sandbox_id)?.for_template_build())
+    }
+
+    fn build_template_from_snapshot(
+        &self,
+        snapshot: &RunnableSnapshot,
+        launch: SandboxLaunchConfig,
+    ) -> Result<Self::Sandbox> {
+        Ok(FirecrackerSandbox::from_snapshot(snapshot, &launch)?.for_template_build())
+    }
+
+    async fn template_versions(
+        &self,
+        sandbox: &Self::Sandbox,
+        tools_version: String,
+    ) -> Result<crate::snapshot::SnapshotRuntimeVersions> {
+        crate::sandbox::probe_runtime_versions(
+            sandbox,
+            ConfigManager::global_config().resolved_firecracker_binary_path(),
+            tools_version,
+        )
+        .await
+    }
+}
+
 fn filter_extra_boot_args(
     extra_boot_args: Option<&str>,
     allowed_prefixes: &[String],
@@ -75,6 +128,15 @@ fn is_allowed_extra_boot_arg(arg: &str, allowed_prefixes: &[String]) -> bool {
 }
 
 impl SandboxBackendFactory for FirecrackerSandboxFactory {
+    fn backend(&self) -> &str {
+        crate::sandbox::FIRECRACKER_BACKEND
+    }
+
+    fn validate_snapshot(&self, snapshot: &RunnableSnapshot) -> Result<()> {
+        super::config::FirecrackerSnapshotConfig::from_runnable_snapshot(snapshot)?;
+        Ok(())
+    }
+
     fn build(
         &self,
         build_spec: FreshSandboxBuildSpec,

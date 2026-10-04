@@ -14,6 +14,12 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/check-hypervisor-builds.sh"
+      - "scripts/tests/verify-package-*.sh"
+      - "scripts/tests/*dragonball_m4*.py"
+      - "scripts/tests/dragonball_m4_workload.c"
+      - "scripts/release/**"
+      - "config/**"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
   push:
@@ -28,6 +34,12 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/check-hypervisor-builds.sh"
+      - "scripts/tests/verify-package-*.sh"
+      - "scripts/tests/*dragonball_m4*.py"
+      - "scripts/tests/dragonball_m4_workload.c"
+      - "scripts/release/**"
+      - "config/**"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
 
@@ -60,5 +72,23 @@ jobs:
       - uses: ./.github/actions/rust-ci-setup
       - name: Configure ublk test host
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
-      - name: Unit tests
+      - name: Unit tests including VMM protocol and Dragonball runner
         run: make test-unit PROFILE=debug
+
+  hypervisor-components:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          components: clippy
+      - name: Single-backend products and dependency isolation
+        run: bash scripts/tests/check-hypervisor-builds.sh
+      - name: Packaging, recovery inventory, lifecycle readers and lab contracts
+        run: make test-hypervisor-regression
+      - name: Linux anonymous-memory workload contract
+        run: python3 scripts/tests/test_dragonball_m4_performance.py --linux-workload
+      - name: Lint each independent backend
+        run: |
+          cargo clippy -p agentenv --all-targets --no-default-features --features hypervisor-firecracker -- -D warnings
+          cargo clippy -p agentenv --all-targets --no-default-features --features hypervisor-dragonball -- -D warnings

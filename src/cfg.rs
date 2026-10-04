@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -99,6 +100,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
+    pub dragonball: DragonballConfig,
+    #[config(nested)]
     pub kernel: KernelConfig,
     #[config(nested)]
     pub tools: ToolsConfig,
@@ -157,6 +160,13 @@ pub struct PosixFsBackendConfig {
         parse_env = parse_required_path
     )]
     pub snapshot_store: PathBuf,
+}
+
+#[derive(Debug, Clone, Config)]
+pub struct DragonballConfig {
+    /// Explicit, qualified runner; packaged separately from the node server.
+    #[config(env = "AENV_DRAGONBALL_BINARY_PATH", parse_env = parse_required_path)]
+    pub binary_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Config)]
@@ -450,6 +460,8 @@ pub struct OssBackendConfig {
     #[serde(alias = "addressingStyle", alias = "addressing-style")]
     pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
+    /// Per-attempt OSS operation and I/O timeout. Unset keeps the 30s default.
+    pub timeout_secs: Option<NonZeroU64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -717,6 +729,7 @@ impl_config_default!(
     BackendConfig,
     PosixFsBackendConfig,
     FirecrackerConfig,
+    DragonballConfig,
     PoolTomlConfig,
     PoolComponentConfig,
     FirecrackerProcessPoolConfig,
@@ -771,13 +784,16 @@ impl AppConfig {
         })
     }
 
+    pub fn resolved_kernel_version(&self) -> &str {
+        self.kernel
+            .version
+            .as_deref()
+            .unwrap_or(&self.manifest_kernel().version)
+    }
+
     pub fn resolved_kernel_image_path(&self) -> PathBuf {
         self.kernel.image_path.clone().unwrap_or_else(|| {
-            let version = self
-                .kernel
-                .version
-                .as_deref()
-                .unwrap_or(&self.manifest_kernel().version);
+            let version = self.resolved_kernel_version();
             self.deps_path
                 .join("kernel")
                 .join(version)
@@ -1011,6 +1027,10 @@ impl AppConfig {
         let home_path = self.home_path.clone();
 
         if let Some(binary_path) = self.firecracker.binary_path.as_mut() {
+            *binary_path = resolve_path(&home_path, config_dir, binary_path);
+        }
+
+        if let Some(binary_path) = self.dragonball.binary_path.as_mut() {
             *binary_path = resolve_path(&home_path, config_dir, binary_path);
         }
 
@@ -1940,6 +1960,7 @@ mod tests {
             ..Default::default()
         };
         config.firecracker.binary_path = Some("./bin/firecracker".into());
+        config.dragonball.binary_path = Some("./bin/aenv-dragonball".into());
         config.firecracker.work_dir = Some("./firecracker-work".into());
         config.firecracker.serial_dir = Some("./firecracker-serial".into());
         config.kernel.image_path = Some("./kernel/vmlinux.bin".into());
@@ -1959,6 +1980,10 @@ mod tests {
         config.normalize(&config_dir)?;
 
         assert_eq!(config.deps_path, config_dir.join("env"));
+        assert_eq!(
+            config.dragonball.binary_path,
+            Some(config_dir.join("bin/aenv-dragonball"))
+        );
         assert_eq!(
             config.firecracker.binary_path,
             Some(config_dir.join("bin/firecracker"))

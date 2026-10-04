@@ -61,6 +61,11 @@ impl SandboxPersistenceError {
 #[async_trait]
 /// Persistence interface for sandbox records and artifacts.
 pub trait SandboxPersister: Send + Sync {
+    /// False when unreadable records make their complete layer graph unknowable.
+    fn allows_image_gc(&self) -> bool {
+        true
+    }
+
     /// Load all persisted sandbox metadata.
     async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
     where
@@ -74,6 +79,14 @@ pub trait SandboxPersister: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<Option<PathBuf>>;
+
+    async fn allocate_artifact_root_for_backend(
+        &self,
+        sandbox_id: &SandboxId,
+        _backend: &str,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        self.allocate_artifact_root(sandbox_id).await
+    }
 
     /// Persist metadata and runtime state for a paused sandbox.
     async fn persist_paused(

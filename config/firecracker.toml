@@ -1,0 +1,21 @@
+# Linux/amd64 KVM candidate template, not a replacement for other platform packages.
+# Paths are relative to this config. Packaging pins the qualified asset versions.
+home_path = "../state"
+runtime_path = "../run"
+deps_path = "../deps"
+virtualization_mode = "kvm"
+
+[firecracker]
+binary_path = "../bin/firecracker"
+
+[kernel]
+version = "@KERNEL_VERSION@"
+image_path = "../assets/vmlinux.bin"
+
+[tools]
+version = "@TOOLS_VERSION@"
+drive_path = "../assets/tools.ext4"
+
+[ublk]
+daemon_binary_path = "../bin/uvm-ublk-daemon"
+daemon_metrics_listen_addr = ""

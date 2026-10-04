@@ -89,31 +89,36 @@ impl CustomExtensionClient {
 
     fn build_from_config() -> Option<CustomExtensionClient> {
         let config = &ConfigManager::global_config().custom_extension;
-        let url = config.url.as_deref()?.trim().to_string();
-        if url.is_empty() {
-            return None;
-        }
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
-        {
+        match Self::from_config(config) {
             Ok(client) => client,
             Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to build reqwest client for custom extension; \
-                     custom extension integration disabled"
-                );
-                return None;
+                tracing::warn!(error = %err, "failed to build custom extension client; integration disabled");
+                None
             }
+        }
+    }
+
+    /// Explicit runtime policy construction. Unlike the legacy singleton,
+    /// a configured client construction failure must fail the operation.
+    pub(crate) fn from_config(config: &crate::cfg::CustomExtensionConfig) -> Result<Option<Self>> {
+        let Some(url) = config.url.as_deref() else {
+            return Ok(None);
         };
-        Some(CustomExtensionClient {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return Ok(None);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .context("build configured custom extension client")?;
+        Ok(Some(CustomExtensionClient {
             configuration: Configuration {
                 base_path: url.trim_end_matches('/').to_string(),
                 client,
                 ..Configuration::default()
             },
-        })
+        }))
     }
 
     /// Invoke the start-fresh hook: a fresh sandbox is about to boot.

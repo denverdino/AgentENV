@@ -65,6 +65,8 @@ pub(crate) struct Slot {
     /// Warm-pool reuse preserves the namespace, so the next tenant may need to
     /// clear rules left by the previous tenant.
     user_egress_rules_present: bool,
+    #[cfg(feature = "hypervisor-dragonball")]
+    metadata_prepared: bool,
 }
 
 struct NamespaceSetup {
@@ -112,6 +114,8 @@ impl Slot {
             egress_proxy,
             cleanup_armed: false,
             user_egress_rules_present: false,
+            #[cfg(feature = "hypervisor-dragonball")]
+            metadata_prepared: false,
         })
     }
 
@@ -463,6 +467,37 @@ impl Slot {
 
     pub(crate) fn namespace_path(&self) -> std::path::PathBuf {
         self.netns_dir.join(&self.namespace_id)
+    }
+
+    /// Opt-in M0 wiring only. Ordinary Firecracker slot creation is unchanged.
+    /// The caller must stop its metadata listener before returning this slot.
+    #[cfg(feature = "hypervisor-dragonball")]
+    pub(crate) fn prepare_metadata(&mut self) -> Result<()> {
+        if self.metadata_prepared {
+            return Ok(());
+        }
+        let namespace = File::open(self.namespace_path())?;
+        crate::privileges::run_with_scoped_capabilities(
+            &[
+                crate::privileges::CAP_NET_ADMIN,
+                crate::privileges::CAP_SYS_ADMIN,
+            ],
+            move || {
+                nix::sched::setns(&namespace, CloneFlags::CLONE_NEWNET)?;
+                let address = format!("{}/32", super::metadata::METADATA_ADDRESS);
+                let output = Command::new("ip")
+                    .args(["address", "replace", &address, "dev", "lo"])
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "configure metadata address: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                super::policy::initialize_namespace_metadata()
+            },
+        )?;
+        self.metadata_prepared = true;
+        Ok(())
     }
 
     pub(crate) fn set_egress_policy(

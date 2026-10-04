@@ -189,6 +189,9 @@ async fn publish_capture(
             disk_size_mib: 0,
         },
         runtime_versions: SnapshotRuntimeVersions {
+            backend: agentenv::sandbox::FIRECRACKER_BACKEND.into(),
+            vmm_version: None,
+            restore_identity: None,
             kernel_version: "test-kernel".to_string(),
             firecracker_version: "test-firecracker".to_string(),
             envd_version: "test-envd".to_string(),

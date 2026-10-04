@@ -11,18 +11,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    record_startup_pack, EnvdAccessToken, EnvdApi, Executor, FirecrackerCaptureArtifacts,
-    FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput, SandboxLaunchConfig,
-    SandboxNetworkPolicy,
+    EnvdAccessToken, EnvdApi, Executor, ExtraDrive, FreshSandboxBuildSpec, ProcessHandle,
+    ProcessOpts, ProcessOutput, SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
     RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotRecord, StartupRecording,
+    SnapshotRecord,
 };
 use crate::types::{RuntimeArtifactSet, SandboxId};
 
@@ -34,6 +34,14 @@ use crate::types::{RuntimeArtifactSet, SandboxId};
 /// Concrete implementations own their serialized form.
 pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn encode(&self) -> Result<Value>;
+
+    /// Transfer captured directory ownership only after the durable record commit.
+    fn persistence_committed(&self) {}
+
+    /// A live lease owns cleanup; persistence failure must not unlink its files.
+    fn owns_artifact_cleanup(&self) -> bool {
+        false
+    }
 
     /// Local artifacts this paused sandbox will reopen on resume.
     /// The orchestrator only carries this value to the image-liveness layer; it
@@ -88,6 +96,50 @@ impl From<anyhow::Error> for SandboxCaptureError {
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 
+#[cfg(test)]
+mod recording_contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn capture_recording_is_deferred_once_and_retains_template_workspace() {
+        fn record(
+            capture: &CapturedSandboxSnapshot,
+            lease: Arc<dyn Any + Send + Sync>,
+        ) -> Option<crate::snapshot::StartupRecording> {
+            let calls = capture
+                .downcast_artifacts_ref::<Arc<AtomicUsize>>()
+                .unwrap()
+                .clone();
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(crate::snapshot::StartupRecording::spawn_with_capture_lease(
+                async { None },
+                Arc::new(lease),
+            ))
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let workspace = Arc::new(tempfile::tempdir().unwrap());
+        let path = workspace.path().to_owned();
+        let mut capture = CapturedSandboxSnapshot::new(
+            SandboxSnapshotManifest::for_test(4096, &[]),
+            calls.clone(),
+        )
+        .with_recording_factory(record)
+        .with_recording_lease(workspace.clone());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let recording = capture.start_recording().unwrap();
+        assert!(capture.start_recording().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(capture);
+        drop(workspace);
+        let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+        trace.await.unwrap();
+        assert!(path.exists(), "publication still owns the workspace");
+        drop(keep_alive);
+        assert!(!path.exists());
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SandboxForkSpec {
     pub sandbox_id: SandboxId,
@@ -111,7 +163,17 @@ pub struct SandboxRuntimeInfo {
 pub struct CapturedSandboxSnapshot {
     manifest: SandboxSnapshotManifest,
     artifacts: Box<dyn Any + Send>,
+    // Node-local immutable generations, kept alive by `artifacts`. Only their
+    // published logical layers enter the committed volume_snapshots record.
+    volume_drives: Option<Vec<ExtraDrive>>,
+    recording_factory: Option<RecordingFactory>,
+    recording_lease: Arc<dyn Any + Send + Sync>,
 }
+
+type RecordingFactory = fn(
+    &CapturedSandboxSnapshot,
+    Arc<dyn Any + Send + Sync>,
+) -> Option<crate::snapshot::StartupRecording>;
 
 impl CapturedSandboxSnapshot {
     /// Take a capture, with whatever the backend has to hold on to until
@@ -125,7 +187,34 @@ impl CapturedSandboxSnapshot {
         Self {
             manifest,
             artifacts: Box::new(artifacts),
+            volume_drives: None,
+            recording_factory: None,
+            recording_lease: Arc::new(()),
         }
+    }
+
+    pub fn with_recording_factory(mut self, factory: RecordingFactory) -> Self {
+        self.recording_factory = Some(factory);
+        self
+    }
+
+    /// Retain caller-owned template output through both recording and publication.
+    pub fn with_recording_lease(mut self, lease: Arc<dyn Any + Send + Sync>) -> Self {
+        self.recording_lease = lease;
+        self
+    }
+
+    pub fn start_recording(&mut self) -> Option<crate::snapshot::StartupRecording> {
+        self.recording_factory.take()?(self, self.recording_lease.clone())
+    }
+
+    pub fn with_volume_drives(mut self, drives: Vec<ExtraDrive>) -> Self {
+        self.volume_drives = Some(drives);
+        self
+    }
+
+    pub fn volume_drives(&self) -> Option<&[ExtraDrive]> {
+        self.volume_drives.as_deref()
     }
 
     /// What was captured, in the form the snapshot layer publishes.
@@ -163,25 +252,40 @@ pub async fn publish_captured(
     captured_snapshot: CapturedSandboxSnapshot,
 ) -> RepositoryResult<SnapshotRecord> {
     let manifest = captured_snapshot.manifest().clone();
-
-    // Spawn the startup-manifest recording up front (a no-op task when
-    // the feature is disabled): the throwaway recording VM overlaps the
-    // backend's layer uploads, and a detached continuation uploads the
-    // manifest once the trace lands — publish never waits on it. The
-    // capture root guard travels with the task so the artifacts outlive
-    // the whole continuation.
-    let recording = captured_snapshot
-        .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-        .map(|artifacts| {
-            let snapshot_config = artifacts.snapshot_config().clone();
-            let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
-            StartupRecording::spawn_with_capture_lease(
-                record_startup_pack(snapshot_config, snapshot_dir),
-                artifacts.snapshot_root_guard(),
+    let mut metadata = metadata;
+    if let Some(volumes) = captured_snapshot.volume_drives() {
+        metadata.volume_snapshots.clear();
+        for drive in volumes {
+            let size = drive
+                .virtual_size()
+                .filter(|size| *size > 0 && size % (1 << 20) == 0)
+                .ok_or_else(|| crate::repository::RepositoryError::InvalidRequest {
+                    reason: "captured volume has invalid capacity".into(),
+                })?;
+            let layers = crate::snapshot::store::store_volume_layers(
+                snapshots.repository().as_ref(),
+                drive.image_config_path(),
             )
-        });
-
-    snapshots.publish(metadata, manifest, recording).await
+            .await?;
+            metadata
+                .volume_snapshots
+                .push(crate::snapshot::SnapshotVolume {
+                    mount_path: drive.mount_path().to_string_lossy().into_owned(),
+                    mode: if drive.read_only() {
+                        crate::volume::VolumeMode::ReadOnly
+                    } else {
+                        crate::volume::VolumeMode::Exclusive
+                    },
+                    size_mb: size >> 20,
+                    layers,
+                });
+        }
+    }
+    let mut captured_snapshot = captured_snapshot;
+    let recording = captured_snapshot.start_recording();
+    let result = snapshots.publish(metadata, manifest, recording).await;
+    drop(captured_snapshot);
+    result
 }
 
 /// Lifecycle interface for a single sandbox instance.
@@ -268,14 +372,8 @@ pub trait SandboxBackend: Send + 'static {
     /// The guest is left held. A template build takes its snapshot this way
     /// and stops the sandbox afterwards, so unlike [`snapshot`][Self::snapshot]
     /// nothing is resumed and the directory is the caller's to keep. The
-    /// optional second tuple element carries the backend's opaque capture
-    /// payload for consumers that need backend-specific capture state (e.g.
-    /// startup-manifest recording re-booting from the capture); `None` for
-    /// backends without one.
-    async fn capture_to_dir(
-        &mut self,
-        at: &Path,
-    ) -> SandboxCaptureResult<(SandboxSnapshotManifest, Option<Box<dyn Any + Send>>)>;
+    /// returned capture owns its opaque backend payload and recording factory.
+    async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
 
     /// Stop the sandbox and release all associated system resources.
     ///
@@ -319,6 +417,23 @@ pub trait SandboxBackend: Send + 'static {
 /// A single factory instance is stored inside the `Orchestrator` and is
 /// used for every `create_sandbox` and `resume_sandbox` request.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
+    fn backend(&self) -> &str;
+
+    /// Validate a resolved snapshot before the caller allocates volumes or runtime
+    /// resources. Implementations must not create a sandbox or acquire leases.
+    fn validate_snapshot(&self, snapshot: &RunnableSnapshot) -> Result<()>;
+
+    /// Pure preflight: an unsupported reader must never decode or allocate state.
+    fn supports_restore(
+        &self,
+        _identity: &super::restore_identity::SnapshotRestoreIdentity,
+    ) -> bool {
+        false
+    }
+
+    fn runtime_versions(&self) -> Result<Option<crate::snapshot::SnapshotRuntimeVersions>> {
+        Ok(None)
+    }
     /// Build a brand-new sandbox backend from a high-level launch request.
     fn build(
         &self,
@@ -347,6 +462,30 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>>;
+}
+
+/// Template construction combines lifecycle and guest-command capabilities.
+/// Concrete adapters translate the neutral inputs without downcasts in callers.
+#[async_trait(?Send)]
+pub trait TemplateSandboxFactory: SandboxBackendFactory {
+    type Sandbox: SandboxBackend + SandboxExecutor;
+
+    fn build_template(
+        &self,
+        spec: FreshSandboxBuildSpec,
+        launch: SandboxLaunchConfig,
+        ublk: Option<super::UblkConfig>,
+    ) -> Result<Self::Sandbox>;
+    fn build_template_from_snapshot(
+        &self,
+        snapshot: &RunnableSnapshot,
+        launch: SandboxLaunchConfig,
+    ) -> Result<Self::Sandbox>;
+    async fn template_versions(
+        &self,
+        sandbox: &Self::Sandbox,
+        tools_version: String,
+    ) -> Result<crate::snapshot::SnapshotRuntimeVersions>;
 }
 
 /// Process execution capability of a running sandbox.
