@@ -8,9 +8,7 @@ use tracing::warn;
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
-use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
-};
+use crate::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{
     SnapshotPublication, SnapshotRepository, SnapshotRuntimeResolver,
@@ -126,10 +124,38 @@ impl SnapshotManager {
     #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
     pub async fn publish_captured(
         &self,
-        metadata: SnapshotPublishMetadata,
-        captured_snapshot: CapturedSandboxSnapshot,
+        mut metadata: SnapshotPublishMetadata,
+        mut captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let manifest = captured_snapshot.manifest().clone();
+
+        if let Some(volumes) = captured_snapshot.volume_drives() {
+            // The capture, not a later read of a mutable volume catalog, owns
+            // the consistency cut. Keep its artifact lease through all uploads.
+            metadata.volume_snapshots.clear();
+            for drive in volumes {
+                let size = drive
+                    .virtual_size()
+                    .filter(|size| *size > 0 && size % (1 << 20) == 0)
+                    .ok_or_else(|| super::RepositoryError::InvalidRequest {
+                        reason: "captured volume has invalid capacity".into(),
+                    })?;
+                let layers = self
+                    .repository
+                    .publish_volume_backing(drive.drive_id(), drive.image_config_path())
+                    .await?;
+                metadata.volume_snapshots.push(super::SnapshotVolume {
+                    mount_path: drive.mount_path().to_string_lossy().into_owned(),
+                    mode: if drive.read_only() {
+                        crate::volume::VolumeMode::ReadOnly
+                    } else {
+                        crate::volume::VolumeMode::Exclusive
+                    },
+                    size_mb: size >> 20,
+                    layers,
+                });
+            }
+        }
 
         // Spawn the startup-manifest recording up front (a no-op task when
         // the feature is disabled): the throwaway recording VM overlaps the
@@ -137,16 +163,7 @@ impl SnapshotManager {
         // manifest once the trace lands — publish never waits on it. The
         // capture root guard travels with the task so the artifacts outlive
         // the whole continuation.
-        let recording = captured_snapshot
-            .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-            .map(|artifacts| {
-                let snapshot_config = artifacts.snapshot_config().clone();
-                let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
-                crate::snapshot::StartupRecording::spawn_with_capture_lease(
-                    crate::sandbox::record_startup_pack(snapshot_config, snapshot_dir),
-                    artifacts.snapshot_root_guard(),
-                )
-            });
+        let recording = captured_snapshot.start_recording();
 
         let publication = self
             .repository

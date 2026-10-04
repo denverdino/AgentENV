@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,8 @@ use uuid::Uuid;
 use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
-use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
+use crate::sandbox::restore_identity::SnapshotRestoreIdentity;
+use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
@@ -34,6 +36,12 @@ struct PersistedPausedRecord {
     metadata: SandboxMetadata,
     artifact_root: PathBuf,
     state: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_identity: Option<SnapshotRestoreIdentity>,
+    #[serde(default)]
+    runtime_artifacts: RuntimeArtifactSet,
 }
 
 impl PersistedPausedRecord {
@@ -51,6 +59,7 @@ impl PersistedPausedRecord {
             })?;
         self.metadata.state = SandboxState::Paused;
         self.metadata.paused_state = Some(paused_state);
+        self.metadata.retained_runtime_artifacts = self.runtime_artifacts;
 
         Ok(self.metadata)
     }
@@ -58,6 +67,7 @@ impl PersistedPausedRecord {
     fn into_metadata_without_runtime_state(mut self) -> SandboxMetadata {
         self.metadata.state = SandboxState::Paused;
         self.metadata.paused_state = None;
+        self.metadata.retained_runtime_artifacts = self.runtime_artifacts;
         self.metadata
     }
 }
@@ -88,6 +98,8 @@ pub struct FileBackedSandboxPersister {
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
     db: OnceCell<LocalKvStore>,
+    dragonball: OnceCell<Box<FileBackedSandboxPersister>>,
+    allows_image_gc: AtomicBool,
 }
 
 impl FileBackedSandboxPersister {
@@ -97,6 +109,8 @@ impl FileBackedSandboxPersister {
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
             db: OnceCell::new(),
+            dragonball: OnceCell::new(),
+            allows_image_gc: AtomicBool::new(true),
         }
     }
 
@@ -108,6 +122,43 @@ impl FileBackedSandboxPersister {
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
         self.durability = durability;
         self
+    }
+
+    async fn dragonball_store(&self) -> &Self {
+        self.dragonball
+            .get_or_init(|| async {
+                Box::new(
+                    Self::new(self.root.join("dragonball"), self.virtualization_mode)
+                        .with_durability(self.durability),
+                )
+            })
+            .await
+    }
+
+    async fn store_for_backend(&self, backend: &str) -> &Self {
+        if backend == "dragonball" {
+            self.dragonball_store().await
+        } else {
+            self
+        }
+    }
+
+    async fn locate_record(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<(&Self, PersistedPausedRecord)> {
+        if self
+            .db()
+            .await?
+            .get(sandbox_id.to_string())
+            .await
+            .map_err(|source| SandboxPersistenceError::store("locate paused record", source))?
+            .is_some()
+        {
+            return Ok((self, self.get_record(sandbox_id).await?));
+        }
+        let store = self.dragonball_store().await;
+        Ok((store, store.get_record(sandbox_id).await?))
     }
 
     fn records_db_path(&self) -> PathBuf {
@@ -246,9 +297,8 @@ impl FileBackedSandboxPersister {
     }
 }
 
-#[async_trait]
-impl SandboxPersister for FileBackedSandboxPersister {
-    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+impl FileBackedSandboxPersister {
+    async fn load_namespace<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
     where
         F: SandboxBackendFactory,
     {
@@ -258,6 +308,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         })?;
         let mut sandboxes = Vec::new();
         let mut retained_artifacts = HashSet::new();
+        let mut unknown_outer = false;
 
         for (key, bytes) in records {
             let sandbox_id_from_key = std::str::from_utf8(&key)
@@ -266,14 +317,39 @@ impl SandboxPersister for FileBackedSandboxPersister {
             let record = match decode_record(&bytes) {
                 Ok(record) => record,
                 Err(err) => {
-                    warn!(record_key = %String::from_utf8_lossy(&key), error = %err, "discarding invalid paused sandbox record");
+                    warn!(record_key = %String::from_utf8_lossy(&key), error = %err, "retaining unreadable paused sandbox record");
+                    unknown_outer = true;
+                    self.allows_image_gc.store(false, Ordering::Release);
                     if let Some(sandbox_id) = sandbox_id_from_key {
-                        let _ = self.remove_record(&sandbox_id).await;
+                        retained_artifacts.insert(sandbox_id);
                     }
                     continue;
                 }
             };
             let sandbox_id = record.metadata.id;
+
+            let backend = record
+                .backend
+                .as_deref()
+                .unwrap_or(&record.metadata.runtime_versions.backend);
+            let supported = backend == factory.backend()
+                && backend == record.metadata.runtime_versions.backend
+                && record.restore_identity == record.metadata.runtime_versions.restore_identity
+                && record
+                    .restore_identity
+                    .as_ref()
+                    .map_or(backend == "firecracker", |identity| {
+                        identity.backend == backend && factory.supports_restore(identity)
+                    });
+            if !supported {
+                if record.runtime_artifacts.is_empty() {
+                    self.allows_image_gc.store(false, Ordering::Release);
+                }
+                warn!(sandbox_id = %sandbox_id, backend, "retaining paused sandbox for a different backend reader");
+                retained_artifacts.insert(sandbox_id);
+                sandboxes.push(record.into_metadata_without_runtime_state());
+                continue;
+            }
 
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
                 warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
@@ -282,6 +358,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
             }
 
             if record.metadata.virtualization_mode != self.virtualization_mode {
+                if record.runtime_artifacts.is_empty() {
+                    self.allows_image_gc.store(false, Ordering::Release);
+                }
                 warn!(
                     sandbox_id = %sandbox_id,
                     record_mode = %record.metadata.virtualization_mode,
@@ -293,19 +372,32 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 continue;
             }
 
+            let qualified = record.backend.is_some();
+            let retained_metadata = record.clone().into_metadata_without_runtime_state();
             match record.into_metadata(factory) {
                 Ok(metadata) => {
                     retained_artifacts.insert(sandbox_id);
                     sandboxes.push(metadata);
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "discarding unusable paused sandbox record");
-                    self.cleanup_invalid_record(&sandbox_id).await?;
+                    if qualified {
+                        if retained_metadata.retained_runtime_artifacts.is_empty() {
+                            self.allows_image_gc.store(false, Ordering::Release);
+                        }
+                        warn!(sandbox_id = %sandbox_id, error = %err, "retaining qualified paused record after decode failure");
+                        retained_artifacts.insert(sandbox_id);
+                        sandboxes.push(retained_metadata);
+                    } else {
+                        warn!(sandbox_id = %sandbox_id, error = %err, "discarding corrupt legacy paused sandbox record");
+                        self.cleanup_invalid_record(&sandbox_id).await?;
+                    }
                 }
             }
         }
 
-        self.cleanup_orphan_artifacts(&retained_artifacts).await?;
+        if !unknown_outer {
+            self.cleanup_orphan_artifacts(&retained_artifacts).await?;
+        }
 
         info!(
             loaded = sandboxes.len(),
@@ -314,6 +406,39 @@ impl SandboxPersister for FileBackedSandboxPersister {
         );
 
         Ok(sandboxes)
+    }
+}
+
+#[async_trait]
+impl SandboxPersister for FileBackedSandboxPersister {
+    fn allows_image_gc(&self) -> bool {
+        self.allows_image_gc.load(Ordering::Acquire)
+    }
+
+    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    where
+        F: SandboxBackendFactory,
+    {
+        let mut records = self.load_namespace(factory).await?;
+        if self.root.join("dragonball").exists() {
+            let db_store = self.dragonball_store().await;
+            records.extend(db_store.load_namespace(factory).await?);
+            if !db_store.allows_image_gc() {
+                self.allows_image_gc.store(false, Ordering::Release);
+            }
+        }
+        Ok(records)
+    }
+
+    async fn allocate_artifact_root_for_backend(
+        &self,
+        sandbox_id: &SandboxId,
+        backend: &str,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        self.store_for_backend(backend)
+            .await
+            .allocate_artifact_root(sandbox_id)
+            .await
     }
 
     async fn allocate_artifact_root(
@@ -350,7 +475,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let state = match paused_state.encode() {
             Ok(state) => state,
             Err(source) => {
-                let _ = Self::remove_artifact_root(artifact_root).await;
+                if !paused_state.owns_artifact_cleanup() {
+                    let _ = Self::remove_artifact_root(artifact_root).await;
+                }
                 return Err(SandboxPersistenceError::InvalidRecord {
                     reason: "failed to encode paused sandbox state".to_string(),
                     source: Some(source),
@@ -363,37 +490,64 @@ impl SandboxPersister for FileBackedSandboxPersister {
             metadata: metadata.clone(),
             artifact_root: artifact_root.to_path_buf(),
             state,
+            backend: Some(metadata.runtime_versions.backend.clone()),
+            restore_identity: metadata.runtime_versions.restore_identity.clone(),
+            runtime_artifacts: paused_state.runtime_artifacts(),
         };
-        let result = self.put_record(&record).await;
+        let result = self
+            .store_for_backend(&metadata.runtime_versions.backend)
+            .await
+            .put_record(&record)
+            .await;
         if result.is_err() {
-            let _ = Self::remove_artifact_root(artifact_root).await;
+            if !paused_state.owns_artifact_cleanup() {
+                let _ = Self::remove_artifact_root(artifact_root).await;
+            }
+        } else {
+            paused_state.persistence_committed();
         }
         result
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");
-        let mut record = self.get_record(sandbox_id).await?;
+        let (store, mut record) = self.locate_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Resuming;
-        self.put_record(&record).await
+        store.put_record(&record).await
     }
 
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "rolling back paused sandbox to paused");
-        let mut record = self.get_record(sandbox_id).await?;
+        let (store, mut record) = self.locate_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Paused;
-        self.put_record(&record).await
+        store.put_record(&record).await
     }
 
     async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record");
-        self.remove_record(sandbox_id).await
+        self.remove_record(sandbox_id).await?;
+        if self.root.join("dragonball").exists() {
+            self.dragonball_store()
+                .await
+                .remove_record(sandbox_id)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
-        self.remove_record(sandbox_id).await?;
+        self.delete_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
+        if self.root.join("dragonball").exists() {
+            Self::remove_artifact_root(
+                &self
+                    .dragonball_store()
+                    .await
+                    .sandbox_artifact_root(sandbox_id),
+            )
+            .await?;
+        }
         Ok(())
     }
 }
@@ -429,6 +583,14 @@ mod tests {
     struct RejectingFactory;
 
     impl SandboxBackendFactory for RejectingFactory {
+        fn backend(&self) -> &str {
+            crate::sandbox::FIRECRACKER_BACKEND
+        }
+
+        fn validate_snapshot(&self, _snapshot: &RunnableSnapshot) -> Result<()> {
+            unreachable!("persister tests only decode state")
+        }
+
         fn build(
             &self,
             _build_spec: FreshSandboxBuildSpec,
@@ -528,6 +690,229 @@ mod tests {
             .expect("paused state should be restored")
             .downcast_ref::<MockSnapshot>()
             .is_some());
+        Ok(())
+    }
+
+    async fn qualify_test_record(
+        persister: &FileBackedSandboxPersister,
+        sandbox_id: SandboxId,
+        backend: &str,
+        identity: Value,
+        image_config: &Path,
+    ) -> anyhow::Result<()> {
+        let db = persister.db().await?;
+        let mut record: Value = serde_json::from_slice(
+            &db.get(sandbox_id.to_string())
+                .await?
+                .expect("stored record"),
+        )?;
+        record["backend"] = backend.into();
+        record["restoreIdentity"] = identity.clone();
+        record["metadata"]["runtime_versions"]["backend"] = backend.into();
+        record["metadata"]["runtime_versions"]["restore_identity"] = identity;
+        record["runtimeArtifacts"] = serde_json::json!({
+            "overlaybd_image_config_paths": [image_config],
+        });
+        db.put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_unknown_backend_is_retained_not_decoded() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let id = SandboxId::new();
+        let root = temp.path().join("artifacts").join(id.to_string());
+        let state = paused_state(&root);
+        persister
+            .persist_paused(
+                &SandboxMetadata {
+                    id,
+                    ..Default::default()
+                },
+                Some(&root),
+                state.as_ref(),
+            )
+            .await?;
+        let config = root.join("image.json");
+        std::fs::write(&config, b"retained-layer-reference")?;
+        qualify_test_record(&persister, id, "future-vmm", Value::Null, &config).await?;
+
+        let loaded = persister.load_all(&RejectingFactory).await?;
+        assert_eq!(loaded.len(), 1, "unsupported backend must remain visible");
+        assert_eq!(loaded[0].id, id);
+        assert!(loaded[0].paused_state.is_none());
+        assert_eq!(
+            loaded[0]
+                .retained_runtime_artifacts
+                .clone()
+                .into_overlaybd_image_config_paths(),
+            vec![config.clone()]
+        );
+        assert!(has_record(&persister, &id).await?);
+        assert_eq!(std::fs::read(&config)?, b"retained-layer-reference");
+
+        qualify_test_record(&persister, id, "firecracker", Value::Null, &config).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded[0].id, id);
+        assert!(
+            loaded[0].paused_state.is_some(),
+            "compatible later reader may decode"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_unknown_db_abi_keeps_artifacts() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let id = SandboxId::new();
+        let root = temp.path().join("artifacts").join(id.to_string());
+        let state = paused_state(&root);
+        persister
+            .persist_paused(
+                &SandboxMetadata {
+                    id,
+                    ..Default::default()
+                },
+                Some(&root),
+                state.as_ref(),
+            )
+            .await?;
+        let config = root.join("memory-image.json");
+        std::fs::write(&config, b"memory-lower-reference")?;
+        qualify_test_record(
+            &persister,
+            id,
+            "dragonball",
+            serde_json::json!({
+                "backend": "dragonball", "architecture": "x86_64", "virtualization_mode": "kvm",
+                "runner_build_id": "future-build", "dragonball_revision": "future-revision",
+                "snapshot_format_epoch": 1, "restore_abi_id": "future-abi",
+                "cpu_policy_id": "host-default", "device_profile_id": "mmio",
+                "memory_layout_id": "full-ram", "kernel_version": "future-kernel",
+                "tools_drive_version": "future-tools", "envd_version": "future-envd",
+            }),
+            &config,
+        )
+        .await?;
+
+        let loaded = persister.load_all(&RejectingFactory).await?;
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].paused_state.is_none());
+        assert!(has_record(&persister, &id).await?);
+        assert_eq!(std::fs::read(&config)?, b"memory-lower-reference");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_fc_paused_record_still_resumes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let root = temp.path().join("artifacts");
+        let (id, _) = persist_test_record(&persister, &root).await?;
+        let db = persister.db().await?;
+        let mut record: Value = serde_json::from_slice(&db.get(id.to_string()).await?.unwrap())?;
+        for field in ["backend", "restoreIdentity", "runtimeArtifacts"] {
+            record.as_object_mut().unwrap().remove(field);
+        }
+        db.put(id.to_string(), serde_json::to_vec(&record)?).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded[0].id, id);
+        assert!(loaded[0]
+            .paused_state
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<MockSnapshot>()
+            .is_some());
+        persister.mark_resuming(&id).await?;
+        persister.rollback_resuming(&id).await?;
+        assert_eq!(
+            persister.load_all(&MockBackendFactory::new()).await?[0].id,
+            id
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_conflicting_outer_backend_is_retained() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let id = SandboxId::new();
+        let root = temp.path().join("artifacts").join(id.to_string());
+        let state = paused_state(&root);
+        persister
+            .persist_paused(
+                &SandboxMetadata {
+                    id,
+                    ..Default::default()
+                },
+                Some(&root),
+                state.as_ref(),
+            )
+            .await?;
+        let db = persister.db().await?;
+        let mut record: Value = serde_json::from_slice(&db.get(id.to_string()).await?.unwrap())?;
+        record["metadata"]["runtime_versions"]["backend"] = "dragonball".into();
+        db.put(id.to_string(), serde_json::to_vec(&record)?).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            loaded[0].paused_state.is_none(),
+            "conflicting outer and metadata backends must not decode"
+        );
+        assert!(has_record(&persister, &id).await?);
+        assert!(root.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_unknown_outer_schema_keeps_record_and_artifacts() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let id = SandboxId::new();
+        let root = temp.path().join("artifacts").join(id.to_string());
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("layer"), b"future-layer")?;
+        persister
+            .db()
+            .await?
+            .put(id.to_string(), b"unknown future encoding".to_vec())
+            .await?;
+        assert!(persister
+            .load_all(&MockBackendFactory::new())
+            .await?
+            .is_empty());
+        assert!(has_record(&persister, &id).await?);
+        assert_eq!(std::fs::read(root.join("layer"))?, b"future-layer");
+        assert!(
+            !persister.allows_image_gc(),
+            "unknown graph cannot authorize external layer GC"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_unsupported_record_without_liveness_graph_disables_gc() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let root = temp.path().join("artifacts");
+        let (id, _) = persist_test_record(&persister, &root).await?;
+        let db = persister.db().await?;
+        let mut record: Value = serde_json::from_slice(&db.get(id.to_string()).await?.unwrap())?;
+        record["backend"] = "future-vmm".into();
+        record["metadata"]["runtime_versions"]["backend"] = "future-vmm".into();
+        record.as_object_mut().unwrap().remove("runtimeArtifacts");
+        db.put(id.to_string(), serde_json::to_vec(&record)?).await?;
+        let loaded = persister.load_all(&RejectingFactory).await?;
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].paused_state.is_none());
+        assert!(has_record(&persister, &id).await?);
+        assert!(
+            !persister.allows_image_gc(),
+            "cannot replace unknown liveness graph with an empty hold"
+        );
         Ok(())
     }
 
@@ -827,7 +1212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_all_discards_invalid_record() -> anyhow::Result<()> {
+    async fn load_all_retains_unrecognized_record() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -840,7 +1225,7 @@ mod tests {
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
         assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &sandbox_id).await?);
+        assert!(has_record(&persister, &sandbox_id).await?);
         Ok(())
     }
 
@@ -860,6 +1245,14 @@ mod tests {
         };
         persister
             .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+
+        // Only recognized legacy FC state grants the historical corruption cleanup.
+        let db = persister.db().await?;
+        let mut record: Value =
+            serde_json::from_slice(&db.get(sandbox_id.to_string()).await?.unwrap())?;
+        record.as_object_mut().unwrap().remove("backend");
+        db.put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
             .await?;
 
         let loaded = persister.load_all(&RejectingFactory).await?;

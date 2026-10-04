@@ -291,6 +291,7 @@ impl UblkDeviceManager {
     /// Tell the daemon the sandbox owning `device_key` finished booting,
     /// releasing held background downloads. Best-effort: failures only mean
     /// the downloads start after the fallback timeout instead.
+    #[cfg(feature = "hypervisor-firecracker")]
     pub(crate) async fn notify_sandbox_ready(&self, device_key: &Path) {
         let Ok(client) = self.require_client() else {
             return;
@@ -579,22 +580,45 @@ impl UblkDeviceManager {
     ///
     /// The device is deleted automatically when the last [`SharedReadOnlyDevice`]
     /// handle is dropped.
+    #[cfg(feature = "hypervisor-firecracker")]
     pub(crate) async fn get_or_create_shared_mem(
         &self,
         spec: &UblkCreateSpec,
         virtual_size: u64,
     ) -> Result<SharedReadOnlyDevice> {
-        self.get_or_create_shared_readonly(spec, Some(virtual_size))
+        self.get_or_create_shared_readonly(spec, Some(virtual_size), true)
             .await
     }
 
+    /// Lazy KVM faults may keep the old block mapping alive after runner reap.
+    /// Share this generation between siblings, but never rebind it in the warm
+    /// pool. Successful synchronous DEL, not waitpid, releases the backing.
+    #[cfg(all(
+        feature = "hypervisor-dragonball",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(crate) async fn get_or_create_retained_mem(
+        &self,
+        spec: &UblkCreateSpec,
+        virtual_size: u64,
+        artifacts: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<SharedReadOnlyDevice> {
+        let device = self
+            .get_or_create_shared_readonly(spec, Some(virtual_size), false)
+            .await?;
+        device.inner.artifacts.lock().unwrap().push(artifacts);
+        Ok(device)
+    }
+
+    #[cfg(feature = "hypervisor-firecracker")]
     pub(crate) async fn get_or_create_shared_tools(
         &self,
         spec: &UblkCreateSpec,
     ) -> Result<SharedReadOnlyDevice> {
         // Tools capacity comes from the published block image. The retained
         // device is created once per release and reused across launches.
-        let device = self.get_or_create_shared_readonly(spec, None).await?;
+        let device = self.get_or_create_shared_readonly(spec, None, true).await?;
         // Retain one idle tools image; active sandboxes retain any other versions.
         self.recent_tools_device
             .lock()
@@ -607,6 +631,7 @@ impl UblkDeviceManager {
         &self,
         spec: &UblkCreateSpec,
         virtual_size: Option<u64>,
+        allow_pool: bool,
     ) -> Result<SharedReadOnlyDevice> {
         let UblkCreateSpec::Overlaybd {
             image_config,
@@ -642,6 +667,10 @@ impl UblkDeviceManager {
                     .upgrade()
                     .filter(|inner| !inner.released.load(Ordering::Acquire))
                 {
+                    anyhow::ensure!(
+                        allow_pool || !strong.pooled,
+                        "cannot reuse a recyclable device for retained RAM"
+                    );
                     debug!(
                         key = %key.display(),
                         dev_id = strong.device.dev_id,
@@ -653,7 +682,8 @@ impl UblkDeviceManager {
             break;
         }
 
-        let device = if self.pool_enabled {
+        let pooled = self.pool_enabled && allow_pool;
+        let device = if pooled {
             let client = self.require_client()?;
             let mut metric =
                 MetricGuard::operation(UBLK_OPERATION_DURATION, "acquire_shared_memory");
@@ -682,7 +712,11 @@ impl UblkDeviceManager {
         let cache_fd = match File::open(&device.device_path) {
             Ok(file) => file,
             Err(error) => {
-                let _ = self.release_device(&device).await;
+                if pooled {
+                    let _ = self.release_device(&device).await;
+                } else {
+                    let _ = self.delete_device(&device).await;
+                }
                 return Err(error).context("keep shared read-only device open");
             }
         };
@@ -698,6 +732,8 @@ impl UblkDeviceManager {
             image_config_key: key.clone(),
             released: AtomicBool::new(false),
             cache_fd: std::sync::Mutex::new(Some(cache_fd)),
+            pooled,
+            artifacts: std::sync::Mutex::new(Vec::new()),
         });
 
         // Use the entry API to avoid overwriting a live Weak inserted by a
@@ -711,6 +747,10 @@ impl UblkDeviceManager {
             .filter(|inner| !inner.released.load(Ordering::Acquire))
         {
             if !Arc::ptr_eq(&winner, &inner) {
+                anyhow::ensure!(
+                    allow_pool || !winner.pooled,
+                    "cannot reuse a recyclable device for retained RAM"
+                );
                 // Another caller inserted a live device while we were acquiring
                 // ours. Reuse theirs; `inner` will be dropped, triggering
                 // automatic cleanup of our redundant device.
@@ -742,11 +782,26 @@ struct SharedReadOnlyDeviceInner {
     /// Canonical key used for the shared device pool lookup.
     image_config_key: PathBuf,
     released: AtomicBool,
+    pooled: bool,
+    artifacts: std::sync::Mutex<Vec<Arc<dyn std::any::Any + Send + Sync>>>,
     // Linux clears a block device's page cache when its last opener closes
     // (blkdev_put_whole -> kill_bdev). Keep an opener between sandbox launches;
     // the daemon's /dev/ublkcN handle does not keep /dev/ublkbN open. This does
     // not prevent normal cache reclaim under memory pressure.
     cache_fd: std::sync::Mutex<Option<File>>,
+}
+
+// Fail closed if the deletion RPC fails, is cancelled, or cannot be scheduled.
+// Leaking owners intentionally retains their on-disk artifacts for diagnosis;
+// dropping them could unlink backing still used by a kernel fault worker.
+struct RetirementArtifacts(Vec<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl Drop for RetirementArtifacts {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            std::mem::forget(std::mem::take(&mut self.0));
+        }
+    }
 }
 
 impl Drop for SharedReadOnlyDeviceInner {
@@ -756,6 +811,8 @@ impl Drop for SharedReadOnlyDeviceInner {
         }
 
         drop(self.cache_fd.get_mut().unwrap().take());
+        let artifacts = RetirementArtifacts(std::mem::take(self.artifacts.get_mut().unwrap()));
+        let pooled = self.pooled;
         let dev_id = self.device.dev_id;
         let key = self.image_config_key.clone();
         let device_path = self.device.device_path.clone();
@@ -793,7 +850,7 @@ impl Drop for SharedReadOnlyDeviceInner {
             return;
         };
         handle.spawn(async move {
-            let _ = release_shared_readonly_device(key, device, notify).await;
+            let _ = release_shared_readonly_device(key, device, notify, pooled, artifacts).await;
         });
     }
 }
@@ -802,6 +859,8 @@ async fn release_shared_readonly_device(
     key: PathBuf,
     device: UblkDevice,
     notify: Arc<Notify>,
+    pooled: bool,
+    mut artifacts: RetirementArtifacts,
 ) -> Result<()> {
     let dev_id = device.dev_id;
 
@@ -816,9 +875,15 @@ async fn release_shared_readonly_device(
                     .is_some_and(|inner| inner.released.load(Ordering::Acquire))
         });
 
-    let release_result = UblkDeviceManager::global().release_device(&device).await;
+    let release_result = if pooled {
+        UblkDeviceManager::global().release_device(&device).await
+    } else {
+        UblkDeviceManager::global().delete_device(&device).await
+    };
     if let Err(e) = &release_result {
-        warn!(dev_id, error = %e, "failed to release shared read-only ublk device");
+        warn!(dev_id, error = %e, "failed to release shared read-only ublk device; retaining backing artifacts");
+    } else {
+        artifacts.0.clear();
     }
     UblkDeviceManager::global()
         .shared_readonly_releases
@@ -843,6 +908,7 @@ impl SharedReadOnlyDevice {
         Arc::as_ptr(&self.inner) as usize
     }
 
+    #[cfg(feature = "hypervisor-firecracker")]
     pub fn image_config_path(&self) -> &Path {
         &self.inner.image_config_key
     }
@@ -872,7 +938,9 @@ impl SharedReadOnlyDevice {
             .insert(key.clone(), Arc::clone(&notify));
         drop(entry);
         drop(self.inner.cache_fd.lock().unwrap().take());
-        release_shared_readonly_device(key, device, notify).await
+        let artifacts =
+            RetirementArtifacts(std::mem::take(&mut *self.inner.artifacts.lock().unwrap()));
+        release_shared_readonly_device(key, device, notify, self.inner.pooled, artifacts).await
     }
 }
 /// A handle to a single `/dev/ublkb<N>` device.
@@ -928,6 +996,26 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_retirement_retains_artifact_owner() {
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let artifacts = RetirementArtifacts(vec![owner]);
+        // Covers RPC error, cancellation before first poll and no runtime.
+        drop(artifacts);
+        assert!(weak.upgrade().is_some());
+    }
+
+    #[test]
+    fn confirmed_retirement_releases_artifact_owner() {
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let mut artifacts = RetirementArtifacts(vec![owner]);
+        artifacts.0.clear();
+        drop(artifacts);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn rejects_persisted_cow_backend_with_migration_guidance() {

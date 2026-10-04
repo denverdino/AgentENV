@@ -15,10 +15,10 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
-    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
-    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FreshSandboxBuildSpec,
+    RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureError, SandboxForkSpec, SandboxLaunchConfig, SandboxNetworkPolicy,
+    SandboxRuntimeInfo, SelectedSandboxFactory,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -107,7 +107,7 @@ impl FailedLaunchStage {
 
 pub struct Orchestrator<
     S: MetadataStore = InMemoryMetadataStore,
-    F: SandboxBackendFactory = FirecrackerSandboxFactory,
+    F: SandboxBackendFactory = SelectedSandboxFactory,
     P: SandboxPersister = FileBackedSandboxPersister,
 > {
     store: S,
@@ -130,11 +130,14 @@ pub struct Orchestrator<
     volume_manager: Option<Arc<VolumeManager>>,
 }
 
-impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
+impl Orchestrator<InMemoryMetadataStore, SelectedSandboxFactory, DisabledSandboxPersister> {
     pub async fn with_in_memory_store() -> Arc<Self> {
         Self::new(
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            crate::sandbox::selected::factory_with_cpu_config(Arc::new(std::sync::RwLock::new(
+                None,
+            )))
+            .expect("selected backend configuration"),
             DisabledSandboxPersister,
         )
         .await
@@ -178,6 +181,14 @@ where
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
+    /// Reject incompatible snapshot artifacts before API-side volume allocation.
+    pub fn validate_snapshot(
+        &self,
+        snapshot: &crate::snapshot::RunnableSnapshot,
+    ) -> anyhow::Result<()> {
+        self.factory.validate_snapshot(snapshot)
+    }
+
     pub async fn new(store: S, factory: F, persister: P) -> Result<Arc<Self>> {
         let image_refs = local_image_services_from_global_config().runtime_refs;
         Self::new_inner(store, factory, persister, image_refs).await
@@ -214,14 +225,18 @@ where
         })
         .await
         .context("join sandbox access-token seed loader")??;
-        let restored_paused: Vec<(SandboxId, Arc<dyn PausedSandboxState>)> = persisted
+        let restored_paused: Vec<(SandboxId, RuntimeArtifactSet)> = persisted
             .iter()
             .filter(|metadata| metadata.state == SandboxState::Paused)
-            .filter_map(|metadata| {
-                metadata
-                    .paused_state
-                    .as_ref()
-                    .map(|paused_state| (metadata.id, Arc::clone(paused_state)))
+            .map(|metadata| {
+                (
+                    metadata.id,
+                    metadata
+                        .paused_state
+                        .as_ref()
+                        .map(|state| state.runtime_artifacts())
+                        .unwrap_or_else(|| metadata.retained_runtime_artifacts.clone()),
+                )
             })
             .collect();
         for metadata in persisted {
@@ -257,7 +272,7 @@ where
 
         // Reconcile durable paused protection, then start maintenance (fail-closed).
         let gc = app_config.image.cache.gc_schedule();
-        if gc.enabled {
+        if gc.enabled && orchestrator.persister.allows_image_gc() {
             match orchestrator
                 .reconcile_paused_at_startup(&restored_paused)
                 .await
@@ -276,6 +291,10 @@ where
                     );
                 }
             }
+        } else if gc.enabled {
+            warn!(
+                "paused record graph is unreadable; not starting image maintenance (fail-closed)"
+            );
         }
 
         Ok(orchestrator)
@@ -390,13 +409,13 @@ where
     /// every restored paused sandbox, then drop orphaned paused protection.
     async fn reconcile_paused_at_startup(
         &self,
-        restored_paused: &[(SandboxId, Arc<dyn PausedSandboxState>)],
+        restored_paused: &[(SandboxId, RuntimeArtifactSet)],
     ) -> Result<()> {
         let mut live_paused = Vec::with_capacity(restored_paused.len());
-        for (sandbox_id, paused_state) in restored_paused {
+        for (sandbox_id, artifacts) in restored_paused {
             self.protect_image_refs(
                 RuntimeImageOwner::PausedSandbox(*sandbox_id),
-                paused_state.runtime_artifacts(),
+                artifacts.clone(),
                 "paused sandbox",
             )
             .await?;
@@ -583,7 +602,10 @@ where
                     snapshot_id: image_ref,
                     snapshot_alias: None,
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                    runtime_versions: configured_runtime_versions(),
+                    runtime_versions: self
+                        .factory
+                        .runtime_versions()?
+                        .unwrap_or_else(configured_runtime_versions),
                     resources,
                     context,
                     image_configs: launch_image_configs,
@@ -1465,7 +1487,11 @@ where
         // Allocate persistence space while the running handle and route are
         // still attached. Allocation does not mutate the backend, so failure
         // only needs to restore metadata and release the temporary image refs.
-        let artifact_root = match self.persister.allocate_artifact_root(&sandbox_id).await {
+        let artifact_root = match self
+            .persister
+            .allocate_artifact_root_for_backend(&sandbox_id, self.factory.backend())
+            .await
+        {
             Ok(artifact_root) => artifact_root,
             Err(err) => {
                 warn!(error = ?err, "failed to allocate paused sandbox artifact root");
@@ -1690,6 +1716,12 @@ where
             });
         }
 
+        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
+            OrchestratorError::InternalError(
+                "paused state is unavailable for this backend reader".to_string(),
+            )
+        })?;
+
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
@@ -1733,11 +1765,6 @@ where
                 "failed to mark persisted sandbox record as resuming: {err:#}"
             )));
         }
-
-        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            warn!("missing paused state while resuming");
-            OrchestratorError::InternalError("missing paused state".to_string())
-        })?;
 
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(

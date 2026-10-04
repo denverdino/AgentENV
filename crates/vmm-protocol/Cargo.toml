@@ -1,0 +1,10 @@
+[package]
+name = "agentenv-vmm-protocol"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

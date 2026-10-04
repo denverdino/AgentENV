@@ -688,10 +688,21 @@ impl PosixFsCatalogStore {
     ) -> RepositoryResult<Option<VolumeRecord>> {
         self.ensure_volume_id(volume_id)?;
         let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, volume_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let record: VolumeRecord = self.read_json(&path)?;
+        // Listing and rollback deletion may race. Decide absence from the read
+        // itself, not an exists() check whose result can immediately become stale.
+        let record: VolumeRecord = match self.read_json(&path) {
+            Ok(record) => record,
+            Err(RepositoryError::Backend {
+                source: Some(error),
+                ..
+            }) if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
         self.ensure_volume_id(&record.id)?;
         if record.id != volume_id {
             return Err(RepositoryError::InvalidRequest {

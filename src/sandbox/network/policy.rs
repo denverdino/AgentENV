@@ -19,6 +19,28 @@ const USER_EGRESS_CHAIN: &str = "AGENTENV-USER-EGRESS";
 const EGRESS_PROXY_CHAIN: &str = "AGENTENV-EGRESS-PROXY";
 const DOMAIN_INSPECTION_TCP_PORTS: &[u16] = &[80, 443];
 
+#[cfg(feature = "hypervisor-dragonball")]
+pub(super) fn build_metadata_commands() -> Vec<IptablesRestoreCommand> {
+    use super::metadata::{METADATA_ADDRESS, METADATA_PORT};
+    let chain = "AGENTENV-METADATA";
+    vec![
+        IptablesRestoreCommand::NewChain { table: "filter", chain },
+        IptablesRestoreCommand::Insert { table: "filter", chain: "INPUT", position: 1,
+            rule: format!("-d {METADATA_ADDRESS}/32 -j {chain}") },
+        IptablesRestoreCommand::Append { table: "filter", chain,
+            rule: format!("-i tap0 -p tcp --dport {METADATA_PORT} -j ACCEPT") },
+        IptablesRestoreCommand::Append { table: "filter", chain, rule: "-j REJECT".into() },
+        IptablesRestoreCommand::Insert { table: "nat", chain: "PREROUTING", position: 1,
+            rule: format!("-i tap0 -d {METADATA_ADDRESS}/32 -p tcp --dport 80 -j DNAT --to-destination {METADATA_ADDRESS}:{METADATA_PORT}") },
+    ]
+}
+
+#[cfg(feature = "hypervisor-dragonball")]
+pub(super) fn initialize_namespace_metadata() -> Result<()> {
+    apply_iptables_commands(&build_metadata_commands(), OpenFailurePolicy::ReturnErr)
+        .context("initialize namespace metadata isolation")
+}
+
 static PLATFORM_DENIED_CIDRS: OnceLock<Box<[Ipv4Network]>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -816,5 +838,23 @@ mod tests {
             std::panic::catch_unwind(|| domain_matches("é.example.com", "*.example.com")).is_ok()
         );
         assert!(domain_matches("API.Example.COM", "*.example.com"));
+    }
+
+    #[test]
+    #[cfg(feature = "hypervisor-dragonball")]
+    fn metadata_is_tap_only_and_precedes_egress_proxy_redirection() {
+        let commands = build_metadata_commands();
+        assert!(commands.iter().any(|command| matches!(command,
+            IptablesRestoreCommand::Insert { table: "nat", chain: "PREROUTING", position: 1, rule }
+            if rule == "-i tap0 -d 169.254.169.254/32 -p tcp --dport 80 -j DNAT --to-destination 169.254.169.254:15001")));
+        assert!(commands.iter().any(|command| matches!(command,
+            IptablesRestoreCommand::Append { table: "filter", chain: "AGENTENV-METADATA", rule }
+            if rule == "-i tap0 -p tcp --dport 15001 -j ACCEPT")));
+        assert!(commands.iter().any(|command| matches!(command,
+            IptablesRestoreCommand::Append { table: "filter", chain: "AGENTENV-METADATA", rule }
+            if rule == "-j REJECT")));
+        assert!(commands.iter().any(|command| matches!(command,
+            IptablesRestoreCommand::Insert { table: "filter", chain: "INPUT", position: 1, rule }
+            if rule == "-d 169.254.169.254/32 -j AGENTENV-METADATA")));
     }
 }

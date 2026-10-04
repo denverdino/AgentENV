@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -86,6 +86,7 @@ impl OssClient {
         prefix: String,
         credential_source: CredentialSource,
         addressing_override: Option<AddressingStyle>,
+        timeout: Option<Duration>,
     ) -> Result<Self> {
         // Detection also validates the endpoint URL, so it always runs; an
         // explicit config override then wins over the detected style.
@@ -97,7 +98,7 @@ impl OssClient {
                 bucket,
                 endpoint,
                 region,
-                timeout: None,
+                timeout,
                 max_retries: None,
             },
             prefix,
@@ -337,7 +338,7 @@ impl OssClient {
                 let write = operator.write_with(&oss_key, data);
                 let result = match etag.as_deref() {
                     Some(etag) => write.if_match(etag).await,
-                    None => write.if_none_match("*").await,
+                    None => write.if_not_exists(true).await,
                 };
                 match result {
                     Ok(_) => Ok(true),
@@ -580,6 +581,153 @@ mod tests {
     use super::OssClient;
     use object_store_operator::{AddressingStyle, CredentialSource};
 
+    #[tokio::test]
+    async fn oss_config_timeout_controls_slow_s3_requests() {
+        use axum::{routing::get, Router};
+        use std::time::Duration;
+
+        use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
+        use crate::snapshot::repository::backends::oss::config::NormalizedOssConfig;
+
+        // Keep the real S3 adapter and timeout layer; only the remote service
+        // is replaced by a delayed HTTP endpoint. Ignoring the configured
+        // timeout must make the short-deadline case incorrectly succeed.
+        let app = Router::new().route(
+            "/snapshots/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "payload"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for seconds in [Some(1), Some(4), None] {
+            let timeout_line = seconds
+                .map(|value| format!("timeout_secs = {value}"))
+                .unwrap_or_default();
+            let config: OssBackendConfig = toml::from_str(&format!(
+                "endpoint = {endpoint:?}\nbucket = \"snapshots\"\nregion = \"us-east-1\"\n\
+                 access_key_id = \"test\"\naccess_key_secret = \"test-secret\"\n{timeout_line}\n"
+            ))
+            .unwrap();
+            let config =
+                NormalizedOssConfig::new(&config, SnapshotImageStoragePolicy::ObjectStorage)
+                    .unwrap();
+            let mut client = OssClient::new(
+                config.bucket().into(),
+                config.endpoint().into(),
+                config.region().into(),
+                config.prefix().into(),
+                config.credential_source(),
+                config.addressing_style(),
+                config.timeout(),
+            )
+            .unwrap();
+            client.operator_config.max_retries = Some(0);
+            let result = tokio::time::timeout(Duration::from_secs(10), client.get_bytes("slow"))
+                .await
+                .expect("bounded S3 request");
+            if seconds == Some(1) {
+                let error =
+                    result.expect_err("one-second deadline must reject a two-second request");
+                assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+            } else {
+                assert_eq!(result.unwrap().as_ref(), b"payload");
+            }
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn conditional_s3_create_and_replace_preserve_preconditions() {
+        use axum::{
+            body::Bytes,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::put,
+            Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        // Exercise our client through the real OpenDAL S3 adapter. The HTTP
+        // fixture checks wire preconditions and keeps the accepted object body.
+        let stored = Arc::new(Mutex::new(None::<Bytes>));
+        let app = Router::new()
+            .route(
+                "/snapshots/record",
+                put(
+                    |State(stored): State<Arc<Mutex<Option<Bytes>>>>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        let mut current = stored.lock().unwrap();
+                        let allowed = if headers.get("if-none-match").is_some_and(|v| v == "*") {
+                            current.is_none()
+                        } else if headers
+                            .get("if-match")
+                            .is_some_and(|v| v == "\"version-1\"")
+                        {
+                            current.is_some()
+                        } else {
+                            false
+                        };
+                        if allowed {
+                            *current = Some(body);
+                            (StatusCode::OK, "")
+                        } else {
+                            (
+                                StatusCode::PRECONDITION_FAILED,
+                                "<Error><Code>PreconditionFailed</Code></Error>",
+                            )
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&stored));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OssClient::new(
+            "snapshots".into(),
+            endpoint,
+            "us-east-1".into(),
+            String::new(),
+            CredentialSource::Static(object_store_operator::ResolvedCredential {
+                access_key_id: "test-key".into(),
+                secret_access_key: "test-secret".into(),
+                security_token: None,
+                expires_at: None,
+            }),
+            Some(AddressingStyle::Path),
+            None,
+        )
+        .unwrap();
+        assert!(client
+            .put_bytes_conditionally("record", "first", None)
+            .await
+            .unwrap());
+        assert!(!client
+            .put_bytes_conditionally("record", "clobber", None)
+            .await
+            .unwrap());
+        assert_eq!(stored.lock().unwrap().as_deref(), Some(b"first".as_slice()));
+        assert!(!client
+            .put_bytes_conditionally("record", "stale", Some("\"stale\""))
+            .await
+            .unwrap());
+        assert!(client
+            .put_bytes_conditionally("record", "second", Some("\"version-1\""))
+            .await
+            .unwrap());
+        assert_eq!(
+            stored.lock().unwrap().as_deref(),
+            Some(b"second".as_slice())
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn explicit_override_takes_precedence_over_detection() {
         let detected = OssClient::new(
@@ -588,6 +736,7 @@ mod tests {
             "auto".to_string(),
             String::new(),
             CredentialSource::Anonymous,
+            None,
             None,
         )
         .expect("build client with detected style");
@@ -603,6 +752,7 @@ mod tests {
             String::new(),
             CredentialSource::Anonymous,
             Some(AddressingStyle::Virtual),
+            None,
         )
         .expect("build client with override");
         assert_eq!(
@@ -620,6 +770,7 @@ mod tests {
             String::new(),
             CredentialSource::Anonymous,
             Some(AddressingStyle::Virtual),
+            None,
         )
         .expect_err("malformed endpoint must fail even with an explicit override");
     }

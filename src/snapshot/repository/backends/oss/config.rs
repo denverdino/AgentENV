@@ -3,6 +3,7 @@ use object_store_operator::{
     credential_source_from_fields, normalized_credential, AddressingStyle, CredentialFields,
     CredentialSource, CredentialSourceOptions,
 };
+use std::time::Duration;
 
 use crate::cfg::{OssAddressingStyle, OssBackendConfig, SnapshotImageStoragePolicy};
 
@@ -15,6 +16,7 @@ pub(crate) struct NormalizedOssConfig {
     credential_source: CredentialSource,
     snapshot_image_storage: SnapshotImageStoragePolicy,
     addressing_style: Option<AddressingStyle>,
+    timeout: Option<Duration>,
 }
 
 impl NormalizedOssConfig {
@@ -67,6 +69,9 @@ impl NormalizedOssConfig {
             credential_source,
             snapshot_image_storage,
             addressing_style,
+            timeout: config
+                .timeout_secs
+                .map(|seconds| Duration::from_secs(seconds.get())),
         })
     }
 
@@ -90,6 +95,10 @@ impl NormalizedOssConfig {
     /// the client should fall back to endpoint-based auto-detection.
     pub(crate) fn addressing_style(&self) -> Option<AddressingStyle> {
         self.addressing_style
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     pub(crate) fn credential_source(&self) -> CredentialSource {
@@ -128,6 +137,7 @@ mod tests {
             region: Some(" cn-hangzhou ".to_string()),
             addressing_style: None,
             cache_max_size_gb: Some(8),
+            timeout_secs: None,
         }
     }
 

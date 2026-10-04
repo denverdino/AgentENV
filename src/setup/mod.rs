@@ -5,6 +5,7 @@ pub mod overlaybd;
 mod packages;
 mod ublk;
 
+#[cfg(feature = "hypervisor-firecracker")]
 pub(crate) use deps::resolve_tools_image;
 
 use anyhow::{Context, Result};

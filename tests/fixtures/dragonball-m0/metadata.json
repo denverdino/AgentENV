@@ -1,0 +1,14 @@
+{
+  "status": "verified against actual M0 guest boot on 2026-09-30; wire templates normalized, token redacted",
+  "recording": "state/run/dragonball-m0/evidence/db-m0-NJdaTL/metadata-requests.json",
+  "recorded_boot_requests": [
+    {"method": "PUT", "path": "/latest/api/token", "headers": {"x-metadata-token-ttl-seconds": "60"}, "status": 200},
+    {"method": "GET", "path": "/", "headers": {"accept": "application/json", "x-metadata-token": "<redacted>"}, "status": 200}
+  ],
+  "tools_sha256": "60ba806a44975c7b2ca382f680de9da87af22ac65e288a683a921d1829e1c03d",
+  "envd_revision": "9c3b7c5dbd181ba819084276b8228f70936e911e",
+  "envd_source": "https://github.com/e2b-dev/infra/blob/9c3b7c5dbd181ba819084276b8228f70936e911e/packages/envd/internal/host/mmds.go",
+  "firecracker_source": "https://github.com/kvcache-ai/firecracker/tree/9fbc98e4dc05d03e1f00902ba4bb796395465099/src/vmm/src/mmds",
+  "token_request": "PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-metadata-token-ttl-seconds: 60\r\nContent-Length: 0\r\n\r\n",
+  "document_request": "GET / HTTP/1.1\r\nHost: 169.254.169.254\r\nX-metadata-token: {TOKEN}\r\nAccept: application/json\r\n\r\n"
+}

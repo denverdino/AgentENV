@@ -9,11 +9,12 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 
 /// Name `backend` takes when a record predates the field.
 pub const FIRECRACKER_BACKEND: &str = "firecracker";
+pub const DRAGONBALL_BACKEND: &str = "dragonball";
 
 /// Names a restore knows how to reach a VMM by.
-const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND];
+const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND, DRAGONBALL_BACKEND];
 
-fn default_backend() -> String {
+pub(crate) fn default_backend() -> String {
     FIRECRACKER_BACKEND.to_string()
 }
 
@@ -39,10 +40,18 @@ pub struct SandboxSnapshotManifest {
     /// means.
     #[serde(default = "default_backend")]
     pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_identity: Option<super::restore_identity::SnapshotRestoreIdentity>,
     pub vm_state: SnapshotVmStateArtifacts,
     pub memory: SnapshotMemoryArtifacts,
     pub rootfs: SnapshotRootfsArtifacts,
     pub attached_drives: Vec<SnapshotAttachedDriveArtifacts>,
+    /// Captured Dragonball physical volume identities; layer ownership remains in
+    /// the committed record's volume_snapshots, never in node-local paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_devices: Vec<SnapshotVolumeDevice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_slots: Vec<SnapshotVolumeSlot>,
     /// Number of reserved virtio-block slots available for launch-time volumes.
     #[serde(default)]
     pub volume_drive_slots: usize,
@@ -94,6 +103,28 @@ pub struct SnapshotAttachedDriveArtifacts {
     pub image_config_path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVolumeDevice {
+    pub drive_id: String,
+    pub mount_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<PathBuf>,
+    pub read_only: bool,
+    pub virtual_size: u64,
+}
+
+/// All reserved Dragonball slots, including placeholders with no guest mount.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVolumeSlot {
+    pub slot_id: String,
+    pub mount_path: Option<PathBuf>,
+    pub sub_path: Option<PathBuf>,
+    pub guest_read_only: bool,
+    pub capacity_bytes: u64,
+}
+
 impl SandboxSnapshotManifest {
     /// Describe a capture `backend` wrote. Pass the backend's own name, one
     /// of the `*_BACKEND` constants, so a restore reaches the VMM which took
@@ -111,9 +142,13 @@ impl SandboxSnapshotManifest {
         if !KNOWN_BACKENDS.contains(&backend) {
             bail!("backend '{backend}' names no VMM a restore can reach");
         }
+        if backend == DRAGONBALL_BACKEND {
+            bail!("Dragonball manifest requires restore identity; use new_dragonball");
+        }
         Self {
             version: MANIFEST_FORMAT_VERSION,
             backend: backend.to_string(),
+            restore_identity: None,
             vm_state: SnapshotVmStateArtifacts {
                 path: vm_state_path.into(),
             },
@@ -126,11 +161,37 @@ impl SandboxSnapshotManifest {
                 virtual_size: rootfs_virtual_size,
             },
             attached_drives: Vec::new(),
+            volume_devices: Vec::new(),
+            volume_slots: Vec::new(),
             volume_drive_slots: 0,
             physical_extra_drive_count: attached_drives.len(),
             memory_startup_pack: None,
         }
         .with_extra_drives(attached_drives)
+    }
+
+    pub fn new_dragonball(
+        identity: super::restore_identity::SnapshotRestoreIdentity,
+        vm_state_path: impl Into<PathBuf>,
+        mem_image_config_path: impl Into<PathBuf>,
+        mem_virtual_size: u64,
+        rootfs_image_config_path: impl Into<PathBuf>,
+        rootfs_virtual_size: u64,
+        attached_drives: &[ExtraDrive],
+    ) -> Result<Self> {
+        identity.validate_profile().map_err(anyhow::Error::msg)?;
+        let mut manifest = Self::new(
+            FIRECRACKER_BACKEND,
+            vm_state_path,
+            mem_image_config_path,
+            mem_virtual_size,
+            rootfs_image_config_path,
+            rootfs_virtual_size,
+            attached_drives,
+        )?;
+        manifest.backend = DRAGONBALL_BACKEND.into();
+        manifest.restore_identity = Some(identity);
+        Ok(manifest)
     }
 
     pub fn extra_drives(&self) -> Vec<ExtraDrive> {
@@ -246,6 +307,7 @@ mod tests {
         let manifest = SandboxSnapshotManifest {
             version: MANIFEST_FORMAT_VERSION,
             backend: default_backend(),
+            restore_identity: None,
             vm_state: SnapshotVmStateArtifacts {
                 path: PathBuf::from("vm_state.bin"),
             },
@@ -258,6 +320,8 @@ mod tests {
                 virtual_size: 4096,
             },
             attached_drives: vec![known],
+            volume_devices: Vec::new(),
+            volume_slots: Vec::new(),
             volume_drive_slots: 0,
             physical_extra_drive_count: 1,
             memory_startup_pack: None,

@@ -724,6 +724,7 @@ impl MetadataStore for ScriptedWaitStore {
 }
 
 #[tokio::test]
+#[cfg(feature = "hypervisor-firecracker")]
 async fn with_in_memory_store_constructs_without_panic() {
     setup();
     let orchestrator = Orchestrator::with_in_memory_store().await;
@@ -842,6 +843,35 @@ fn paused_resume_metadata(sandbox_id: SandboxId) -> SandboxMetadata {
         paused_state: Some(test_paused_state().clone()),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn paused_unsupported_backend_resume_preserves_state_and_record() -> anyhow::Result<()> {
+    setup();
+    let id = SandboxId::new();
+    let persister = RecordingPersister::with_loaded(vec![SandboxMetadata {
+        id,
+        state: SandboxState::Paused,
+        paused_state: None,
+        ..Default::default()
+    }]);
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+        test_runtime_image_refs(),
+    )
+    .await?;
+    assert!(orchestrator
+        .resume_sandbox(id, NewTimeout::UseExisting)
+        .await
+        .is_err());
+    assert_eq!(
+        orchestrator.get_sandbox(&id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    assert!(!persister.calls().contains(&RecordingCall::MarkResuming));
+    Ok(())
 }
 
 /// The expected `OrchestratorMetrics` snapshot for a state in which a single

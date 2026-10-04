@@ -1,10 +1,10 @@
 # 使用 Dragonball 替换 Firecracker
 
-状态：用户已于 2026-09-30 确认设计，尚未实现或完成虚拟机实测。
+状态：用户已确认设计，并于 2026-10-01 确认 M1 计划与 Native 执行。M0 与原 Firecracker 全量回归已完成；M1 正在实施，默认后端尚未切换。
 
-日期：2026-09-29。
+日期：2026-09-29。2026-10-02 目标修订：保留 Firecracker 与 Dragonball 为可选组件，支持编译时选择；不再以删除 Firecracker 为 M5 目标。此修订优先于下文历史迁移建议，具体见 [组件设计](./hypervisor-components-design.md)。
 
-实施计划：[M0：Dragonball 接入资格验证](./dragonball-m0-implementation-plan.md)。
+实施计划：[M0：Dragonball 接入资格验证](./dragonball-m0-implementation-plan.md)、[M1：运行中一致性](./dragonball-m1-implementation-plan.md)、[M1–M5 执行路线](./dragonball-m1-m5-roadmap.md)。证据见 [M0 结果](./dragonball-m0-results.md)。
 
 AgentENV 基线：`875faeecfbc2c69eed709de06764003b86ac5c28`。
 
@@ -102,6 +102,8 @@ flowchart TB
 进程启动时进入对应 network namespace，接收经过节点解析的设备路径/FD、工作目录和身份；在 guest 执行前完成资源绑定及 seccomp 设置。控制 UDS 位于私有运行目录，具有受限权限和 peer 校验，不向 guest 或公网暴露。沿用非 root runtime 用户与既有 host setup；新增 syscall、设备访问或内存读取要求进入启动自检，不要求 server 整体长期提权。
 
 停止顺序为禁止新请求、停设备/vCPU、确认进程退出，再释放内存 ublk 引用、磁盘设备和网络 slot。runner 崩溃由节点回收；节点意外退出时 runner 需要父进程退出检测和进程组清理，避免 orphan VM。正常关停继续先持久化为 `Paused`。不能用 `Drop` 代替异步资源清理，也不能在 runner 仍访问设备时归还 pool entry。
+
+Dragonball 懒加载 RAM 还有内核 APF 生命周期：runner 被 reap 后，缺页 worker 仍可能持有旧映射。因此 RAM ublk generation 仅在本地兄弟实例间共享，不进入可重新绑定的 warm pool；最后一个用户释放时执行同步 DEL，成功后才释放底层不可变快照。删除失败、取消或无异步运行环境时保留底层 owner，不能用进程退出或缓存刷新替代内核引用排空证明。Firecracker、tools 和普通磁盘的 pool 策略不随此规则改变。
 
 ### 5.1 控制协议
 
@@ -308,7 +310,7 @@ runner 随 AgentENV 构建/发布，更新依赖下载、checksum、Docker/部�
 | M2：生产内存与设备 | ublk COW、累计 dirty/zero、balloon、卷槽变更、startup manifest | 与 full dump 对照；共享镜像不变；连续捕获/清零/回收/预取回归 |
 | M3：平台集成 | 通用 factory、模板、版本/仓库、配置/依赖、运维指标 | 旧 FC 回归、DB POSIX/OSS、扩展、registry/P2P、节点重启恢复 |
 | M4：灰度与默认切换 | 分池、模板重建、性能与故障验证、回滚演练 | 正确性全通过且性能满足预先冻结的指标；旧池有排空方案 |
-| M5：退役 | 删除 FC backend/client/pool/资产及过渡配置 | 无仍需 FC 恢复的保留资源；PVM/aarch64 范围得到单独处理 |
+| M5：组件验收 | 保留 FC/DB 可选 backend，独立构建、打包与兼容策略 | FC-only/DB-only 构建与回归通过；保留历史恢复资产；明确各平台支持范围 |
 
 M0 通过只说明接入成立。M1–M3 的功能缺口不应通过减少默认 API 能力来掩盖。暂不估算日历工期：主要不确定性集中在设备冻结、balloon/COW 与卷槽 guest 行为，应以 M0/M1 的结果拆分可估算任务。
 

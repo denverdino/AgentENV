@@ -11,7 +11,6 @@ pub(super) async fn test_api(
         cfg::AppConfig,
         image::ImageResolver,
         orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator},
-        sandbox::FirecrackerSandboxFactory,
         snapshot::{
             mock::write_mock_built_artifacts,
             repository::backends::{PosixFsBackend, PosixFsBackendConfig},
@@ -38,7 +37,7 @@ pub(super) async fn test_api(
     let record = manager.publish(metadata, manifest, None).await?;
     let orchestrator = Orchestrator::new(
         InMemoryMetadataStore::new(),
-        FirecrackerSandboxFactory::new(),
+        crate::sandbox::selected::test_factory(),
         FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
     )
     .await?;

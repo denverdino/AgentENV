@@ -2182,6 +2182,7 @@ mod tests {
             "prefix".to_string(),
             CredentialSource::Anonymous,
             None,
+            None,
         )
         .expect("oss client");
         OssSnapshotRepository::new(
@@ -2253,6 +2254,7 @@ mod tests {
                     "region".to_string(),
                     "prefix".to_string(),
                     CredentialSource::Anonymous,
+                    None,
                     None,
                 )
                 .expect("oss client"),

@@ -40,6 +40,7 @@ pub(crate) struct EnvdInstance {
 }
 
 impl EnvdInstance {
+    #[cfg(any(feature = "hypervisor-firecracker", test))]
     pub(crate) async fn metrics(&self) -> Result<super::SandboxMetric> {
         self.ensure_live()?;
         let raw = default_api::metrics_get(&self.config).await?;

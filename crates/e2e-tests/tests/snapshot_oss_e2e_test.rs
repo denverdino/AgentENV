@@ -29,6 +29,9 @@ use tempfile::TempDir;
 
 fn test_runtime_versions() -> SnapshotRuntimeVersions {
     SnapshotRuntimeVersions {
+        backend: agentenv::sandbox::FIRECRACKER_BACKEND.into(),
+        vmm_version: None,
+        restore_identity: None,
         kernel_version: "kernel".to_string(),
         firecracker_version: "fc".to_string(),
         envd_version: "envd".to_string(),
@@ -193,6 +196,7 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
         region: Some(fixture.region.clone()),
         addressing_style: None,
         cache_max_size_gb: Some(1),
+        timeout_secs: None,
     }
 }
 

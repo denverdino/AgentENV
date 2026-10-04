@@ -7,7 +7,7 @@ use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use agentenv::sandbox::{selected, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
@@ -32,6 +32,10 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 #[derive(Debug, Parser)]
 #[command(name = "agentenv server")]
 struct ServerCli {
+    /// Print compiled component identity without loading config or provisioning.
+    #[arg(long, conflicts_with_all = ["setup_only", "setup_host"])]
+    component_info_json: bool,
+
     /// Run setup/provisioning only, then exit.
     #[arg(long)]
     setup_only: bool,
@@ -59,6 +63,22 @@ async fn main() -> anyhow::Result<()> {
     agentenv_observability::init_prometheus_recorder()?;
 
     let cli = ServerCli::parse();
+    if cli.component_info_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "backend": selected::BACKEND,
+                "firecracker": cfg!(feature = "hypervisor-firecracker"),
+                "dragonball": cfg!(feature = "hypervisor-dragonball"),
+                "debug_assertions": cfg!(debug_assertions),
+                "architecture": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+                "version": env!("CARGO_PKG_VERSION"),
+                "git_commit": env!("AENV_GIT_COMMIT"),
+            })
+        );
+        return Ok(());
+    }
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
@@ -100,8 +120,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+    if let Err(err) = selected::prime_pool().await {
+        warn!(target: "agentenv", error = %err, "backend pool prime failed; continuing startup");
     }
 
     let snapshot_p2p_transport = config
@@ -125,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
+    let factory = selected::factory_with_cpu_config(Arc::clone(&cluster_cpu_arc))?;
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
         factory,
         Arc::clone(&volume_manager),
@@ -137,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
             ObservabilityService::new(
                 identity,
                 Arc::clone(&orchestrator),
-                config.resolved_cpu_template_helper(),
+                selected::cpu_template_helper(),
                 cluster_cpu_arc,
             )
             .await,
@@ -208,11 +228,8 @@ async fn main() -> anyhow::Result<()> {
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
             }
-            if let Some(pool) = FirecrackerPool::global() {
-                info!(target: "agentenv", "shutting down firecracker pool");
-                if let Err(err) = pool.shutdown().await {
-                    warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
-                }
+            if let Err(err) = selected::shutdown_pool().await {
+                warn!(target: "agentenv", error = %err, "error occurred while shutting down backend pool");
             }
             info!(target: "agentenv", "shutting down ublk daemon");
             if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {

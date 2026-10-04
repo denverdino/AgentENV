@@ -85,6 +85,7 @@ impl OssBackend {
             config.prefix().to_string(),
             config.credential_source(),
             config.addressing_style(),
+            config.timeout(),
         )?);
 
         let repository: Arc<dyn SnapshotRepository> = Arc::new(OssSnapshotRepository::new(

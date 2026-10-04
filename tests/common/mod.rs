@@ -3,11 +3,14 @@ use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::image::ImageResolver;
-use agentenv::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
+use agentenv::sandbox::UblkDeviceManager;
+#[cfg(feature = "hypervisor-firecracker")]
+use agentenv::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig};
 use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
 use agentenv::snapshot::repository::SnapshotRepository;
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
+#[cfg(feature = "hypervisor-firecracker")]
 use anyhow::Result;
 use tokio::sync::OnceCell;
 
@@ -23,6 +26,16 @@ pub async fn setup() {
     let config = setup_runtime_only().await;
     DEFAULT_ROOTFS_IMAGE_CONFIG
         .get_or_init(|| async {
+            // Resolve assets outside the disposable network namespace. Backend
+            // lifecycle tests may use that explicit, materialized test fixture.
+            if let Some(path) = std::env::var_os("AENV_TEST_ROOTFS_IMAGE_CONFIG") {
+                let path = std::path::PathBuf::from(path);
+                assert!(
+                    path.is_absolute() && path.is_file(),
+                    "invalid prepared rootfs fixture"
+                );
+                return path;
+            }
             let resolved = ImageResolver::new(config)
                 .resolve(TEST_ROOTFS_IMAGE)
                 .await
@@ -71,6 +84,7 @@ pub fn default_rootfs_template_build_spec_with_image_config() -> (TemplateBuildS
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "hypervisor-firecracker")]
 pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
     let image_config_path = DEFAULT_ROOTFS_IMAGE_CONFIG
         .get()

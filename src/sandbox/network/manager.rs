@@ -225,6 +225,7 @@ impl NetworkManager {
         }
     }
 
+    #[cfg(feature = "hypervisor-firecracker")]
     pub(crate) fn cleanup_allocated_slot(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
         self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
     }
@@ -1314,7 +1315,8 @@ mod tests {
                 "child failed to observe allocated network namespace: {netns_id}"
             );
 
-            println!("SLOT_IDX={slot_idx}");
+            // Serial libtest prints its progress prefix without a trailing newline.
+            println!("\nSLOT_IDX={slot_idx}");
             println!("NETNS_ID={netns_id}");
             println!("HOST_INTERACTION_IP={}", slot.host_interaction_ip);
 

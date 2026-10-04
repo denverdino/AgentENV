@@ -110,7 +110,7 @@ impl TemplateBuilder {
             TemplateBuildRunner::new().execute(context)
         })
         .await?;
-        let build_execution = match execution {
+        let mut build_execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
                 let reason = Self::build_failure_reason(&error);
@@ -136,20 +136,7 @@ impl TemplateBuilder {
         // no-op task when the feature is disabled or the backend carries no
         // capture payload); a detached continuation uploads the manifest once
         // the trace lands.
-        let recording = build_execution
-            .capture_artifacts
-            .and_then(|artifacts| {
-                artifacts
-                    .downcast::<crate::sandbox::FirecrackerSnapshotConfig>()
-                    .ok()
-            })
-            .map(|snapshot_config| crate::snapshot::StartupRecording {
-                trace: tokio::spawn(crate::sandbox::record_startup_pack(
-                    *snapshot_config,
-                    build_execution.output_dir.clone(),
-                )),
-                keep_alive: Box::new(()),
-            });
+        let recording = build_execution.capture.start_recording();
         let record = snapshot_manager
             .publish(
                 SnapshotPublishMetadata {
@@ -256,7 +243,7 @@ impl TemplateBuilder {
             startup: Self::startup_from_spec(spec),
             override_startup: spec.overrides_startup(),
             resources,
-            workspace,
+            workspace: Arc::new(workspace),
             steps: spec.steps().to_vec(),
             base,
             cpu_config_json: self.current_cpu_config(),
@@ -328,7 +315,7 @@ impl TemplateBuilder {
             startup,
             override_startup,
             resources,
-            workspace,
+            workspace: Arc::new(workspace),
             steps: spec.steps().to_vec(),
             base: TemplateBuildBase::Snapshot {
                 base_snapshot: Box::new(base_snapshot.clone()),

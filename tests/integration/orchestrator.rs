@@ -5,21 +5,71 @@ use agentenv::orchestrator::{
     CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore, NewTimeout,
     Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
-use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
+use agentenv::sandbox::{selected, SandboxNetworkPolicy};
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotSource,
     StartupCommand,
 };
+use agentenv::types::SandboxId;
 
 use anyhow::Result;
 use envd::process::{ListRequest, ProcessClient};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::tempdir;
+use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tonic::Request;
 use uuid::Uuid;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
+static ORCHESTRATOR_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+fn restart_fixture_root() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+#[test]
+fn restart_fixture_is_private() -> Result<()> {
+    let root = restart_fixture_root()?;
+    assert_eq!(
+        std::fs::metadata(root.path())?.permissions().mode() & 0o077,
+        0
+    );
+    Ok(())
+}
+
+async fn run_in_subprocess(test_name: &str) -> Result<bool> {
+    if std::env::var_os("AENV_ORCHESTRATOR_TEST_CHILD").is_some() {
+        return Ok(false);
+    }
+    // Shutdown permanently stops process-global managers. Isolate each case and
+    // serialize their host resources, without resetting production singletons.
+    let _guard = ORCHESTRATOR_TEST_LOCK.lock().await;
+    let root = restart_fixture_root()?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env("AENV_ORCHESTRATOR_TEST_CHILD", "1")
+        .env("AENV_ORCHESTRATOR_TEST_ROOT", root.path())
+        .kill_on_drop(true);
+    let status = timeout(TEST_TIMEOUT, command.status()).await??;
+    anyhow::ensure!(status.success(), "{test_name} subprocess failed: {status}");
+    if test_name == "orchestrator::orchestrator_lifecycle" {
+        // The old process must exit before another daemon can bind its socket or
+        // reopen RocksDB. The parent owns the fixture across both processes.
+        let status = timeout(
+            TEST_TIMEOUT,
+            command.env("AENV_ORCHESTRATOR_RESTART", "1").status(),
+        )
+        .await??;
+        anyhow::ensure!(status.success(), "restarted orchestrator failed: {status}");
+    }
+    Ok(true)
+}
 
 async fn envd_process_list_status(
     target: &agentenv::orchestrator::ProxyTarget,
@@ -51,10 +101,25 @@ fn host_file_persister(root: PathBuf) -> FileBackedSandboxPersister {
 
 #[tokio::test]
 async fn orchestrator_lifecycle() -> Result<()> {
+    if run_in_subprocess("orchestrator::orchestrator_lifecycle").await? {
+        return Ok(());
+    }
+    let root = PathBuf::from(
+        std::env::var_os("AENV_ORCHESTRATOR_TEST_ROOT").expect("lifecycle fixture root"),
+    );
+    if std::env::var_os("AENV_ORCHESTRATOR_RESTART").is_some() {
+        common::setup_runtime_only().await;
+        let (sandbox_id, access_token): (SandboxId, String) =
+            serde_json::from_slice(&std::fs::read(root.join("restart.json"))?)?;
+        return timeout(
+            TEST_TIMEOUT,
+            assert_lifecycle_after_restart(root.join("paused-sandboxes"), sandbox_id, access_token),
+        )
+        .await?;
+    }
     common::setup().await;
     timeout(TEST_TIMEOUT, async {
-        let root = tempdir()?;
-        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
+        let (builder, snapshot_manager, _) = common::snapshot_test_parts(&root);
         let alias = format!("orchestrator-test-shared-{}", Uuid::now_v7());
 
         let stored = builder
@@ -68,8 +133,9 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let runnable = snapshot_manager.resolve_runnable(stored).await?;
 
         let store = InMemoryMetadataStore::new();
-        let factory = FirecrackerSandboxFactory::new();
-        let paused_store = root.path().join("paused-sandboxes");
+        let factory =
+            selected::factory_with_cpu_config(std::sync::Arc::new(std::sync::RwLock::new(None)))?;
+        let paused_store = root.join("paused-sandboxes");
         let persister = host_file_persister(paused_store.clone());
         let orchestrator = Orchestrator::new(store, factory, persister).await?;
         let case_id = Uuid::now_v7().to_string();
@@ -164,54 +230,12 @@ async fn orchestrator_lifecycle() -> Result<()> {
         orchestrator.shutdown().await?;
         drop(orchestrator);
 
-        let restarted = Orchestrator::new(
-            InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
-            host_file_persister(paused_store),
-        )
-        .await?;
-        let restored = restarted
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("persisted paused metadata should be loaded after orchestrator restart");
-        assert_eq!(restored.state, SandboxState::Paused);
-        assert_eq!(
-            restarted.proxy_lookup_for(&sandbox_id).await?,
-            ProxyLookupResult::Paused { auto_resume: false }
-        );
-
-        let resumed = restarted
-            .resume_sandbox(sandbox_id, NewTimeout::Set(Duration::from_secs(120)))
-            .await?;
-        assert_eq!(resumed.state, SandboxState::Running);
-        assert_eq!(resumed.timeout, Some(Duration::from_secs(120)));
-        let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
-        assert!(
-            matches!(lookup, ProxyLookupResult::Ready(_)),
-            "expected proxy lookup Ready after resume for sandbox {sandbox_id}, got {lookup:?}"
-        );
-        let resumed_token = restarted
-            .get_envd_access_token(&resumed)
-            .expect("resumed secure sandbox access token");
-        assert_eq!(resumed_token, access_token);
-        let ProxyLookupResult::Ready(target) = lookup else {
-            unreachable!();
-        };
-        assert_eq!(
-            envd_process_list_status(&target, None).await?,
-            envd::reqwest::StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            envd_process_list_status(&target, Some("wrong-token")).await?,
-            envd::reqwest::StatusCode::UNAUTHORIZED
-        );
-        assert_envd_process_list_succeeds(&target, resumed_token.expose()).await?;
-
-        restarted.delete_sandbox(sandbox_id).await?;
-        let deleted = restarted.get_sandbox(&sandbox_id).await?;
-        assert!(deleted.is_none(), "sandbox should be removed after delete");
-        let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
-        assert_eq!(lookup, ProxyLookupResult::NotFound);
+        // The fixture directory is private and parent-owned. Never pass the
+        // ephemeral token in process arguments or print it on assertion failure.
+        std::fs::write(
+            root.join("restart.json"),
+            serde_json::to_vec(&(sandbox_id, access_token.expose()))?,
+        )?;
 
         Ok(())
     })
@@ -219,8 +243,75 @@ async fn orchestrator_lifecycle() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("test timed out"))?
 }
 
+async fn assert_lifecycle_after_restart(
+    paused_store: PathBuf,
+    sandbox_id: SandboxId,
+    access_token: String,
+) -> Result<()> {
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        selected::factory_with_cpu_config(std::sync::Arc::new(std::sync::RwLock::new(None)))?,
+        host_file_persister(paused_store),
+    )
+    .await?;
+    let restored = restarted
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("persisted paused metadata should be loaded after orchestrator restart");
+    assert_eq!(restored.state, SandboxState::Paused);
+    assert_eq!(
+        restarted.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Paused { auto_resume: false }
+    );
+
+    let resumed = restarted
+        .resume_sandbox(sandbox_id, NewTimeout::Set(Duration::from_secs(120)))
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert_eq!(resumed.timeout, Some(Duration::from_secs(120)));
+    let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
+    assert!(
+        matches!(lookup, ProxyLookupResult::Ready(_)),
+        "expected proxy lookup Ready after resume for sandbox {sandbox_id}, got {lookup:?}"
+    );
+    let resumed_token = restarted
+        .get_envd_access_token(&resumed)
+        .expect("resumed secure sandbox access token");
+    assert!(
+        resumed_token.expose() == access_token,
+        "access token must survive restart"
+    );
+    let ProxyLookupResult::Ready(target) = lookup else {
+        unreachable!();
+    };
+    assert_eq!(
+        envd_process_list_status(&target, None).await?,
+        envd::reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        envd_process_list_status(&target, Some("wrong-token")).await?,
+        envd::reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_envd_process_list_succeeds(&target, resumed_token.expose()).await?;
+
+    restarted.delete_sandbox(sandbox_id).await?;
+    let deleted = restarted.get_sandbox(&sandbox_id).await?;
+    assert!(deleted.is_none(), "sandbox should be removed after delete");
+    let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
+    assert_eq!(lookup, ProxyLookupResult::NotFound);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Result<()> {
+    if run_in_subprocess(
+        "orchestrator::orchestrator_capture_snapshot_can_be_published_and_relaunched",
+    )
+    .await?
+    {
+        return Ok(());
+    }
     common::setup().await;
     timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;

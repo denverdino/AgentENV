@@ -1,0 +1,27 @@
+# Build with --platform linux/amd64 and a locally qualified candidate bundle.
+# Match the builder's libc baseline; override only with a compatible base.
+ARG BASE_IMAGE=ubuntu:26.04
+FROM ${BASE_IMAGE}
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = amd64
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates curl e2fsprogs iproute2 iptables jq sudo umoci zstd \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ARG BUNDLE=agentenv-dragonball.tar.gz
+ARG BUNDLE_SHA256
+COPY ${BUNDLE} /tmp/agentenv-dragonball.tar.gz
+RUN test -n "${BUNDLE_SHA256}" \
+    && echo "${BUNDLE_SHA256}  /tmp/agentenv-dragonball.tar.gz" | sha256sum --check --strict \
+    && mkdir -p /opt /etc/overlaybd \
+    && tar -xzf /tmp/agentenv-dragonball.tar.gz -C /opt \
+    && bash /opt/agentenv-dragonball/verify.sh \
+    && printf '{}\n' > /etc/overlaybd/overlaybd.json \
+    && rm /tmp/agentenv-dragonball.tar.gz
+
+ENV AENV_CONFIG_PATH=/opt/agentenv-dragonball/config/dragonball.toml
+ENV AENV_HOME_PATH=/var/lib/aenv-dragonball
+ENV AENV_RUNTIME_PATH=/run/aenv-dragonball
+ENV AENV_DEPS_PATH=/opt/agentenv-dragonball/deps
+WORKDIR /opt/agentenv-dragonball
+ENTRYPOINT ["/opt/agentenv-dragonball/bin/server"]

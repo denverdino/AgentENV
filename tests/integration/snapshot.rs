@@ -19,6 +19,9 @@ use crate::common;
 
 fn sample_runtime_versions() -> SnapshotRuntimeVersions {
     SnapshotRuntimeVersions {
+        backend: agentenv::sandbox::FIRECRACKER_BACKEND.into(),
+        vmm_version: None,
+        restore_identity: None,
         kernel_version: "kernel".to_string(),
         firecracker_version: "fc".to_string(),
         envd_version: "envd".to_string(),

@@ -68,6 +68,9 @@ pub struct SandboxMetadata {
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
     pub paused_state: Option<Arc<dyn PausedSandboxState>>,
+    /// Liveness references retained even when this node cannot decode paused state.
+    #[serde(skip)]
+    pub retained_runtime_artifacts: crate::sandbox::RuntimeArtifactSet,
 }
 
 impl Default for SandboxMetadata {
@@ -100,6 +103,7 @@ impl Default for SandboxMetadata {
             volume_mounts: HashMap::new(),
             secure: false,
             paused_state: None,
+            retained_runtime_artifacts: Default::default(),
         }
     }
 }

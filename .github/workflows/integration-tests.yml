@@ -6,6 +6,26 @@ on:
       log_level:
         description: "Log level for the tests"
         required: false
+      dragonball_m0:
+        description: "Run M0 on a provisioned dragonball-m0 Linux/KVM/ublk runner"
+        type: boolean
+        default: false
+      dragonball_m1:
+        description: "Run M1 on a provisioned non-root Dragonball KVM/ublk runner"
+        type: boolean
+        default: false
+      dragonball_m2:
+        description: "Run M2 incremental memory/DAMON qualification on a provisioned non-root runner"
+        type: boolean
+        default: false
+      dragonball_m3:
+        description: "Run M3 OSS/extensions/private-registry/P2P on a provisioned non-root runner"
+        type: boolean
+        default: false
+      dragonball_candidates:
+        description: "Run M4/M5 relocated candidate restore and rollback on a provisioned isolated host"
+        type: boolean
+        default: false
   pull_request:
     paths-ignore: &ignore_docs
       - "**.md"
@@ -33,6 +53,123 @@ permissions:
   packages: read
 
 jobs:
+  dragonball-candidates:
+    # Protected manual opt-in. Root orchestrates namespaces; workloads use aenv.
+    # Provision AENV_M4_INPUTS on the runner; no implicit download/install/build.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dragonball_candidates }}
+    runs-on: [self-hosted, linux, x64, dragonball-candidates]
+    environment: dragonball-candidates
+    concurrency:
+      group: dragonball-candidates-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check explicitly provisioned candidate inputs
+        run: |
+          test "$(id -u)" != 0
+          test "$(id -u aenv)" != 0
+          test -n "${AENV_M4_INPUTS:-}" && test -r "$AENV_M4_INPUTS"
+          case "$AENV_M4_INPUTS" in /*) ;; *) exit 1 ;; esac
+          test -e /dev/kvm && test -e /dev/ublk-control
+          python3 -c 'import sys; assert sys.version_info >= (3, 11)'
+      - name: Check lab contracts without host privileges
+        run: make test-dragonball-m4-unit
+      - name: Qualify empty-cache restore across isolated nodes
+        run: sudo -n make test-dragonball-m4 AENV_M4_INPUTS="$AENV_M4_INPUTS" AENV_M4_SCENARIO=restore
+      - name: Qualify independent backends and rollback routing
+        run: sudo -n make test-dragonball-m4 AENV_M4_INPUTS="$AENV_M4_INPUTS" AENV_M4_SCENARIO=rollback
+
+  dragonball-m3:
+    # Protected manual opt-in; PR events never execute on this privileged host.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dragonball_m3 }}
+    runs-on: [self-hosted, linux, x64, dragonball-m3]
+    environment: dragonball-m3
+    concurrency:
+      group: dragonball-m3-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      AENV_TEST_STATE_DIR: ${{ runner.temp }}/aenv-dragonball-m3-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check explicitly provisioned M3 prerequisites
+        run: |
+          test "$(id -u)" != 0
+          test -r /dev/kvm && test -w /dev/kvm
+          test -r /dev/ublk-control && test -w /dev/ublk-control
+          test -n "${AENV_CONFIG_PATH:-}" && test -r "$AENV_CONFIG_PATH"
+          test -n "${AENV_TEST_DEPS_PATH:-}" && test -d "$AENV_TEST_DEPS_PATH"
+          test -n "${AENV_M3_S3_SERVER:-}" && test -x "$AENV_M3_S3_SERVER"
+          test -n "${AENV_M3_REGISTRY_SERVER:-}" && test -x "$AENV_M3_REGISTRY_SERVER"
+          for command in cc debugfs ip nsenter unshare jq openssl htpasswd; do command -v "$command"; done
+          mkdir -p "$AENV_TEST_STATE_DIR"
+      - name: Qualify DB-only platform contracts
+        run: make test-dragonball-m3 PROFILE=debug
+
+  dragonball-m2:
+    # Protected manual opt-in only; PR events never receive host capabilities.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dragonball_m2 }}
+    runs-on: [self-hosted, linux, x64, dragonball-m2]
+    environment: dragonball-m2
+    concurrency:
+      group: dragonball-m2-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      AENV_TEST_STATE_DIR: ${{ runner.temp }}/aenv-dragonball-m2-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check explicitly provisioned M2 prerequisites
+        run: |
+          test "$(id -u)" != 0
+          test "$(getconf PAGESIZE)" = 4096
+          test -r /dev/kvm && test -w /dev/kvm
+          test -r /dev/ublk-control && test -w /dev/ublk-control
+          test -n "${AENV_CONFIG_PATH:-}" && test -r "$AENV_CONFIG_PATH"
+          test -n "${AENV_TEST_DEPS_PATH:-}" && test -d "$AENV_TEST_DEPS_PATH"
+          for command in cc debugfs ip nsenter unshare; do command -v "$command"; done
+      - name: Qualify full oracle, incremental memory, slots and startup recording
+        run: make test-dragonball-m2 PROFILE=debug
+
+  dragonball-m1:
+    # Manual only: never execute arbitrary PR code on this capability-enabled host.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dragonball_m1 }}
+    runs-on: [self-hosted, linux, x64, dragonball-m1]
+    environment: dragonball-m1
+    concurrency:
+      group: dragonball-m1-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      AENV_TEST_STATE_DIR: ${{ runner.temp }}/aenv-dragonball-m1-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check explicitly provisioned M1 prerequisites
+        run: |
+          test "$(id -u)" != 0
+          test -r /dev/kvm && test -w /dev/kvm
+          test -r /dev/ublk-control && test -w /dev/ublk-control
+          test -n "${AENV_CONFIG_PATH:-}" && test -r "$AENV_CONFIG_PATH"
+          test -n "${AENV_TEST_DEPS_PATH:-}" && test -d "$AENV_TEST_DEPS_PATH"
+          for command in cc debugfs ip nsenter unshare; do command -v "$command"; done
+      - name: Qualify active I/O, published snapshots, forks and restart
+        run: make test-dragonball-m1 PROFILE=debug
+
+  dragonball-m0:
+    # Never send untrusted PR code to a privileged self-hosted runner.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dragonball_m0 }}
+    runs-on: [self-hosted, linux, x64, dragonball-m0]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check explicitly provisioned M0 prerequisites
+        run: |
+          test "$(id -u)" != 0
+          test -r /dev/kvm && test -w /dev/kvm
+          test -r /dev/ublk-control && test -w /dev/ublk-control
+          test -n "${AENV_CONFIG_PATH:-}" && test -r "$AENV_CONFIG_PATH"
+          test -n "${AENV_TEST_DEPS_PATH:-}" && test -d "$AENV_TEST_DEPS_PATH"
+          command -v ip
+          command -v unshare
+      - name: Qualify the configured M0 kernel and guest assets
+        run: make test-dragonball-m0 PROFILE=debug
+
   agentenv-tests:
     runs-on: ubuntu-latest
     steps:

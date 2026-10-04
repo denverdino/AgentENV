@@ -32,6 +32,42 @@ Packaged runtime dependency versions and download URLs live in
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.
 
+## Hypervisor component selection
+
+The server backend is selected at compile time, independently of
+`virtualization_mode`. Firecracker remains the default and is not retired.
+
+```bash
+# Firecracker-only server (the default).
+cargo build -p agentenv --bin server
+# Dragonball-only Linux x86_64/KVM server and its separate runner.
+cargo build -p agentenv --bin server --no-default-features --features hypervisor-dragonball
+cargo build -p agentenv-dragonball-runner --bin aenv-dragonball --locked
+# Or: make build-server-dragonball
+```
+
+Use `-p agentenv` for a single-backend build: selecting other workspace packages
+can unify their default features back into AgentENV. With both backend features
+enabled (including `--all-features`), the server selects Firecracker; both
+adapters remain available to qualification tests. No runtime backend switch is
+provided. Snapshot memory is not portable between the two backends.
+
+Dragonball requires `[dragonball].binary_path` (or `AENV_DRAGONBALL_BINARY_PATH`)
+and an explicit `[kernel].image_path` for its qualified kernel. Also set
+`[tools].drive_path` to the qualified plain ext4 tools image and `[tools].version`
+to that image's release version; automatic OCI/native-tools provisioning is not
+supported by this Dragonball profile. Missing tools inputs fail setup before
+downloads or dependency-directory creation. The runner must
+be an executable regular file; relative paths resolve against the config file.
+Deploy the runner built from the same locked source alongside the server.
+Setup does not download Firecracker or its default kernel for a DB-only build.
+PVM, non-x86_64 hosts, and Firecracker CPU templates are unsupported by this
+Dragonball profile. Existing packaged releases remain Firecracker unless built
+and packaged explicitly with the commands above.
+
+See [component design](../internals/hypervisor-components-design.md) for the
+composition boundary and qualification requirements.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.
@@ -505,6 +541,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `region` | string | none | Region passed to the S3-compatible object-store client; required for current OSS backend |
 | `addressing_style` | string | auto-detect | Bucket addressing style, `"virtual"` or `"path"`. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider's required or preferred style differs from the detected default |
 | `cache_max_size_gb` | integer | `10` | Maximum size of the node-local OSS artifact cache in GiB |
+| `timeout_secs` | positive integer | `30` | Per-attempt operation and I/O timeout for the snapshot OSS client and generated OverlayBD OSS configuration, including multipart writes. Retries may extend the total operation beyond this value |
 
 Notes:
 
@@ -512,6 +549,7 @@ Notes:
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
 - Leave `addressing_style` unset when endpoint-based detection is correct. Set it to `"virtual"` or `"path"` when the provider's required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.
+- For a slow test storage backend, set `timeout_secs = 120` explicitly and allow a larger outer API deadline. This changes the failure deadline, not storage throughput or durability; omitted values retain 30 seconds and zero is rejected.
 - The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (`ossConfig.defaultAddressingStyle`), which the runtime uses when reading remote managed snapshot layers during sandbox restore.
 
 For an S3-compatible provider where virtual-host addressing is required or preferred — for example [Tigris](https://www.tigrisdata.com/docs/) — set `addressing_style` explicitly:
