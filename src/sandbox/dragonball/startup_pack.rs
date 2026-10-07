@@ -20,6 +20,7 @@ use crate::{
 pub(super) struct RecordingConfig {
     pub(super) memory_config: PathBuf,
     pub(super) trace: PathBuf,
+    pub(super) lease: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 pub(crate) fn startup_recording(
@@ -36,12 +37,13 @@ pub(crate) fn startup_recording(
     // Publication can fail or be cancelled before a backend registers its
     // continuation. The recorder itself must participate in shutdown drain.
     let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()?;
+    let recording_lease = lease.clone();
     Some(StartupRecording::spawn_with_capture_lease(
         {
             let artifacts = artifacts.clone();
             async move {
                 let _guard = guard;
-                record_startup_pack(artifacts, policy).await
+                record_startup_pack(artifacts, policy, recording_lease).await
             }
         },
         Arc::new((artifacts, lease)),
@@ -51,6 +53,7 @@ pub(crate) fn startup_recording(
 pub(super) async fn record_startup_pack(
     artifacts: Arc<DragonballCaptureArtifacts>,
     policy: DragonballRuntimePolicy,
+    lease: Arc<dyn std::any::Any + Send + Sync>,
 ) -> Option<PathBuf> {
     if !recording_enabled_for(&policy.app.snapshot) {
         return None;
@@ -72,6 +75,7 @@ pub(super) async fn record_startup_pack(
         let config = RecordingConfig {
             memory_config,
             trace: dir.join(MEMORY_STARTUP_TRACE_ARTIFACT),
+            lease,
         };
         let result = boot_and_wait(artifacts, policy, config.clone()).await;
         if result.is_ok() {

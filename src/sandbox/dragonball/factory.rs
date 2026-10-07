@@ -59,12 +59,18 @@ impl DragonballSandboxFactory {
         inherit_extensions: bool,
     ) -> Result<DragonballSandbox> {
         // Read the qualified portable state before constructing or allocating any runtime.
-        let reader =
-            crate::sandbox::restore_identity::RestoreReader::from_build(self.build.clone())?;
+        let reader = crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(
+            self.build.clone(),
+        )?;
         let envelope =
             super::snapshot::read_for_restore(&reader, snapshot.record(), snapshot.manifest())?;
         let committed = snapshot.committed();
         let manifest = snapshot.manifest();
+        // Only automatic clones preserve the filesystem cached in captured guest RAM.
+        ensure!(
+            manifest.volume_devices.is_empty() || launch.extra_drives_in_snapshot,
+            "Dragonball does not support explicit volume replacement in occupied snapshot slots"
+        );
         ensure!(
             if manifest.volume_slots.is_empty() {
                 launch.extra_drives.len() == manifest.volume_devices.len()
@@ -143,8 +149,8 @@ impl DragonballSandboxFactory {
                 launch: launch.clone(),
                 recording_policy: self.policy.clone(),
                 storage: None,
+                memory_owner: None,
                 runnable_snapshot: Some(snapshot.clone()),
-                _memory_base: None,
             }),
             control_port: self.policy.app.tools.control_plane_port,
         };
@@ -162,7 +168,7 @@ impl DragonballSandboxFactory {
             "Dragonball reader build query failed"
         );
         let build: RuntimeBuildIdentity = serde_json::from_slice(&output.stdout)?;
-        crate::sandbox::restore_identity::RestoreReader::from_build(build.clone())?;
+        crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(build.clone())?;
         ensure!(
             build.dragonball_revision == QUALIFIED_DRAGONBALL_REVISION
                 && build.feature_profile == RUNTIME_FEATURE_PROFILE
@@ -231,8 +237,9 @@ impl DragonballSandboxFactory {
         let saved = state
             .downcast_ref::<super::capture::DragonballPausedState>()
             .context("not a Dragonball paused state")?;
-        let reader =
-            crate::sandbox::restore_identity::RestoreReader::from_build(self.build.clone())?;
+        let reader = crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(
+            self.build.clone(),
+        )?;
         let envelope = super::snapshot::read_envelope(&saved.artifacts.manifest.vm_state.path)?;
         reader.validate_restore(&envelope.identity)?;
         ensure!(
@@ -269,8 +276,9 @@ impl DragonballSandboxFactory {
         artifacts: Arc<super::capture::DragonballCaptureArtifacts>,
         child: crate::sandbox::SandboxForkSpec,
     ) -> Result<DragonballSandbox> {
-        let reader =
-            crate::sandbox::restore_identity::RestoreReader::from_build(self.build.clone())?;
+        let reader = crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(
+            self.build.clone(),
+        )?;
         reader.validate_restore(&artifacts.envelope.identity)?;
         ensure!(
             super::snapshot::read_envelope(&artifacts.manifest.vm_state.path)?
@@ -278,96 +286,8 @@ impl DragonballSandboxFactory {
             "captured envelope changed before fork"
         );
         let mut spec = artifacts.spec.clone();
-        let mut replaced = std::collections::HashSet::new();
-        let mut replacement_ids = std::collections::HashSet::new();
-        for (old_id, new_id) in &child.replace_drive_ids {
-            ensure!(
-                replaced.insert(old_id) && replacement_ids.insert(new_id),
-                "duplicate volume replacement"
-            );
-            let captured = spec
-                .extra_drives
-                .iter_mut()
-                .find(|drive| drive.drive_id() == old_id)
-                .context("replacement is not a captured device")?;
-            ensure!(
-                captured.is_volume(),
-                "cannot replace captured attached disk"
-            );
-            let replacement = child
-                .extra_drives
-                .iter()
-                .find(|drive| drive.drive_id() == new_id)
-                .context("replacement volume was not supplied")?;
-            ensure!(
-                replacement.is_volume()
-                    && replacement.virtual_size() == captured.virtual_size()
-                    && replacement.read_only() == captured.read_only()
-                    && replacement.mount_path() == captured.mount_path()
-                    && replacement.sub_path() == captured.sub_path(),
-                "replacement changes captured capacity/features/mount topology"
-            );
-            // Allocation supplies identity/ownership, never the consistency cut.
-            // Adopt the actual capture's immutable lowers into the child catalog
-            // directory before its runtime opens a private writable upper.
-            let target = replacement.image_config_path();
-            overlaybd::config::load_image_config(target)
-                .context("load allocated child volume backing")?;
-            let source = captured.image_config_path();
-            ensure!(
-                std::fs::canonicalize(source)? != std::fs::canonicalize(target)?,
-                "child volume aliases captured backing"
-            );
-            let source_root =
-                std::fs::canonicalize(source.parent().context("captured volume parent")?)?;
-            let staging = target
-                .parent()
-                .context("child volume parent")?
-                .join(format!("fork-{}", uuid::Uuid::new_v4()));
-            let config =
-                crate::sandbox::storage_snapshot::stage_overlaybd_snapshot_from_live_runtime(
-                    source,
-                    &staging,
-                    None,
-                    &[source_root],
-                )
-                .await?;
-            crate::sandbox::storage_snapshot::write_bytes_atomically(
-                target,
-                &tokio::fs::read(config).await?,
-                "fork volume backing",
-            )?;
-            *captured = replacement.clone();
-        }
-        for drive in &child.extra_drives {
-            let bound = spec
-                .extra_drives
-                .iter_mut()
-                .find(|bound| bound.drive_id() == drive.drive_id())
-                .context("child drive is outside captured topology")?;
-            ensure!(
-                bound.is_volume()
-                    && drive.is_volume()
-                    && bound.virtual_size() == drive.virtual_size()
-                    && bound.read_only() == drive.read_only()
-                    && bound.mount_path() == drive.mount_path()
-                    && bound.sub_path() == drive.sub_path(),
-                "child override changes captured volume topology"
-            );
-            // Replacements above already carry the adopted generation. Shared RO
-            // volumes retain this capture's leased copy, not a mutable catalog path.
-            if !replacement_ids.contains(&drive.drive_id().to_string()) {
-                *bound = drive.with_image_config_path(bound.image_config_path().to_path_buf());
-            }
-        }
-        for drive in &artifacts.spec.extra_drives {
-            ensure!(
-                !drive.is_volume()
-                    || drive.read_only()
-                    || replaced.contains(&drive.drive_id().to_string()),
-                "writable volume requires an independently owned child replacement"
-            );
-        }
+        spec.extra_drives =
+            crate::sandbox::volume_snapshot::bind_fork_drives(&spec.extra_drives, &child).await?;
         let mut launch = artifacts.launch.clone();
         launch.sandbox_id = child.sandbox_id;
         launch.envd_access_token = child.envd_access_token;
@@ -386,8 +306,9 @@ impl SandboxBackendFactory for DragonballSandboxFactory {
     }
 
     fn validate_snapshot(&self, snapshot: &RunnableSnapshot) -> Result<()> {
-        let reader =
-            crate::sandbox::restore_identity::RestoreReader::from_build(self.build.clone())?;
+        let reader = crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(
+            self.build.clone(),
+        )?;
         super::snapshot::read_for_restore(&reader, snapshot.record(), snapshot.manifest())?;
         Ok(())
     }
@@ -396,20 +317,20 @@ impl SandboxBackendFactory for DragonballSandboxFactory {
         &self,
         identity: &crate::sandbox::restore_identity::SnapshotRestoreIdentity,
     ) -> bool {
-        crate::sandbox::restore_identity::RestoreReader::from_build(self.build.clone())
+        crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(self.build.clone())
             .is_ok_and(|reader| reader.validate_restore(identity).is_ok())
     }
 
     fn runtime_versions(&self) -> Result<Option<crate::snapshot::SnapshotRuntimeVersions>> {
-        let reader =
-            crate::sandbox::restore_identity::RestoreReader::from_build(self.build.clone())?;
-        Ok(Some(
-            crate::snapshot::SnapshotRuntimeVersions::from_dragonball(reader.identity(
-                self.policy.app.resolved_kernel_version().into(),
-                self.policy.app.resolved_tools_version().into(),
-                self.policy.app.envd.version.clone(),
-            ))?,
+        let reader = crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(
+            self.build.clone(),
+        )?;
+        crate::snapshot::SnapshotRuntimeVersions::from_dragonball(reader.identity(
+            self.policy.app.resolved_kernel_version().into(),
+            self.policy.app.resolved_tools_version().into(),
+            self.policy.app.envd.version.clone(),
         ))
+        .map(Some)
     }
 
     fn build(
@@ -511,5 +432,214 @@ mod component_tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("CPU templates"), "{error}");
+    }
+    fn volume() -> crate::sandbox::ExtraDrive {
+        crate::sandbox::ExtraDrive::Overlaybd {
+            drive_id: "replacement_volume".into(),
+            image_config_path: "/unused/volume.json".into(),
+            read_only: false,
+            mount_path: "/mnt/data".into(),
+            virtual_size: Some(64 << 20),
+            sub_path: None,
+            snapshot_output_dir: None,
+            volume: true,
+        }
+    }
+
+    fn snapshot_fixture(
+        directory: &std::path::Path,
+        occupied: bool,
+    ) -> (DragonballSandboxFactory, RunnableSnapshot) {
+        use crate::sandbox::manifest::{
+            SandboxSnapshotManifest, SnapshotVolumeDevice, SnapshotVolumeSlot,
+        };
+        use crate::snapshot::{
+            CommittedSnapshot, SnapshotRecord, SnapshotRuntimeVersions, SnapshotVolume,
+        };
+        use agentenv_vmm_protocol::runtime::*;
+        use serde_json::json;
+
+        let asset = directory.join("asset");
+        std::fs::write(&asset, b"{}").unwrap();
+        let mut factory = factory_for_tests();
+        factory.policy.tools = asset.clone();
+        factory.build.runner_build_id = format!("sha256:{}", "a".repeat(64));
+        factory.build.restore_abi_id =
+            format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}");
+        let reader =
+            super::super::restore_identity::RestoreReader::from_build(factory.build.clone())
+                .unwrap();
+        let identity = reader.identity(
+            factory.policy.app.resolved_kernel_version().into(),
+            factory.policy.app.resolved_tools_version().into(),
+            factory.policy.app.envd.version.clone(),
+        );
+        let mut envelope = RuntimeSnapshotEnvelope {
+            envelope_version: 2,
+            identity: identity.clone(),
+            machine: PortableMachine {
+                vcpu_count: 1,
+                memory_mib: 128,
+                block_devices: vec![
+                    LogicalBlockDevice {
+                        drive_id: "rootfs".into(),
+                        read_only: true,
+                        is_root: true,
+                        is_volume_slot: false,
+                        backing_read_only: None,
+                        capacity_bytes: 8192,
+                        rate_limiter: None,
+                    },
+                    LogicalBlockDevice {
+                        drive_id: "user_rootfs".into(),
+                        read_only: false,
+                        is_root: false,
+                        is_volume_slot: false,
+                        backing_read_only: None,
+                        capacity_bytes: 4096,
+                        rate_limiter: None,
+                    },
+                ],
+                network_id: "eth0".into(),
+            },
+            memory_layout: MemoryLayout {
+                page_size: 4096,
+                image_size: 128 * 1024 * 1024,
+                regions: vec![MemoryRegion {
+                    guest_base: 0,
+                    image_offset: 0,
+                    length: 128 * 1024 * 1024,
+                }],
+            },
+            upstream_state: json!({}),
+        };
+        envelope.machine.block_devices.push(LogicalBlockDevice {
+            drive_id: "agentenv_volume_slot_0".into(),
+            read_only: false,
+            is_root: false,
+            is_volume_slot: true,
+            backing_read_only: Some(false),
+            capacity_bytes: if occupied { 64 << 20 } else { 4096 },
+            rate_limiter: None,
+        });
+        envelope.upstream_state = json!({
+            "header":{"format_epoch":1,"producer_version":"test"}, "vm_kvm_state":{}, "capture_cpu":{}, "vcpu_states":[{"id":0}],
+            "memory_state":{"regions":[{"guest_addr":0,"file_offset":0,"size":128*1024*1024u64}]},
+            "device_states":{
+                "balloon":{"devices":[{
+                    "config":{"balloon_id":"memory","size_mib":0,"use_shared_irq":false,"use_generic_irq":false,"f_deflate_on_oom":true,"f_reporting":true},
+                    "device_info":{"device_info":{"avail_features":(1u64<<32)|(1<<2)|(1<<5),"acked_features":0,"config_space":[0,0,0,0,0,0,0,0]},"num_pages":0,"actual":0},
+                    "transport":{"Mmio":{"device_activated":true,"queues":[{},{},{}]}}
+                }]},
+                "block":{"devices":envelope.machine.block_devices.iter().map(|disk| json!({
+                    "config":{"drive_id":disk.drive_id,"device_type":"RawBlock","path_on_host":format!("aenv-block:{}",disk.drive_id),"is_root_device":disk.is_root,"part_uuid":null,"is_read_only":disk.read_only,"is_direct":!(disk.is_root && disk.read_only),"no_drop":false,"sparse":false,"is_volume_slot":disk.is_volume_slot,"backing_read_only":disk.backing_read_only,"num_queues":1,"queue_size":256,"rate_limiter":null,"use_shared_irq":false,"use_generic_irq":false,"use_pci_bus":false},
+                    "device_info":{"RawBlock":{"avail_features":block_profile_features(disk.read_only),"acked_features":0,"config_space":block_profile_config_space(disk.capacity_bytes)}},
+                    "transport":{"Mmio":{"device_activated":true,"queues":[{}]}}
+                })).collect::<Vec<_>>()},
+                "virtio_net":{"devices":[{
+                    "config":{"num_queues":null,"queue_size":null,"backend":{"type":"virtio","iface_id":"eth0","host_dev_name":"aenv-net:eth0","rx_rate_limiter":null,"tx_rate_limiter":null,"allow_duplicate_mac":false},"guest_mac":null,"use_shared_irq":false,"use_generic_irq":false},
+                    "device_info":{"avail_features":NET_PROFILE_FEATURES,"acked_features":0,"config_space":[0,1,2,3,4,5,0,0,0,0,220,5]},
+                    "transport":{"Mmio":{"device_activated":true,"queues":[{},{}]}}
+                }]}
+            }
+        });
+
+        let state_path = directory.join("state.json");
+        std::fs::write(&state_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let mut manifest = SandboxSnapshotManifest::new_dragonball(
+            identity.clone(),
+            state_path,
+            directory.join("memory.json"),
+            128 << 20,
+            asset,
+            4096,
+            &[],
+        )
+        .unwrap();
+        manifest.volume_drive_slots = 1;
+        manifest.volume_slots.push(SnapshotVolumeSlot {
+            slot_id: "agentenv_volume_slot_0".into(),
+            mount_path: occupied.then(|| "/mnt/data".into()),
+            sub_path: None,
+            guest_read_only: false,
+            capacity_bytes: if occupied { 64 << 20 } else { 4096 },
+        });
+        let mut committed = CommittedSnapshot::mock();
+        committed.virtualization_mode = crate::virtualization::VirtualizationMode::Kvm;
+        committed.runtime_versions = SnapshotRuntimeVersions::from_dragonball(identity).unwrap();
+        if occupied {
+            manifest.volume_devices.push(SnapshotVolumeDevice {
+                drive_id: "agentenv_volume_slot_0".into(),
+                mount_path: "/mnt/data".into(),
+                sub_path: None,
+                read_only: false,
+                virtual_size: 64 << 20,
+            });
+            committed.volume_snapshots.push(SnapshotVolume {
+                mount_path: "/mnt/data".into(),
+                mode: crate::volume::VolumeMode::Exclusive,
+                size_mb: 64,
+                layers: vec![],
+            });
+        }
+        let record = SnapshotRecord::mock_ready(committed);
+        let snapshot = crate::snapshot::mock::runnable_snapshot(record, manifest);
+        factory.validate_snapshot(&snapshot).unwrap();
+        (factory, snapshot)
+    }
+
+    #[test]
+    fn explicit_replacement_of_captured_volume_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let (factory, snapshot) = snapshot_fixture(directory.path(), true);
+        let launch = SandboxLaunchConfig {
+            extra_drives: vec![volume()],
+            extra_drives_in_snapshot: false,
+            ..Default::default()
+        };
+        let error = match factory.build_snapshot(&snapshot, launch, true) {
+            Ok(_) => {
+                panic!("unrelated same-geometry volume replaced a captured mounted filesystem")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("explicit volume replacement"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn automatic_cloned_captured_volume_is_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        let (factory, snapshot) = snapshot_fixture(directory.path(), true);
+        let launch = SandboxLaunchConfig {
+            extra_drives: vec![volume()],
+            extra_drives_in_snapshot: true,
+            ..Default::default()
+        };
+        let sandbox = factory.build_snapshot(&snapshot, launch, true).unwrap();
+        assert_eq!(
+            sandbox.spec.extra_drives[0].drive_id(),
+            "replacement_volume"
+        );
+        assert!(sandbox.restore.is_some());
+    }
+
+    #[test]
+    fn explicit_volume_on_empty_captured_slot_is_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        let (factory, snapshot) = snapshot_fixture(directory.path(), false);
+        let launch = SandboxLaunchConfig {
+            extra_drives: vec![volume()],
+            extra_drives_in_snapshot: false,
+            ..Default::default()
+        };
+        let sandbox = factory.build_snapshot(&snapshot, launch, true).unwrap();
+        assert_eq!(
+            sandbox.spec.extra_drives[0].drive_id(),
+            "replacement_volume"
+        );
+        assert_eq!(sandbox.spec.extra_drives[0].virtual_size(), Some(64 << 20));
     }
 }

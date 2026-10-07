@@ -9,23 +9,23 @@ use agentenv::snapshot::{
 use agentenv::volume::{VolumeManager, VolumeMode};
 use anyhow::{Context, Result};
 
-use super::dragonball_m1::{asset, fixture, fork_command, launch, publish_metadata, spec};
+use super::dragonball_support::{asset, fixture, fork_command, launch, publish_metadata, spec};
 
 #[tokio::test]
 #[ignore = "real empty Dragonball volume slot binding; isolated KVM fixture"]
-async fn dragonball_m2_placeholder_slot_binds_real_volume() -> Result<()> {
+async fn dragonball_memory_placeholder_slot_binds_real_volume() -> Result<()> {
     slot_launch_cases(&[(64, false, 1)]).await
 }
 
 #[tokio::test]
 #[ignore = "same 4KiB slot template restored with 64/128MiB filesystems"]
-async fn dragonball_m2_slot_resize_reports_new_capacity() -> Result<()> {
+async fn dragonball_memory_slot_resize_reports_new_capacity() -> Result<()> {
     slot_launch_cases(&[(64, false, 1), (128, false, 1)]).await
 }
 
 #[tokio::test]
 #[ignore = "real shared RO backing, guest mount/raw-write policy and binding cleanup"]
-async fn dragonball_m2_slot_ro_policy_and_failure_rollback() -> Result<()> {
+async fn dragonball_memory_slot_ro_policy_and_failure_rollback() -> Result<()> {
     slot_launch_cases(&[(64, true, 2)]).await
 }
 
@@ -255,6 +255,7 @@ async fn slot_launch_cases(cases: &[(u64, bool, usize)]) -> Result<()> {
                 .await?
                 .context("bound slot snapshot")?;
             let mut invalid = bound_launch;
+            invalid.extra_drives_in_snapshot = true;
             invalid.snapshot_id = bound_record.id.to_string();
             let ExtraDrive::Overlaybd {
                 virtual_size,

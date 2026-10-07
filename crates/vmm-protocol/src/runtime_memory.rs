@@ -29,6 +29,8 @@ pub struct FrozenMemoryMap {
     pub page_size: u64,
     pub regions: Vec<FrozenMemoryRegion>,
     pub changed_ranges: Vec<MemoryRange>,
+    /// Optional zero classification; changed_ranges still includes zero pages
+    /// when the runner omits classification.
     pub zero_ranges: Vec<MemoryRange>,
 }
 

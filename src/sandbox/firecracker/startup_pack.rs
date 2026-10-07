@@ -34,12 +34,14 @@ pub(super) fn startup_recording(
     let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()?;
     let config = artifacts.snapshot_config().clone();
     let dir = artifacts.snapshot_dir().to_path_buf();
+    let lease = std::sync::Arc::new((artifacts.snapshot_root_guard(), lease));
+    let recording_lease = lease.clone();
     Some(crate::snapshot::StartupRecording::spawn_with_capture_lease(
         async move {
             let _guard = guard;
-            record_startup_pack(config, dir).await
+            record_startup_pack(config, dir, recording_lease).await
         },
-        std::sync::Arc::new((artifacts.snapshot_root_guard(), lease)),
+        lease,
     ))
 }
 
@@ -51,10 +53,11 @@ pub(super) fn template_startup_recording(
         captured.downcast_artifacts_ref::<(FirecrackerSnapshotConfig, PathBuf)>()?;
     let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()?;
     let (config, dir) = (config.clone(), dir.clone());
+    let recording_lease = lease.clone();
     Some(crate::snapshot::StartupRecording::spawn_with_capture_lease(
         async move {
             let _guard = guard;
-            record_startup_pack(config, dir).await
+            record_startup_pack(config, dir, recording_lease).await
         },
         std::sync::Arc::new(lease),
     ))
@@ -68,6 +71,7 @@ pub(super) fn template_startup_recording(
 pub(crate) async fn record_startup_pack(
     mut config: FirecrackerSnapshotConfig,
     snapshot_dir: PathBuf,
+    lease: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 ) -> Option<PathBuf> {
     if !recording_enabled() {
         return None;
@@ -94,7 +98,7 @@ pub(crate) async fn record_startup_pack(
     config.mem_overlaybd_config.image_config_path = recording_config.clone();
     config.pack_recording = true;
 
-    let outcome = boot_and_wait(config, &trace_path, budget_secs).await;
+    let outcome = boot_and_wait(config, &trace_path, budget_secs, lease).await;
 
     if outcome.is_none() {
         cleanup_pack_files(&trace_path, &recording_config).await;
@@ -116,6 +120,7 @@ async fn boot_and_wait(
     config: FirecrackerSnapshotConfig,
     trace_path: &Path,
     budget_secs: u64,
+    lease: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 ) -> Option<PathBuf> {
     let phase_t0 = std::time::Instant::now();
     let mut recording_vm = match FirecrackerSandbox::from_snapshot_config(&config) {
@@ -125,6 +130,9 @@ async fn boot_and_wait(
             return None;
         }
     };
+    // Device rollback can outlive both this task and publication. Install the
+    // actual capture/workspace owner before start can allocate any devices.
+    recording_vm.recording_lease = Some(lease);
     if let Err(error) = recording_vm.start_nowait().await {
         warn!(%error, "startup pack: recording VM start failed");
         // Best-effort teardown of whatever start_nowait managed to create.
@@ -205,11 +213,8 @@ async fn boot_and_wait(
             warn!(%error, "startup pack: recording VM stop failed");
         }
     };
-    if matches!(outcome, WaitOutcome::Shutdown) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), stop).await;
-    } else {
-        stop.await;
-    }
+    // Teardown owns device/backing leases and must drain even on shutdown.
+    stop.await;
     info!(
         elapsed_ms = phase_t0.elapsed().as_millis() as u64,
         "startup pack: recording VM stopped"

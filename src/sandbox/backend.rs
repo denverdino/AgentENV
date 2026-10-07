@@ -366,7 +366,8 @@ pub trait SandboxBackend: Send + 'static {
 
     /// Stop the sandbox and release all associated system resources.
     ///
-    /// Idempotent: calling `stop` more than once must not return an error.
+    /// Repeated calls must not repeat completed or uncertain resource releases.
+    /// A successful stop remains successful; an incomplete cleanup may keep returning its error.
     async fn stop(&mut self) -> Result<()>;
 
     /// Freeze writable persistent filesystems and seal their volume layers,
@@ -421,6 +422,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         false
     }
 
+    /// Optional backend override; None preserves the configured Firecracker metadata.
     fn runtime_versions(&self) -> Result<Option<crate::snapshot::SnapshotRuntimeVersions>> {
         Ok(None)
     }

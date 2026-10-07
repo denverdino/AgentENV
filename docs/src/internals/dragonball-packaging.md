@@ -54,23 +54,24 @@ docker build --platform linux/amd64 \
   -f Dockerfile.agentenv-dragonball -t agentenv-dragonball:candidate .
 ```
 
-默认 Ubuntu 26.04 对齐当前候选构建主机的 libc；换基础镜像需重新验证动态库兼容。
+默认基础镜像为 Ubuntu 26.04；候选二进制依赖的 libc 及其他动态库必须与镜像兼容。
+更换构建环境或基础镜像后需重新验证动态库兼容。
 镜像运行仍需要 KVM/ublk 和正常的 runtime capability 配置，不自动启动 systemd
 或操作既有服务。原 Firecracker Dockerfile 不变。正式公开分发前仍需相应 release
 审批、完整依赖许可材料与源码提供流程；本入口不宣称完成正式发布合规审查。
 
-## M3 平台资格入口
+## 平台资格入口
 
 在已配置 KVM/ublk 的 Linux x86_64 主机，以非 root 用户运行：
 
 ```bash
 export AENV_CONFIG_PATH=/absolute/qualified-test.toml
-export AENV_TEST_STATE_DIR=/isolated/m3-state
+export AENV_TEST_STATE_DIR=/isolated/platform-state
 export AENV_TEST_DEPS_PATH=/isolated/deps
 export AENV_M3_S3_SERVER=/absolute/s3-compatible-server
 export AENV_M3_REGISTRY_SERVER=/absolute/registry
 mkdir -p "$AENV_TEST_STATE_DIR"
-make test-dragonball-m3
+make test-dragonball-platform
 ```
 
 测试配置应沿用已验证的 DB kernel/tools、关闭 warm pools，显式包含
@@ -79,7 +80,7 @@ ublk-daemon，准备资产并串行执行真实 OSS、扩展、私有 registry �
 原生 S3/registry fixture 在独立 namespace 内以测试用户运行，不需要生产账户；
 主机须提供 `openssl`、`htpasswd`、`debugfs`、网络工具和现有 capability runner
 所需授权。缺少前提时失败，不以 skipped 作为资格通过。临时大文件使用独占的
-`/var/tmp/db-m3-fixtures.*`，namespace 退出后清理。
+`/var/tmp/db-platform-fixtures.*`，namespace 退出后清理。
 
 Integration Tests 工作流的 `dragonball_m3` 是默认关闭的手动开关，要求专用
 `dragonball-m3` runner 和同名受保护 environment；需由仓库管理员配置审批策略，

@@ -329,7 +329,18 @@ impl FirecrackerPool {
         .await;
 
         if let Err(err) = spawn_result {
-            let _ = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await;
+            if fc_instance
+                .stop(POOL_FIRECRACKER_STOP_TIMEOUT)
+                .await
+                .is_err()
+                && fc_instance
+                    .terminate_blocking(POOL_FIRECRACKER_STOP_TIMEOUT)
+                    .is_err()
+            {
+                std::mem::forget(slot);
+                std::mem::forget(work_dir);
+                return Err(err.context("warm process exit unconfirmed; retaining namespace"));
+            }
             let _ = NetworkManager::global().release(slot);
             return Err(err);
         }
@@ -353,26 +364,24 @@ impl FirecrackerPool {
     ) -> Result<()> {
         let WarmFirecracker {
             slot,
-            mut fc_instance,
             work_dir,
+            mut fc_instance,
         } = warm;
         let slot_idx = slot.idx;
 
-        if sync_network_cleanup {
-            // Process-exit hooks can run after Tokio runtime thread-local state
-            // has been destroyed. Avoid Runtime::block_on here; Drop kills the
-            // child process without entering Tokio.
-            drop(fc_instance);
+        let stopped = if sync_network_cleanup {
+            // Exit hooks can run after Tokio has shut down.
+            fc_instance.terminate_blocking(POOL_FIRECRACKER_STOP_TIMEOUT)
         } else {
-            let stop_result = self
-                .runtime
-                .block_on(fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT));
-            if let Err(err) = stop_result {
-                warn!(
-                    slot = slot_idx,
-                    error = %err,
-                    "firecracker pool: stop warm process failed"
-                );
+            self.runtime
+                .block_on(fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT))
+        };
+        if let Err(error) = stopped {
+            warn!(slot = slot_idx, %error, "firecracker pool: stop warm process failed");
+            if let Err(error) = fc_instance.terminate_blocking(POOL_FIRECRACKER_STOP_TIMEOUT) {
+                std::mem::forget(slot);
+                std::mem::forget(work_dir);
+                return Err(error.context("warm process exit unconfirmed; retaining namespace"));
             }
         }
 
@@ -386,17 +395,18 @@ impl FirecrackerPool {
     async fn cleanup_warm_async(&self, warm: WarmFirecracker) -> Result<()> {
         let WarmFirecracker {
             slot,
-            mut fc_instance,
             work_dir,
+            mut fc_instance,
         } = warm;
         let slot_idx = slot.idx;
 
-        if let Err(err) = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await {
-            warn!(
-                slot = slot_idx,
-                error = %err,
-                "firecracker pool: stop warm process failed"
-            );
+        if let Err(error) = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await {
+            warn!(slot = slot_idx, %error, "firecracker pool: stop warm process failed");
+            if let Err(error) = fc_instance.terminate_blocking(POOL_FIRECRACKER_STOP_TIMEOUT) {
+                std::mem::forget(slot);
+                std::mem::forget(work_dir);
+                return Err(error.context("warm process exit unconfirmed; retaining namespace"));
+            }
         }
 
         drop(work_dir);

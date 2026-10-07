@@ -65,6 +65,14 @@ PVM, non-x86_64 hosts, and Firecracker CPU templates are unsupported by this
 Dragonball profile. Existing packaged releases remain Firecracker unless built
 and packaged explicitly with the commands above.
 
+Dragonball snapshot launches automatically clone captured volumes when `volumeMounts`
+is omitted. Explicit replacement of volumes in already occupied snapshot slots is
+rejected; explicit mounts into previously empty slots remain supported. Pause/resume
+and fork retain their existing volume bindings.
+The production Dragonball runner retains at most 128 KiB per stdout/stderr log
+under its runtime directory; compaction keeps the newest 64 KiB. Failure messages
+read at most 64 KiB, and failure archives retain the existing bounded tails.
+
 See [component design](../internals/hypervisor-components-design.md) for the
 composition boundary and qualification requirements.
 
@@ -604,9 +612,9 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `global_config_path` | string | `"$AENV_HOME/overlaybd/overlaybd-global.json"` | Path to overlaybd global config JSON (see note below). Relative explicit paths are resolved against the config file directory. |
-| `read_only` | boolean | `false` | When set to `true`, materializes the rootfs without a writable upper |
+| `read_only` | boolean | `false` | When set to `true`, materializes the rootfs without a writable upper on Firecracker snapshot launches. Dragonball rejects `true`. |
 | `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode |
-| `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. |
+| `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. Dragonball rejects `allow_shrink=true`. |
 | `resize_timeout_secs` | integer | `120` | Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero. |
 | `download_enable` | boolean | `false` | Enables overlaybd layer-level background download for remote layers |
 | `p2p_lookup_timeout_ms` | integer | `300` | Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss. |

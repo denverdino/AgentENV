@@ -24,7 +24,7 @@ from pathlib import Path
 
 TEST = "posix_startup_pack::posix_startup_pack_publish_resolve_and_resume"
 EVENT = re.compile(
-    r"agentenv::sandbox::firecracker::startup_pack.*?"
+    r"agentenv::sandbox::startup_pack.*?"
     r"memory device startup prefetch drained\s+"
     r"requested_bytes=(\d+)\s+read_bytes=(\d+)"
 )
@@ -65,7 +65,7 @@ def run(log_path: Path) -> None:
         raise ValueError("cargo is unavailable; load the host Rust environment")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env["RUST_LOG"] = "agentenv::sandbox::firecracker::startup_pack=debug"
+    env["RUST_LOG"] = "agentenv::sandbox::startup_pack=debug"
     cmd = [
         str(repo / "scripts/run-with-capabilities.sh"),
         cargo,

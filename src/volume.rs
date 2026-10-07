@@ -548,27 +548,6 @@ impl VolumeManager {
         Ok(record)
     }
 
-    pub(crate) async fn snapshot_volume_state(
-        &self,
-        reference: &str,
-    ) -> Result<VolumeRecord, VolumeError> {
-        let mut parent = self.get(reference).await?;
-        // A running sandbox restacks its volume upper into this same local
-        // image config before capture. Publish that latest state before making
-        // the logical volume snapshot.
-        let owner = parent.reserved_by_sandbox_id.clone();
-        if let Some(owner) = owner.as_deref() {
-            self.recover_and_publish_backings(owner, std::slice::from_ref(&parent.id))
-                .await?;
-            parent = self.get(reference).await?;
-        } else {
-            self.publish_backing(&mut parent).await?;
-            self.persist_catalog(&parent).await?;
-            self.cache_record(parent.clone()).await;
-        }
-        Ok(parent)
-    }
-
     pub async fn reserve(&self, reference: &str, owner: &str) -> Result<(), VolumeError> {
         let mut record = self.get(reference).await?;
         match record.status {

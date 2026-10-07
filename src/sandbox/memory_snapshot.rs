@@ -30,6 +30,23 @@ pub(crate) async fn write_memory_overlaybd(
     Ok(output)
 }
 
+/// Full Dragonball RAM has an implicit zero base; detect zeros while copying
+/// so frozen guest memory is read only once, without staging another RAM file.
+#[cfg(feature = "hypervisor-dragonball")]
+pub(crate) async fn write_sparse_memory_overlaybd(
+    source: Arc<dyn VirtualFile>,
+    segments: &[MemorySegment],
+    virtual_size: u64,
+    at: &Path,
+    mode: OverlaybdCompactOutput,
+) -> Result<PathBuf> {
+    let mappings = segment_mappings(segments, virtual_size)?;
+    tokio::fs::create_dir_all(at).await?;
+    let output = at.join("overlaybd.commit");
+    publish_memory_layer(&[source], &mappings, virtual_size, &output, mode, 1, true).await?;
+    Ok(output)
+}
+
 fn segment_mappings(segments: &[MemorySegment], virtual_size: u64) -> Result<Vec<SegmentMapping>> {
     ensure!(
         virtual_size.is_multiple_of(4096),
@@ -84,6 +101,27 @@ pub(crate) async fn publish_memory_overlaybd_layer(
     mode: OverlaybdCompactOutput,
     concurrency: usize,
 ) -> Result<()> {
+    publish_memory_layer(
+        src_layers,
+        mappings,
+        virtual_size,
+        output_path,
+        mode,
+        concurrency,
+        false,
+    )
+    .await
+}
+
+async fn publish_memory_layer(
+    src_layers: &[Arc<dyn VirtualFile>],
+    mappings: &[SegmentMapping],
+    virtual_size: u64,
+    output_path: &Path,
+    mode: OverlaybdCompactOutput,
+    concurrency: usize,
+    detect_zeros: bool,
+) -> Result<()> {
     let parent = output_path
         .parent()
         .context("memory output has no parent")?;
@@ -96,16 +134,32 @@ pub(crate) async fn publish_memory_overlaybd_layer(
     let output_file: Arc<dyn VirtualFile> =
         Arc::new(LocalFile::builder().create(false).open(staged.path())?);
     let commit_args = create_commit_args(output_file.clone(), mode, concurrency).await?;
-    compact_to(src_layers, mappings, virtual_size, commit_args)
-        .await
-        .context("compact memory layer")?;
+    let started = std::time::Instant::now();
+    if detect_zeros {
+        overlaybd::index_file::compact_to_sparse(src_layers, mappings, virtual_size, commit_args)
+            .await
+    } else {
+        compact_to(src_layers, mappings, virtual_size, commit_args).await
+    }
+    .context("compact memory layer")?;
+    let compact_us = started.elapsed().as_micros() as u64;
+    let sync_started = std::time::Instant::now();
     output_file
         .sync()
         .await
         .context("sync sealed memory layer")?;
+    let sync_us = sync_started.elapsed().as_micros() as u64;
     tokio::fs::hard_link(staged.path(), output_path)
         .await
         .context("adopt sealed memory layer without overwrite")?;
+    if detect_zeros {
+        tracing::debug!(
+            compact_us,
+            sync_us,
+            total_us = started.elapsed().as_micros() as u64,
+            "sparse memory publication timing"
+        );
+    }
     Ok(())
 }
 

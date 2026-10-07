@@ -128,7 +128,7 @@ fn runner_cli_reports_ready_and_stops_without_boot() {
     };
     assert_eq!(
         identity.dragonball_revision,
-        "c77812d669737c11cb16321827acc1c79bf065f3"
+        "9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
     );
     assert_eq!(
         fs::metadata(&runner.socket).unwrap().permissions().mode() & 0o777,

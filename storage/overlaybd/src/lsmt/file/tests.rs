@@ -2929,6 +2929,185 @@ async fn test_compact_to_rejects_short_reads() {
     assert_err_contains(&err, "failed to read");
 }
 
+#[tokio::test]
+async fn test_sparse_compact_rejects_short_reads() {
+    let temp_dir = TempDir::new().unwrap();
+    let src: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(vec![0x5a; 4096], 1));
+    let dest = Arc::new(LocalFile::new(temp_dir.path().join("short-read.lsmt")).unwrap());
+    let err = super::compact_to_sparse(
+        &[src],
+        &[SegmentMapping::new(0, 8, 0, false, 0)],
+        4096,
+        CommitArgs::new(dest),
+    )
+    .await
+    .expect_err("short reads during sparse compact should fail");
+    assert_err_contains(&err, "failed to read");
+}
+
+#[tokio::test]
+async fn test_sparse_compact_reads_each_byte_once_and_preserves_zero_runs() {
+    struct ReadOnce {
+        bytes: Vec<u8>,
+        cursor: std::sync::atomic::AtomicU64,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl VirtualFile for ReadOnce {
+        async fn read_at(&self, offset: u64, length: usize) -> anyhow::Result<bytes::Bytes> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            assert_eq!(
+                self.cursor
+                    .fetch_add(length as u64, std::sync::atomic::Ordering::SeqCst),
+                offset,
+                "sparse capture must read once, sequentially"
+            );
+            Ok(bytes::Bytes::copy_from_slice(
+                &self.bytes[offset as usize..offset as usize + length],
+            ))
+        }
+        async fn write_at(&self, _: u64, _: &[u8]) -> anyhow::Result<usize> {
+            anyhow::bail!("read only")
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+    for pattern in ["sparse", "zero", "dense", "alternating"] {
+        let dir = TempDir::new().unwrap();
+        // Include a 512 B tail: LSMT mapping boundaries need not be page aligned.
+        let mut bytes = vec![0; 5 * 1024 * 1024 + 512];
+        if pattern == "dense" {
+            bytes.fill(0xa7);
+        } else if pattern == "alternating" {
+            for block in bytes.chunks_mut(1024) {
+                block[..512].fill(0xa7);
+            }
+        } else if pattern == "sparse" {
+            for offset in [
+                0,
+                511,
+                4096,
+                1024 * 1024 - 1,
+                1024 * 1024,
+                2 * 1024 * 1024 - 1,
+                2 * 1024 * 1024,
+                4 * 1024 * 1024 - 1,
+                4 * 1024 * 1024,
+                bytes.len() - 1,
+            ] {
+                bytes[offset] = 0x9b;
+            }
+        }
+        let size = bytes.len() as u64;
+        let source = Arc::new(ReadOnce {
+            bytes: bytes.clone(),
+            cursor: Default::default(),
+            calls: Default::default(),
+        });
+        let output = Arc::new(LocalFile::new(dir.path().join("sparse.lsmt")).unwrap());
+        super::compact_to_sparse(
+            &[source.clone() as Arc<dyn VirtualFile>],
+            &[SegmentMapping::new(0, (size / 512) as u32, 0, false, 0)],
+            size,
+            CommitArgs::new(output.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            source.cursor.load(std::sync::atomic::Ordering::SeqCst),
+            size
+        );
+        assert!(
+            source.calls.load(AtomicOrdering::SeqCst) <= 8,
+            "RAM reads should be batched, not issued per small writer buffer"
+        );
+        if matches!(pattern, "sparse" | "zero") {
+            assert!(output.size().await.unwrap() < 64 * 1024);
+        }
+        let image = open_file_ro(output).await.unwrap();
+        if pattern == "alternating" {
+            assert!(
+                image.index_view().unwrap().mappings().len() <= 2,
+                "sub-page zero runs should not inflate the RAM index"
+            );
+        }
+        assert_eq!(image.size().await.unwrap(), size);
+        assert_eq!(
+            image.read_at(0, size as usize).await.unwrap().as_ref(),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sparse_compact_overlaps_next_read_with_current_write() {
+    // Keep at least two reads with the 1/2/4 MiB batch sizes used in tuning.
+    const SIZE: u64 = 6 * 1024 * 1024;
+    struct PipelinedSource(Arc<Notify>);
+    #[async_trait]
+    impl VirtualFile for PipelinedSource {
+        async fn read_at(&self, offset: u64, length: usize) -> Result<Bytes> {
+            if offset > 0 {
+                self.0.notify_one();
+            }
+            Ok(Bytes::from(vec![0x5a; length]))
+        }
+        async fn write_at(&self, _: u64, _: &[u8]) -> Result<usize> {
+            bail!("read only")
+        }
+        async fn size(&self) -> Result<u64> {
+            Ok(SIZE)
+        }
+    }
+    struct GatedOutput {
+        inner: LocalFile,
+        next_read: Arc<Notify>,
+    }
+    #[async_trait]
+    impl VirtualFile for GatedOutput {
+        async fn read_at(&self, offset: u64, length: usize) -> Result<Bytes> {
+            self.inner.read_at(offset, length).await
+        }
+        async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+            if offset == 4096 {
+                self.next_read.notified().await;
+            }
+            self.inner.write_at(offset, data).await
+        }
+        async fn size(&self) -> Result<u64> {
+            self.inner.size().await
+        }
+        async fn sync(&self) -> Result<()> {
+            self.inner.sync().await
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let next_read = Arc::new(Notify::new());
+    let output = Arc::new(GatedOutput {
+        inner: LocalFile::new(dir.path().join("pipelined.lsmt")).unwrap(),
+        next_read: next_read.clone(),
+    });
+    let size = SIZE;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        super::compact_to_sparse(
+            &[Arc::new(PipelinedSource(next_read))],
+            &[SegmentMapping::new(0, (size / 512) as u32, 0, false, 0)],
+            size,
+            CommitArgs::new(output.clone()),
+        ),
+    )
+    .await
+    .expect("next read must progress while the first data write is pending")
+    .unwrap();
+    let image = open_file_ro(output).await.unwrap();
+    assert_eq!(
+        image.read_at(0, size as usize).await.unwrap().as_ref(),
+        vec![0x5a; size as usize]
+    );
+}
+
 // Sparse LSMT files are rejected where the filesystem does not guarantee
 // that unwritten regions read back as holes; see
 // `sys::sparse_extents_are_reliable`. Lift this together with that gate.

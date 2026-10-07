@@ -132,7 +132,7 @@ pub(super) fn decode(
         owned_file(&root, path)?;
     }
     let envelope = super::snapshot::read_envelope(&saved.vm_state_path)?;
-    crate::sandbox::restore_identity::RestoreReader::from_build(factory.build.clone())?
+    crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(factory.build.clone())?
         .validate_restore(&envelope.identity)?;
     let mut manifest = saved.manifest;
     ensure!(
@@ -193,8 +193,8 @@ pub(super) fn decode(
             launch,
             recording_policy: factory.policy.clone(),
             storage: None,
+            memory_owner: None,
             runnable_snapshot: None,
-            _memory_base: None,
         }),
         control_port: saved.control_port,
     });

@@ -105,7 +105,7 @@ fn runtime_cli_keeps_probe_separate_and_seccomp_enabled() {
     };
     assert_eq!(
         hello.dragonball_revision,
-        "c77812d669737c11cb16321827acc1c79bf065f3"
+        "9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
     );
     assert_eq!(hello.feature_profile, "db-virtio-blk-net-balloon-v2");
     assert_eq!(

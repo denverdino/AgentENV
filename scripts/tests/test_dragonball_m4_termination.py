@@ -13,6 +13,7 @@ import unittest
 from dragonball_m4_lab import empty_cgroup
 
 
+@unittest.skipUnless(__name__ == "__main__", "run directly with --inputs for real controller termination")
 class TerminationTests(unittest.TestCase):
     def exercise(self, target):
         script = Path(__file__).with_name("dragonball_m4_scenarios.py")

@@ -11,6 +11,7 @@ mod envd;
 mod extra_drive;
 #[cfg(feature = "hypervisor-firecracker")]
 mod firecracker;
+mod guest;
 pub mod selected;
 pub use selected::SelectedSandboxFactory;
 pub mod manifest;
@@ -23,6 +24,7 @@ mod network;
 mod process;
 mod process_vm_reader;
 pub mod restore_identity;
+mod runtime_cleanup;
 pub(crate) mod startup_pack;
 pub(crate) mod storage_snapshot;
 mod ublk;

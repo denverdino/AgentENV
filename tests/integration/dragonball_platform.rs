@@ -30,7 +30,7 @@ use axum::{extract::State, http::StatusCode, Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::dragonball_m1::{asset, fixture, fork_command, launch, publish_metadata, spec};
+use super::dragonball_support::{asset, fixture, fork_command, launch, publish_metadata, spec};
 
 async fn subprocess_case(name: &str) -> Result<bool> {
     if std::env::var("AENV_M3_CASE").as_deref() == Ok(name) {
@@ -41,7 +41,7 @@ async fn subprocess_case(name: &str) -> Result<bool> {
             .args([
                 "--ignored",
                 "--exact",
-                &format!("dragonball_m3::{name}"),
+                &format!("dragonball_platform::{name}"),
                 "--nocapture",
             ])
             .env("AENV_M3_CASE", name),
@@ -123,7 +123,7 @@ impl Drop for CaseProcessGroup {
 
 #[tokio::test]
 #[ignore = "requires native M3 S3 and registry fixtures"]
-async fn dragonball_m3_timeout_reaps_native_fixtures() -> Result<()> {
+async fn dragonball_platform_timeout_reaps_native_fixtures() -> Result<()> {
     if let Some(root) = std::env::var_os("AENV_M3_TIMEOUT_ROOT") {
         let root = Path::new(&root);
         let s3 = LocalS3::start(root).await?;
@@ -146,7 +146,7 @@ async fn dragonball_m3_timeout_reaps_native_fixtures() -> Result<()> {
             .args([
                 "--ignored",
                 "--exact",
-                "dragonball_m3::dragonball_m3_timeout_reaps_native_fixtures",
+                "dragonball_platform::dragonball_platform_timeout_reaps_native_fixtures",
                 "--nocapture",
             ])
             .env("AENV_M3_TIMEOUT_ROOT", &path),
@@ -284,9 +284,9 @@ impl P2pTransport for ObservedPeer {
 
 #[tokio::test]
 #[ignore = "real KVM/ublk, local S3 and two real peer endpoints"]
-async fn dragonball_m3_oss_p2p_commit_and_fallback() -> Result<()> {
+async fn dragonball_platform_oss_p2p_commit_and_fallback() -> Result<()> {
     use sha2::{Digest, Sha256};
-    if subprocess_case("dragonball_m3_oss_p2p_commit_and_fallback").await? {
+    if subprocess_case("dragonball_platform_oss_p2p_commit_and_fallback").await? {
         return Ok(());
     }
     let root = tempfile::Builder::new().prefix("db-m3-peer-").tempdir()?;
@@ -452,8 +452,8 @@ async fn dragonball_m3_oss_p2p_commit_and_fallback() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real KVM/ublk and two real peer endpoints"]
-async fn dragonball_m3_posix_missing_artifact_is_not_peer_repaired() -> Result<()> {
-    if subprocess_case("dragonball_m3_posix_missing_artifact_is_not_peer_repaired").await? {
+async fn dragonball_platform_posix_missing_artifact_is_not_peer_repaired() -> Result<()> {
+    if subprocess_case("dragonball_platform_posix_missing_artifact_is_not_peer_repaired").await? {
         return Ok(());
     }
     let root = tempfile::Builder::new()
@@ -684,14 +684,14 @@ impl LocalRegistry {
 
 #[tokio::test]
 #[ignore = "real KVM/ublk and authenticated TLS OCI registry"]
-async fn dragonball_m3_private_registry_template() -> Result<()> {
+async fn dragonball_platform_private_registry_template() -> Result<()> {
     use agentenv::{
         image::ImageResolver,
         sandbox::{SandboxLaunchConfig, TemplateSandboxFactory},
         template::TemplateBuildSpec,
     };
     use sha2::{Digest, Sha256};
-    if subprocess_case("dragonball_m3_private_registry_template").await? {
+    if subprocess_case("dragonball_platform_private_registry_template").await? {
         return Ok(());
     }
     let root = tempfile::Builder::new()
@@ -975,8 +975,8 @@ fn owned_ram_devices(runner: &Path) -> Result<Vec<PathBuf>> {
 
 #[tokio::test]
 #[ignore = "real KVM/ublk and explicitly supplied local S3 server"]
-async fn dragonball_m3_oss_capture_restore_preserves_identity() -> Result<()> {
-    if subprocess_case("dragonball_m3_oss_capture_restore_preserves_identity").await? {
+async fn dragonball_platform_oss_capture_restore_preserves_identity() -> Result<()> {
+    if subprocess_case("dragonball_platform_oss_capture_restore_preserves_identity").await? {
         return Ok(());
     }
     let root = tempfile::Builder::new().prefix("db-m3-oss-").tempdir()?;
@@ -1140,8 +1140,8 @@ fn create_request(assets: &Value, params: Value) -> Result<CreateSandboxRequest>
 
 #[tokio::test]
 #[ignore = "real KVM/ublk and extension HTTP lifecycle/patch contracts"]
-async fn dragonball_m3_extension_patch_roundtrip() -> Result<()> {
-    if subprocess_case("dragonball_m3_extension_patch_roundtrip").await? {
+async fn dragonball_platform_extension_patch_roundtrip() -> Result<()> {
+    if subprocess_case("dragonball_platform_extension_patch_roundtrip").await? {
         return Ok(());
     }
     let root = tempfile::Builder::new()
@@ -1188,7 +1188,7 @@ async fn dragonball_m3_extension_patch_roundtrip() -> Result<()> {
     );
     let captured = orchestrator.capture_snapshot(id).await?;
     assert_eq!(captured.metadata.custom_extension_params, updated);
-    let manager = super::dragonball_m1::posix_manager(&root.path().join("repository"))?;
+    let manager = super::dragonball_support::posix_manager(&root.path().join("repository"))?;
     let mut publication =
         publish_metadata(id, &spec(&assets)?, &assets, &captured.captured_snapshot)?;
     publication.custom_extension_params = captured.metadata.custom_extension_params;

@@ -1,0 +1,14 @@
+[
+  {
+    "ssh": "agentenv-test-a",
+    "script": "/opt/agentenv/scripts/tests/dragonball_m4_physical.py",
+    "inputs": "/opt/agentenv/config/tests/physical-inputs.local.json",
+    "private_ip": "10.20.0.10"
+  },
+  {
+    "ssh": "agentenv-test-b",
+    "script": "/opt/agentenv/scripts/tests/dragonball_m4_physical.py",
+    "inputs": "/opt/agentenv/config/tests/physical-inputs.local.json",
+    "private_ip": "10.20.0.11"
+  }
+]

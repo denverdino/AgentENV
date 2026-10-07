@@ -18,6 +18,45 @@ def implementation():
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_direct_cell_rejects_kernel_mismatch_before_allocating_lab(self):
+        from unittest.mock import patch
+        m = implementation()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            kernel.write_bytes(b"db kernel")
+            other = root / "fc-kernel"
+            other.write_bytes(b"different kernel")
+            assets = root / "assets.json"
+            assets.write_text(json.dumps({"kernel_path": str(kernel)}))
+            inputs = {name: str(kernel) for name in
+                      ("server", "server_fc", "daemon", "s3", "registry", "ublk_cli", "workload", "firecracker")}
+            inputs.update(assets=str(assets), kernel_fc=str(other), deps=str(root))
+            with patch.object(m.os, "geteuid", return_value=0), patch.object(m, "Lab") as lab:
+                with self.assertRaisesRegex(ValueError, "same kernel"):
+                    m.run_cell(root / "unused", inputs, "dragonball",
+                               {"memory_mib": 1024, "dirty": "low", "concurrency": 1}, None, root)
+                lab.assert_not_called()
+                self.assertFalse((root / "unused").exists())
+
+    def test_preflight_refuses_missing_receipts_before_allocating_lab(self):
+        from unittest.mock import patch
+        m = implementation()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = root / "asset"
+            asset.write_text("same bytes")
+            manifest = root / "assets.json"
+            manifest.write_text(json.dumps({"kernel_path": str(asset)}))
+            inputs = {name: str(asset) for name in
+                      ("server", "server_fc", "daemon", "s3", "registry", "ublk_cli", "workload", "firecracker", "kernel_fc")}
+            inputs.update(assets=str(manifest), deps=str(root))
+            with patch.object(m.os, "geteuid", return_value=0), patch.object(m, "Lab") as lab:
+                with self.assertRaisesRegex(ValueError, "receipt"):
+                    m.run_cell(root / "unused", inputs, "dragonball",
+                               {"memory_mib": 1024, "dirty": "low", "concurrency": 1}, None, root)
+                lab.assert_not_called()
+
     def test_capacity_reserves_fixture_memory_before_admission(self):
         m = implementation()
         cell = {"memory_mib": 1024, "dirty": "low", "concurrency": 10}
@@ -339,7 +378,7 @@ def vm_cleanup_audit():
     print("M4 partial cold cleanup audit root: " + str(root), flush=True)
     with patch.object(m, "api", side_effect=partial_create):
         result = m.run_cell(root, inputs, "dragonball", {"memory_mib": 1024, "dirty": "low", "concurrency": 2},
-            SimpleNamespace(repeats=1, operations=["cold"], node_memory_gib=12, node_cpus=4), output)
+            SimpleNamespace(repeats=1, operations=["cold"], node_memory_gib=12, node_cpus=4, fixture_memory_gib=16), output)
     rows = result["samples"]
     assert len(rows) == 2 and sum(row["ok"] for row in rows) == 1, result
     assert "batch contains failed samples" in result.get("error", ""), result

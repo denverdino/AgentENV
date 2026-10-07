@@ -1,9 +1,8 @@
 use super::sandbox::{DragonballSandbox, RuntimeStarted};
 use crate::sandbox::{
     volume_snapshot::{set_volume_freeze, snapshot_persistent_volume_drives},
-    Executor, ExtraDrive, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
+    Executor, ExtraDrive, SandboxCaptureError, SandboxCaptureResult,
 };
-use agentenv_vmm_protocol::runtime::{RuntimeCommand, RuntimeReply};
 use anyhow::Context;
 use std::{sync::atomic::Ordering, time::Duration};
 
@@ -36,7 +35,7 @@ impl DragonballSandbox {
         .map_err(|error| SandboxCaptureError::terminal(error.into()))?;
         self.runtime = Some(runtime);
         if result.as_ref().is_err_and(SandboxCaptureError::is_terminal) {
-            if let Err(error) = self.stop().await {
+            if let Err(error) = self.stop_runtime(true).await {
                 result = Err(SandboxCaptureError::terminal(anyhow::anyhow!(
                     "volume operation failed; teardown not confirmed: {error:#}"
                 )));
@@ -47,6 +46,25 @@ impl DragonballSandbox {
 }
 
 impl RuntimeStarted {
+    pub(super) async fn sync_writable_volume_filesystems(&self) -> SandboxCaptureResult<()> {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            Executor::new(self.envd.clone())
+                .with_root_user()
+                .run_command("/agentenv/bin/busybox", &["sync"]),
+        )
+        .await
+        .context("guest volume sync timed out")
+        .and_then(|output| output)?;
+        if output.exit_code != 0 {
+            return Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+                "guest volume sync failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     async fn thaw_volume_mounts(&mut self) -> SandboxCaptureResult<()> {
         while let Some((mount, device)) = self.frozen_volume_mounts.last().cloned() {
             let output = set_volume_freeze(self.envd.clone(), &mount, Some(&device))
@@ -113,34 +131,20 @@ impl RuntimeStarted {
                 self.frozen_volume_mounts.last_mut().unwrap().1 = output.stdout.trim().into();
             }
         } else {
-            let output = tokio::time::timeout(
-                Duration::from_secs(30),
-                Executor::new(self.envd.clone())
-                    .with_root_user()
-                    .run_command("/agentenv/bin/busybox", &["sync"]),
-            )
-            .await
-            .context("guest volume sync timed out")
-            .and_then(|output| output)?;
-            if output.exit_code != 0 {
-                return Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
-                    "guest volume sync failed: {}",
-                    output.stderr.trim()
-                )));
-            }
+            self.sync_writable_volume_filesystems().await?;
         }
-        self.ready.store(false, Ordering::Release);
-        let RuntimeReply::Held(report) = self
-            .client
-            .lock()
-            .await
-            .request(RuntimeCommand::BeginCapture, Duration::from_secs(30))
-            .await
-            .map_err(SandboxCaptureError::terminal)?
-        else {
-            return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                "missing volume quiescence proof"
-            )));
+        let report = match self.begin_capture().await {
+            Ok(report) => report,
+            Err(error) => {
+                if !error.is_terminal() {
+                    self.thaw_volume_mounts().await.map_err(|thaw| {
+                        SandboxCaptureError::terminal(anyhow::anyhow!(
+                            "capture rejected and rollback thaw failed: {thaw:#}"
+                        ))
+                    })?;
+                }
+                return Err(error);
+            }
         };
         snapshot_persistent_volume_drives(drives, &self.extras)
             .await

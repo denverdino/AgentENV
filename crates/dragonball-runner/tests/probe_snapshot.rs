@@ -264,7 +264,7 @@ fn valid_state(machine: &ProbeVmConfig) -> serde_json::Value {
                 "config":{
                     "device_type":"RawBlock", "drive_id":disk.drive_id,
                     "path_on_host":disk.path_on_host, "is_root_device":disk.is_root,
-                    "is_read_only":disk.read_only, "is_direct":true,
+                    "is_read_only":disk.read_only, "is_direct":!(disk.is_root && disk.read_only),
                     "is_volume_slot":false,"backing_read_only":null,
                     "no_drop":false,"num_queues":1,"part_uuid":null,
                     "queue_size":256,"rate_limiter":null,"sparse":false,"use_generic_irq":false,
@@ -344,6 +344,10 @@ fn saved_device_membership_and_config_must_match_machine_stamp() {
         (
             "/device_states/block/devices/0/config/is_root_device",
             json!(false),
+        ),
+        (
+            "/device_states/block/devices/0/config/is_direct",
+            json!(true),
         ),
         ("/device_states/block/devices/0/config/no_drop", json!(true)),
         (

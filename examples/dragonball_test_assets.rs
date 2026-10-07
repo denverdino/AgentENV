@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     anyhow::ensure!(
         args.len() == 2,
-        "usage: dragonball_m0_assets <runner> <output.json>"
+        "usage: dragonball_test_assets <runner> <output.json>"
     );
     let config = ConfigManager::init_global()?.config();
     let source = std::env::var("AENV_DRAGONBALL_M0_IMAGE")

@@ -9,6 +9,10 @@ an E2B-compatible API. Gateway and scheduler form a separate Go module in `servi
 Behavioral guidelines to reduce common LLM coding mistakes, combined with the
 project-specific instructions below.
 
+For multi-step development and testing, read and maintain
+[the engineering efficiency improvement log](AGENTS_Updated.md). It supplements
+this guide; distinguish proposed automation from implemented and verified tooling.
+
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks,
 use judgment.
 

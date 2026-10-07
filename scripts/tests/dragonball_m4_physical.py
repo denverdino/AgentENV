@@ -251,8 +251,11 @@ class Worker:
 
 
 def worker(args):
-    private_ipv4(args.private_ip)
     inputs = json.loads(args.inputs.read_text())
+    address = args.private_ip if args.private_ip is not None else inputs.get("private_ip")
+    if not address:
+        raise ValueError("private_ip in --inputs or --private-ip is required")
+    args.private_ip = private_ipv4(address)
     cleanup_binary = Path(inputs.get("ublk_cli", ""))
     if not cleanup_binary.is_absolute() or not cleanup_binary.is_file():
         raise ValueError("physical M4 requires absolute ublk_cli for exact owned-device cleanup")
@@ -426,7 +429,7 @@ def main():
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--inside", action="store_true")
     parser.add_argument("--inputs", type=Path)
-    parser.add_argument("--private-ip")
+    parser.add_argument("--private-ip", help="worker RFC1918 address; overrides private_ip in --inputs")
     parser.add_argument("--host-pid", type=int)
     parser.add_argument("--hosts", type=Path)
     parser.add_argument("--output", type=Path)

@@ -69,7 +69,7 @@ pub fn validate_snapshot(state: &Path, memory: &Path, machine: &ProbeVmConfig) -
         let expected_config = serde_json::json!({
             "device_type": "RawBlock", "drive_id": expected.drive_id,
             "path_on_host": expected.path_on_host, "is_root_device": expected.is_root,
-            "is_read_only": expected.read_only, "is_direct": true,
+            "is_read_only": expected.read_only, "is_direct": !(expected.is_root && expected.read_only),
             "is_volume_slot":false,"backing_read_only":null,
             "no_drop": false, "num_queues": 1, "part_uuid": null,
             "queue_size": 256, "rate_limiter": null, "sparse": false,

@@ -62,7 +62,6 @@ impl PrivateListener {
             socket_path: socket.into(),
         };
         fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
-        private.listener.set_nonblocking(true)?;
         Ok(private)
     }
 
@@ -70,10 +69,7 @@ impl PrivateListener {
         loop {
             let (mut stream, _) = match self.listener.accept() {
                 Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("accept private VMM request"),
             };
             if peer_uid(stream.as_raw_fd())? != unsafe { libc::geteuid() } {
@@ -116,10 +112,7 @@ impl PrivateListener {
         loop {
             let (mut stream, _) = match self.listener.accept() {
                 Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("accept runtime request"),
             };
             if peer_uid(stream.as_raw_fd())? != unsafe { libc::geteuid() } {
@@ -200,5 +193,35 @@ fn peer_uid(fd: std::os::fd::RawFd) -> anyhow::Result<u32> {
 impl Drop for PrivateListener {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_accept_waits_for_a_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = PrivateListener::bind(&socket, directory.path()).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            accepted_tx
+                .send(listener.listener.accept().map(|_| ()))
+                .unwrap();
+        });
+        let idle = accepted_rx.recv_timeout(Duration::from_millis(50));
+        assert!(matches!(
+            idle,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let _connection = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
 }

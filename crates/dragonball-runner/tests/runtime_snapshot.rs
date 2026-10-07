@@ -32,6 +32,33 @@ fn machine() -> RuntimeVmConfig {
 }
 
 #[test]
+fn tools_snapshot_preserves_buffered_reads_and_rejects_wrong_io_policy() {
+    for (read_only, direct) in [(true, false), (false, true)] {
+        let mut source = machine();
+        source.block_devices[0].read_only = read_only;
+        let mut raw = raw_state();
+        let block = &mut raw["device_states"]["block"]["devices"][0];
+        block["config"]["is_read_only"] = json!(read_only);
+        block["config"]["is_direct"] = json!(direct);
+        block["device_info"]["RawBlock"]["avail_features"] =
+            json!(block_profile_features(read_only));
+        let envelope = capture_envelope(raw.clone(), &source, 16 * 1024 * 1024).unwrap();
+        let restored = restore_state(&envelope, &source, 16 * 1024 * 1024).unwrap();
+        assert_eq!(
+            restored["device_states"]["block"],
+            raw["device_states"]["block"]
+        );
+        raw["device_states"]["block"]["devices"][0]["config"]["is_direct"] = json!(!direct);
+        assert!(capture_envelope(raw, &source, 16 * 1024 * 1024).is_err());
+        let mut wrong = envelope;
+        wrong.upstream_state["device_states"]["block"]["devices"][0]["config"]["is_direct"] =
+            json!(!direct);
+        assert!(wrong.validate_state_topology().is_err());
+        assert!(restore_state(&wrong, &source, 16 * 1024 * 1024).is_err());
+    }
+}
+
+#[test]
 fn runtime_snapshot_preserves_then_replaces_only_host_rate_limits() {
     let captured_rate = json!({
         "bandwidth":{"size":1048576,"one_time_burst":2097152,"refill_time":1000},

@@ -9,6 +9,13 @@ use tokio::{
     net::UnixStream,
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("runtime {code}: {message}")]
+struct RuntimeRemoteError {
+    code: String,
+    message: String,
+}
+
 pub struct RuntimeClient {
     socket: PathBuf,
     instance: String,
@@ -48,6 +55,43 @@ impl RuntimeClient {
 
     pub(super) fn finish_memory_lease(&mut self) {
         self.memory_lease_active = false;
+    }
+
+    pub(super) async fn begin_capture(
+        &mut self,
+    ) -> crate::sandbox::SandboxCaptureResult<CaptureReport> {
+        use crate::sandbox::SandboxCaptureError;
+        match self
+            .request(RuntimeCommand::BeginCapture, Duration::from_secs(30))
+            .await
+        {
+            Ok(RuntimeReply::Held(report)) => Ok(report),
+            Ok(_) => Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                "missing held capture proof"
+            ))),
+            Err(error) => {
+                let rejected = error
+                    .downcast_ref::<RuntimeRemoteError>()
+                    .is_some_and(|error| error.code == "snapshot_preflight_error");
+                // A lost response is not a rejection. Only the runner's known-error
+                // contract, followed by a positive state check, permits recovery.
+                if rejected
+                    && matches!(
+                        self.request(RuntimeCommand::Status, Duration::from_secs(5))
+                            .await,
+                        Ok(RuntimeReply::Status(RuntimeStatus {
+                            phase: RuntimePhase::Running,
+                            capture: None,
+                            memory_map_pinned: false,
+                        }))
+                    )
+                {
+                    Err(SandboxCaptureError::recoverable(error))
+                } else {
+                    Err(SandboxCaptureError::terminal(error))
+                }
+            }
+        }
     }
     pub async fn request(
         &mut self,
@@ -124,7 +168,11 @@ impl RuntimeClient {
                 if mutating && error.code != "vmm_error" {
                     self.outcome_unknown = was_unknown;
                 }
-                Err(anyhow::anyhow!("runtime {}: {}", error.code, error.message))
+                Err(RuntimeRemoteError {
+                    code: error.code,
+                    message: error.message,
+                }
+                .into())
             }
         }
     }
@@ -138,6 +186,101 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixListener,
     };
+
+    #[tokio::test]
+    async fn capture_rejection_requires_positive_running_confirmation() {
+        for (code, phase, pinned, recoverable) in [
+            (
+                "snapshot_preflight_error",
+                Some(RuntimePhase::Running),
+                false,
+                true,
+            ),
+            (
+                "snapshot_preflight_error",
+                Some(RuntimePhase::Running),
+                true,
+                false,
+            ),
+            (
+                "snapshot_preflight_error",
+                Some(RuntimePhase::Failed),
+                false,
+                false,
+            ),
+            ("snapshot_preflight_error", None, false, false),
+            ("vmm_error", Some(RuntimePhase::Running), false, false),
+            ("invalid_phase", Some(RuntimePhase::Running), false, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("runtime.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut peer).await;
+                assert_eq!(request.command, RuntimeCommand::BeginCapture);
+                let response = RuntimeResponse {
+                    mode: "runtime".into(),
+                    protocol_version: RUNTIME_PROTOCOL_VERSION,
+                    request_id: request.request_id,
+                    sandbox_instance_id: request.sandbox_instance_id.clone(),
+                    result: Err(RuntimeError {
+                        code: code.into(),
+                        message: "capture refused".into(),
+                    }),
+                };
+                peer.write_all(&encode_runtime_response(&response).unwrap())
+                    .await
+                    .unwrap();
+                if code == "snapshot_preflight_error" {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    let status = read_request(&mut peer).await;
+                    assert_eq!(status.command, RuntimeCommand::Status);
+                    let Some(phase) = phase else {
+                        return;
+                    };
+                    peer.write_all(
+                        &encode_runtime_response(&RuntimeResponse {
+                            request_id: status.request_id,
+                            result: Ok(RuntimeReply::Status(RuntimeStatus {
+                                phase,
+                                capture: None,
+                                memory_map_pinned: pinned,
+                            })),
+                            ..response
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let mut client = RuntimeClient::new(socket, "instance".into());
+            let error = client.begin_capture().await.unwrap_err();
+            assert_eq!(!error.is_terminal(), recoverable, "{code}: {error}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_capture_reply_remains_terminal_and_prevents_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_request(&mut peer).await.command,
+                RuntimeCommand::BeginCapture
+            );
+            // EOF after receipt does not prove that the runner rejected capture.
+        });
+        let mut client = RuntimeClient::new(socket, "instance".into());
+        assert!(client.begin_capture().await.unwrap_err().is_terminal());
+        assert!(client.outcome_unknown);
+        assert!(client.begin_capture().await.unwrap_err().is_terminal());
+        server.await.unwrap();
+    }
 
     #[test]
     fn m2_runtime_client_cannot_acquire_another_live_memory_lease() {

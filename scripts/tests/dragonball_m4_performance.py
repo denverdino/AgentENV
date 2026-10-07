@@ -21,6 +21,7 @@ import time
 import uuid
 
 from dragonball_m4_lab import Lab
+from dragonball_m4_build import verify as verify_build
 from dragonball_m4_cleanup import cleanup_owned_ublk
 from dragonball_m4_metrics import resources
 from dragonball_m4_rollback import digest
@@ -222,7 +223,43 @@ def cleanup_cell(lab, services, inputs):
     return fixture_resources
 
 
+
+def preflight(inputs):
+    """Shared admission for CLI and direct experiment callers; allocates no lab."""
+    validate_inputs(inputs, "rollback", os.geteuid())
+    for name in ("workload", "ublk_cli"):
+        path = Path(inputs.get(name, ""))
+        if not path.is_absolute() or not path.is_file():
+            raise ValueError("missing absolute input: " + name)
+    assets = json.loads(Path(inputs["assets"]).read_text())
+    if digest(assets["kernel_path"]) != digest(inputs["kernel_fc"]):
+        raise ValueError("comparative matrix requires the same kernel bytes for both backends")
+    builds = {}
+    for backend, key in (("dragonball", "server"), ("firecracker", "server_fc")):
+        builds[backend] = verify_build(Path(inputs.get(key + "_receipt", "")), inputs[key], backend)
+    return {"assets": assets, "builds": builds}
+
+
+def comparable_builds(results):
+    if any("error" in row for row in results):
+        return False
+    rows = [row for row in results if "identity" in row]
+    if {row["backend"] for row in rows} != {"firecracker", "dragonball"}:
+        return False
+    signatures = set()
+    for row in rows:
+        receipt = row.get("build_receipt")
+        if not receipt:
+            return False
+        build = receipt["build"]
+        signatures.add(json.dumps([receipt["source"], build["profile"], build["toolchains"],
+                                   build["environment_sha256"], build["configurations"]], sort_keys=True))
+    return len(signatures) == 1
+
+
 def run_cell(root, inputs, backend, cell, args, output):
+    checked = preflight(inputs)
+    receipt = checked["builds"][backend]
     samples = []
     spec = workload(cell["memory_mib"], cell["dirty"])
     encoded = base64.b64encode(Path(inputs["workload"]).read_bytes()).decode()
@@ -230,6 +267,7 @@ def run_cell(root, inputs, backend, cell, args, output):
               "oss_timeout_seconds": inputs.get("oss_timeout_seconds", 30),
               "request_timeout_seconds": inputs.get("request_timeout_seconds", 180),
               "repeats_requested": args.repeats, "samples": samples, "cleanup": "pending",
+              "build_receipt": receipt,
               "fixture_resources_path": str(root / "fixture-resources.json")}
     try:
         with Lab(root, "aenv") as lab:
@@ -242,6 +280,8 @@ def run_cell(root, inputs, backend, cell, args, output):
                 (node.cgroup / "cpu.max").write_text(f"{args.node_cpus * 100000} 100000")
                 (node.cgroup / "pids.max").write_text(str(max(2048, cell["concurrency"] * 128)))
                 result["identity"] = start_server(node, inputs, cert, assets, backend)
+                if any(result["identity"].get(key) != value for key, value in receipt["identity"].items()):
+                    raise ValueError("running server identity differs from build receipt")
                 result["config_sha256"] = digest(node.root / "config.toml")
                 result["namespaces"] = json.loads((node.root / "ready").read_text())
                 count = cell["concurrency"]
@@ -376,18 +416,10 @@ def main():
     if not 2 <= args.fixture_memory_gib <= 128:
         parser.error("fixture memory budget must be 2..128 GiB")
     inputs = json.loads(args.inputs.read_text())
-    validate_inputs(inputs, "rollback", os.geteuid())
+    checked = preflight(inputs)
+    assets = checked["assets"]
     if not 1 <= args.node_cpus <= (os.cpu_count() or 1):
         parser.error("node CPU budget must fit host logical CPUs")
-    workload_path = Path(inputs.get("workload", ""))
-    if not workload_path.is_absolute() or not workload_path.is_file():
-        parser.error("inputs.workload must be an absolute static Linux helper binary path")
-    ublk_cli = Path(inputs.get("ublk_cli", ""))
-    if not ublk_cli.is_absolute() or not ublk_cli.is_file():
-        parser.error("inputs.ublk_cli must be an absolute ublk control binary path")
-    assets = json.loads(Path(inputs["assets"]).read_text())
-    if digest(assets["kernel_path"]) != digest(inputs["kernel_fc"]):
-        parser.error("comparative matrix requires the same kernel bytes for both backends")
     cells = [{"memory_mib": m, "dirty": d, "concurrency": c}
              for m, d, c in itertools.product(args.memory_mib, args.dirty, args.concurrency)]
     for value in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -400,7 +432,7 @@ def main():
     conditions = {"host": os.uname()._asdict() if hasattr(os.uname(), "_asdict") else list(os.uname()),
         "host_cpuinfo": Path("/proc/cpuinfo").read_text(), "operations": args.operations,
         "repeats": args.repeats, "node_memory_gib": args.node_memory_gib, "node_cpu_quota": args.node_cpus,
-        "fixture_memory_gib": args.fixture_memory_gib,
+        "fixture_memory_gib": args.fixture_memory_gib, "build_receipts": checked["builds"],
         "vcpu_per_sandbox": 1, "cache_policy": "fresh_node_caches_shared_host_cache_no_flush",
         "backend_order": "alternating_by_cell_firecracker_first_even_dragonball_first_odd",
         "pool": "disabled", "storage": "overlaybd_ublk_oss_local_minio",
@@ -439,14 +471,12 @@ def main():
             results.append(row)
             append_json(output / "cells.jsonl", row)
     samples = [sample for row in results for sample in row.get("samples", [])]
-    commits = {row["identity"].get("git_commit") for row in results if "identity" in row}
-    backends = {row["backend"] for row in results if "identity" in row}
-    comparable = len(commits) == 1 and None not in commits and backends == {"firecracker", "dragonball"}
+    comparable = comparable_builds(results)
     report = {"conditions": conditions, "conditions_comparable": comparable,
               "cells": results, **summarize(samples)}
     if not comparable:
         for comparison in report["relative_diagnostics"].values():
-            comparison["status"] = "missing_or_mismatched_server_identity"
+            comparison["status"] = "missing_or_mismatched_build_provenance"
     (output / "result.json").write_text(json.dumps(report, indent=2, allow_nan=False))
     print(json.dumps({"output": str(output), "performance_qualified": False,
                       "failed_cells": sum("error" in row for row in results)}), flush=True)

@@ -6,7 +6,7 @@ use agentenv::sandbox::{
 };
 use anyhow::{Context, Result};
 
-use super::dragonball_m1::{asset, fixture, launch, posix_manager, publish_metadata, spec};
+use super::dragonball_support::{asset, fixture, launch, posix_manager, publish_metadata, spec};
 
 // Observe only this isolated runtime directory, never unrelated host VMs.
 async fn mapped_memory_device(runtime: &std::path::Path) -> Result<std::path::PathBuf> {
@@ -73,7 +73,7 @@ async fn daemon_call(
 
 #[tokio::test]
 #[ignore = "real held restore checks valid/corrupt/missing/budget startup manifests"]
-async fn dragonball_m2_prefetch_failure_keeps_snapshot_runnable() -> Result<()> {
+async fn dragonball_memory_prefetch_failure_keeps_snapshot_runnable() -> Result<()> {
     use sha2::{Digest, Sha256};
     let (mut app, assets) = fixture().await?;
     app.snapshot.memory_startup_pack.enabled = false;
@@ -173,13 +173,13 @@ async fn dragonball_m2_prefetch_failure_keeps_snapshot_runnable() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "cancel real POSIX publication while the dedicated recorder owns the capture"]
-async fn dragonball_m2_recording_outlives_publication_cancellation() -> Result<()> {
+async fn dragonball_memory_recording_outlives_publication_cancellation() -> Result<()> {
     cancellation_case(false).await
 }
 
 #[tokio::test]
 #[ignore = "isolated child process exercises permanent node shutdown admission and drain"]
-async fn dragonball_m2_shutdown_drains_recording() -> Result<()> {
+async fn dragonball_memory_shutdown_drains_recording() -> Result<()> {
     if std::env::var("AENV_TEST_DB_SHUTDOWN_CHILD").as_deref() != Ok("1") {
         let runtime = tempfile::tempdir()?;
         let status = tokio::time::timeout(
@@ -187,7 +187,7 @@ async fn dragonball_m2_shutdown_drains_recording() -> Result<()> {
             tokio::process::Command::new(std::env::current_exe()?)
                 .args([
                     "--exact",
-                    "dragonball_m2_startup::dragonball_m2_shutdown_drains_recording",
+                    "dragonball_startup::dragonball_memory_shutdown_drains_recording",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -297,7 +297,7 @@ async fn cancellation_case(shutdown: bool) -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real Dragonball first-touch recording with startup-pack enabled"]
-async fn dragonball_m2_recording_uses_dedicated_device() -> Result<()> {
+async fn dragonball_memory_recording_uses_dedicated_device() -> Result<()> {
     for (record, consume, failure) in [
         (false, false, false),
         (false, true, false),
@@ -455,7 +455,7 @@ async fn recording_case(record: bool, consume: bool, failure: bool) -> Result<()
 
 #[tokio::test]
 #[ignore = "real 1/8GiB guests with the dedicated DAMON_RECLAIM qualification kernel"]
-async fn dragonball_m2_damon_uses_actual_regions() -> Result<()> {
+async fn dragonball_memory_damon_uses_actual_regions() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -544,5 +544,68 @@ cat $t/trace
             eprintln!("DAMON MMIO-hole sampling: {entries} calls, {returns} NULL returns");
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real daemon observes rootfs and restored memory readiness notifications"]
+async fn dragonball_memory_ready_releases_rootfs_and_memory_downloads() -> Result<()> {
+    let (app, assets) = fixture().await?;
+    let factory = DragonballSandboxFactory::new(
+        DragonballRuntimePolicy::from_app_config(
+            &app,
+            asset(&assets, "runner_path")?,
+            asset(&assets, "kernel_path")?,
+        )?
+        .with_memory_mode(DragonballMemoryMode::SharedUblkIncremental),
+    )?;
+    let log = app
+        .ublk
+        .daemon_log_path
+        .clone()
+        .unwrap_or_else(|| app.home_path.join("logs/ublk-daemon.log"));
+    let build = spec(&assets)?;
+    let source = launch(&assets)?;
+    let id = source.sandbox_id;
+    let mut vm = factory.build_fresh(build.clone(), source)?;
+    vm.start().await?;
+    let runtime = vm.work_dir()?.canonicalize()?;
+    let captured = vm.snapshot().await?;
+    let metadata = publish_metadata(id, &build, &assets, &captured)?;
+    let root = tempfile::tempdir_in(&app.runtime_path)?;
+    let manager = posix_manager(root.path())?;
+    let record = manager.publish_captured(metadata, captured).await?;
+    vm.stop().await?;
+    let runnable = manager.resolve_runnable(record.clone()).await?;
+    let memory = runnable
+        .manifest()
+        .memory
+        .image_config_path
+        .canonicalize()?;
+    let mut restored = factory.build_from_snapshot(&runnable, launch(&assets)?)?;
+    restored.start().await?;
+    restored.stop().await?;
+    let lines = std::fs::read_to_string(&log)?;
+    let ready: Vec<_> = lines
+        .lines()
+        .filter(|line| line.contains("sandbox reported envd-ready; releasing held downloads"))
+        .collect();
+    assert!(
+        ready
+            .iter()
+            .any(|line| line.contains(&runtime.join("overlaybd").to_string_lossy().to_string())),
+        "fresh rootfs download gate was not released: {}",
+        log.display()
+    );
+    assert!(
+        ready
+            .iter()
+            .any(|line| line.contains(&memory.to_string_lossy().to_string())),
+        "restored memory download gate was not released: {}",
+        log.display()
+    );
+    drop(restored);
+    drop(runnable);
+    manager.delete(record.id.to_string()).await?;
     Ok(())
 }

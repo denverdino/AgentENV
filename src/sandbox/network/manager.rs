@@ -104,6 +104,12 @@ impl NetworkManager {
         MANAGER.get()
     }
 
+    /// Deterministic global fixture for backend teardown tests: no warm retention.
+    #[cfg(test)]
+    pub(crate) fn global_for_cleanup_test() -> &'static Self {
+        MANAGER.get_or_init(|| Self::new(false, 0, 0))
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         maintenance_enabled: bool,

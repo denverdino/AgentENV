@@ -8,10 +8,95 @@ use agentenv::sandbox::{
 };
 use anyhow::{Context, Result};
 
-use super::dragonball_m1::{
-    asset, fixture, fork_command, fork_spec, launch, posix_manager, publish_metadata,
-    runtime_frame, spec, start_active_io, start_echo, ActiveTraffic,
+use super::dragonball_support::{
+    asset, fixture, fork_command, fork_spec, launch, memory_device, posix_manager,
+    publish_metadata, runtime_frame, spec, start_active_io, start_echo, ActiveTraffic,
 };
+
+#[tokio::test]
+#[ignore = "real shared RAM generations; custom pause roots and device retirement require KVM/ublk"]
+async fn dragonball_memory_pause_retires_ancestor_devices_and_adopts_custom_ram() -> Result<()> {
+    use agentenv::sandbox::SandboxBackendFactory;
+    let (app, assets) = fixture().await?;
+    let factory = DragonballSandboxFactory::new(
+        DragonballRuntimePolicy::from_app_config(
+            &app,
+            asset(&assets, "runner_path")?,
+            asset(&assets, "kernel_path")?,
+        )?
+        .with_memory_mode(DragonballMemoryMode::SharedUblkIncremental),
+    )?;
+    let launch = launch(&assets)?;
+    let (id, token) = (launch.sandbox_id, launch.envd_access_token.clone());
+    let custom = tempfile::tempdir()?;
+    let persisted = tempfile::tempdir()?;
+    let mut cold = factory.build_fresh(spec(&assets)?, launch)?;
+    cold.start().await?;
+    command(&cold, "printf retained-ram > /dev/shm/review-ram").await?;
+    let mut paused = cold.pause(Some(custom.path())).await?;
+    cold.stop().await?;
+    drop(cold);
+    for _ in 0..3 {
+        let old_memory = PathBuf::from(
+            paused.encode()?["memory_image_config_path"]
+                .as_str()
+                .context("memory config")?,
+        );
+        let old_root = old_memory.parent().context("memory root")?.to_path_buf();
+        anyhow::ensure!(
+            old_root.starts_with(custom.path()) || old_root.starts_with(persisted.path()),
+            "old RAM must belong to this test fixture"
+        );
+        let mut vm = factory.build_paused(id, paused.as_ref(), token.clone())?;
+        vm.start().await?;
+        drop(paused);
+        let device = memory_device(&vm).await?;
+        assert_eq!(
+            command(&vm, "cat /dev/shm/review-ram").await?,
+            "retained-ram"
+        );
+        let next = vm.pause(Some(persisted.path())).await?;
+        let record = next.encode()?;
+        next.persistence_committed();
+        vm.stop().await?;
+        drop(vm);
+        // Keeping the new capture alive must not keep the prior device alive.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while device.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("new pause retained an ancestral memory device")?;
+        let config: overlaybd::config::ImageConfig = serde_json::from_slice(&std::fs::read(
+            record["memory_image_config_path"]
+                .as_str()
+                .context("new memory config")?,
+        )?)?;
+        assert!(
+            config
+                .lowers
+                .iter()
+                .all(|layer| !std::path::Path::new(&layer.file).starts_with(&old_root)),
+            "new RAM still references the previous pause root"
+        );
+        drop(next);
+        // Committed old roots are caller-owned. Remove only this fixture's old
+        // RAM after checking the successor has independent layer references.
+        if old_root.exists() {
+            std::fs::remove_dir_all(&old_root)?;
+        }
+        paused = factory.decode_paused_state(persisted.path().to_path_buf(), record)?;
+    }
+    let mut vm = factory.build_paused(id, paused.as_ref(), token)?;
+    vm.start().await?;
+    assert_eq!(
+        command(&vm, "cat /dev/shm/review-ram").await?,
+        "retained-ram"
+    );
+    vm.stop().await?;
+    Ok(())
+}
 
 // Take over only after node capture has left the source held. Exporting an
 // independent full dump at that same token catches missing CPU/device/zero pages.
@@ -94,31 +179,31 @@ async fn compare_held_oracle(
 
 #[tokio::test]
 #[ignore = "same-held complete RAM oracle of a real incremental shared-memory guest"]
-async fn dragonball_m2_incremental_matches_held_full_dump() -> Result<()> {
+async fn dragonball_memory_incremental_matches_held_full_dump() -> Result<()> {
     incremental_case(1024, false, false).await
 }
 
 #[tokio::test]
 #[ignore = "2GiB active CPU/AIO/TAP incremental full-RAM oracle"]
-async fn dragonball_m2_incremental_full_oracle_2g() -> Result<()> {
+async fn dragonball_memory_incremental_full_oracle_2g() -> Result<()> {
     incremental_case(2048, false, false).await
 }
 
 #[tokio::test]
 #[ignore = "8GiB across GPA hole; requires dedicated memory fixture capacity"]
-async fn dragonball_m2_incremental_full_oracle_8g() -> Result<()> {
+async fn dragonball_memory_incremental_full_oracle_8g() -> Result<()> {
     incremental_case(8192, false, false).await
 }
 
 #[tokio::test]
 #[ignore = "real publication rejection must not advance the restored memory base"]
-async fn dragonball_m2_failed_publish_does_not_reset_dirty() -> Result<()> {
+async fn dragonball_memory_failed_publish_does_not_reset_dirty() -> Result<()> {
     incremental_case(512, true, false).await
 }
 
 #[tokio::test]
 #[ignore = "real tmpfs zero/rewrite snapshots and subsequent private restore"]
-async fn dragonball_m2_zero_then_rewrite_and_fork() -> Result<()> {
+async fn dragonball_memory_zero_then_rewrite_and_fork() -> Result<()> {
     incremental_case(512, false, true).await
 }
 
@@ -316,30 +401,6 @@ fn balloon_reports(state: &std::path::Path) -> Result<u64> {
         .context("balloon reporting used index")
 }
 
-pub(super) async fn memory_device(sandbox: &DragonballSandbox) -> Result<PathBuf> {
-    let socket = tokio::net::UnixStream::connect(sandbox.work_dir()?.join("runner.sock")).await?;
-    let pid = socket.peer_cred()?.pid().context("owned runner peer PID")?;
-    drop(socket);
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
-    let devices = maps
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            (fields.len() >= 6 && fields[1] == "rw-p" && fields[5].starts_with("/dev/ublkb"))
-                .then(|| PathBuf::from(fields[5]))
-        })
-        .collect::<std::collections::HashSet<_>>();
-    anyhow::ensure!(
-        devices.len() == 1,
-        "expected one private ublk RAM mapping, got {devices:?}"
-    );
-    anyhow::ensure!(
-        !sandbox.work_dir()?.join("restore-memory.bin").exists(),
-        "restore copied full RAM"
-    );
-    Ok(devices.into_iter().next().unwrap())
-}
-
 async fn command(sandbox: &DragonballSandbox, script: &str) -> Result<String> {
     let output = sandbox.run_command("/bin/sh", &["-ec", script]).await?;
     anyhow::ensure!(
@@ -352,7 +413,7 @@ async fn command(sandbox: &DragonballSandbox, script: &str) -> Result<String> {
 
 #[tokio::test]
 #[ignore = "diagnostic control: identical idle guest restored from a regular RAM file"]
-async fn dragonball_m2_idle_file_restore_control() -> Result<()> {
+async fn dragonball_memory_idle_file_restore_control() -> Result<()> {
     let (app, assets) = fixture().await?;
     let policy = DragonballRuntimePolicy::from_app_config(
         &app,
@@ -380,7 +441,7 @@ async fn dragonball_m2_idle_file_restore_control() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real shared ublk COW guest; isolated non-root KVM fixture"]
-async fn dragonball_m2_shared_memory_cow_three_children() -> Result<()> {
+async fn dragonball_memory_shared_memory_cow_three_children() -> Result<()> {
     let (app, assets) = fixture().await?;
     if std::env::var_os("AENV_TEST_DB_MEMORY_POOL").is_some() {
         assert!(
@@ -469,7 +530,7 @@ async fn dragonball_m2_shared_memory_cow_three_children() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "shared lazy RAM must retire, not recycle, even with the block warm pool enabled"]
-async fn dragonball_m2_shared_memory_retires_with_pool_enabled() -> Result<()> {
+async fn dragonball_memory_shared_memory_retires_with_pool_enabled() -> Result<()> {
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join("run"))?;
     let config_path = std::env::var_os("AENV_CONFIG_PATH").context("explicit test config")?;
@@ -485,7 +546,7 @@ async fn dragonball_m2_shared_memory_retires_with_pool_enabled() -> Result<()> {
         tokio::process::Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
-                "dragonball_m2::dragonball_m2_shared_memory_cow_three_children",
+                "dragonball_memory::dragonball_memory_shared_memory_cow_three_children",
                 "--ignored",
                 "--nocapture",
             ])
@@ -505,7 +566,7 @@ async fn dragonball_m2_shared_memory_retires_with_pool_enabled() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "owned shared-memory runner SIGBUS/SIGKILL; isolated non-root KVM fixture"]
-async fn dragonball_m2_shared_memory_runner_death_retains_backing_until_reap() -> Result<()> {
+async fn dragonball_memory_shared_memory_runner_death_retains_backing_until_reap() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(
         DragonballRuntimePolicy::from_app_config(
@@ -590,7 +651,7 @@ async fn dragonball_m2_shared_memory_runner_death_retains_backing_until_reap() -
 
 #[tokio::test]
 #[ignore = "a kernel block opener outlives runner reap; backing must survive synchronous device retirement"]
-async fn dragonball_m2_memory_backing_survives_kernel_reference() -> Result<()> {
+async fn dragonball_memory_memory_backing_survives_kernel_reference() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(
         DragonballRuntimePolicy::from_app_config(
@@ -654,7 +715,7 @@ async fn dragonball_m2_memory_backing_survives_kernel_reference() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "truncate only this fixture's new RAM layer to inject real ublk I/O failure"]
-async fn dragonball_m2_shared_memory_io_error_is_contained() -> Result<()> {
+async fn dragonball_memory_shared_memory_io_error_is_contained() -> Result<()> {
     use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(

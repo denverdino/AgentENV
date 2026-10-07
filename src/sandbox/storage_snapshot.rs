@@ -313,12 +313,44 @@ fn restack_target_upper_data_path(live_runtime_image_config_path: &Path) -> Resu
     Ok(PathBuf::from(image_config.upper.data))
 }
 
-fn on_same_filesystem(src_path: &Path, dst_dir: &Path) -> Result<bool> {
+fn on_same_mount(src_path: &Path, dst_dir: &Path) -> Result<bool> {
     let src_meta = fs::metadata(src_path)
         .with_context(|| format!("stat restack source path {}", src_path.display()))?;
     let dst_meta = fs::metadata(dst_dir)
         .with_context(|| format!("stat restack destination dir {}", dst_dir.display()))?;
-    Ok(src_meta.dev() == dst_meta.dev())
+    if src_meta.dev() != dst_meta.dev() {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Distinct bind mounts can share st_dev but still reject rename with EXDEV.
+        // If mount IDs are unavailable, use the existing staging/copy path.
+        Ok(matches!((mount_id(src_path), mount_id(dst_dir)), (Some(src), Some(dst)) if src == dst))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id(path: &Path) -> Option<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: path is NUL-terminated and stat points to writable storage.
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: the buffer was zero-initialized and statx completed successfully.
+    let stat = unsafe { stat.assume_init() };
+    (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id)
 }
 
 pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Result<()> {
@@ -464,24 +496,6 @@ pub(crate) async fn stage_overlaybd_snapshot_from_live_runtime(
     Ok(output_path)
 }
 
-async fn rewrite_lowers_with_owned_runtime_suffix(
-    existing_lowers: Vec<LayerConfig>,
-    output_dir: &Path,
-    appended_layer: Option<LayerConfig>,
-    compaction_output_name: &'static str,
-    compaction_output: OverlaybdCompactOutput,
-) -> Result<Vec<LayerConfig>> {
-    rewrite_lowers_with_runtime_roots(
-        existing_lowers,
-        output_dir,
-        appended_layer,
-        compaction_output_name,
-        canonicalized_runtime_owned_roots(),
-        compaction_output,
-    )
-    .await
-}
-
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -565,8 +579,8 @@ async fn capture_live_overlaybd_snapshot(
         .context("resolve restack source upper path")?;
     let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
-    let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
-        .context("validate restack snapshot filesystem precondition")?
+    let live_snapshot_layer_path = if on_same_mount(&live_upper_data_path, output_dir)
+        .context("validate restack snapshot mount boundary")?
     {
         snapshot_layer_path.clone()
     } else {
@@ -640,20 +654,39 @@ async fn capture_live_overlaybd_snapshot(
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
 }
 
+#[cfg(any(feature = "hypervisor-firecracker", test))]
 pub(crate) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
 ) -> Result<ImageConfig> {
+    build_mem_snapshot_image_config_with_runtime_roots(
+        resume_mem_image_config_path,
+        new_layer_path,
+        output_dir,
+        memory_output,
+        canonicalized_runtime_owned_roots(),
+    )
+    .await
+}
+
+pub(crate) async fn build_mem_snapshot_image_config_with_runtime_roots(
+    resume_mem_image_config_path: Option<&Path>,
+    new_layer_path: &Path,
+    output_dir: &Path,
+    memory_output: OverlaybdCompactOutput,
+    runtime_owned_roots: &[PathBuf],
+) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let lowers = rewrite_lowers_with_runtime_roots(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        runtime_owned_roots,
         memory_output,
     )
     .await?;
@@ -750,6 +783,63 @@ mod tests {
     use overlaybd::virtual_file::VirtualFile;
     use serde_json::json;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn restack_same_mount_allows_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("upper.data");
+        let destination = root.path().join("snapshot");
+        fs::write(&source, b"upper contents").unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(on_same_mount(&source, &destination).unwrap());
+        fs::rename(&source, destination.join("sealed.commit")).unwrap();
+        assert_eq!(
+            fs::read(destination.join("sealed.commit")).unwrap(),
+            b"upper contents"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a private mount namespace and bind mounts via capability runner"]
+    fn restack_distinguishes_bind_mounts_on_same_device() {
+        let fixture = "AENV_RESTACK_BIND_MOUNT_TEST_DIR";
+        if std::env::var_os(fixture).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            for name in ["backing", "source", "destination"] {
+                fs::create_dir(root.path().join(name)).unwrap();
+            }
+            let output = std::process::Command::new("unshare")
+                .args(["--mount", "--propagation", "private", "sh", "-ec"])
+                .arg(concat!(
+                    "mount --bind \"$2/backing\" \"$2/source\"; ",
+                    "mount --bind \"$2/backing\" \"$2/destination\"; ",
+                    "export AENV_RESTACK_BIND_MOUNT_TEST_DIR=\"$2\"; ",
+                    "exec \"$1\" sandbox::storage_snapshot::tests::restack_distinguishes_bind_mounts_on_same_device --exact --ignored --test-threads=1"
+                ))
+                .arg("restack-bind-fixture")
+                .arg(std::env::current_exe().unwrap())
+                .arg(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "bind-mount child failed: {output:?}"
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(fixture).unwrap());
+        let source = root.join("source/upper.data");
+        let destination = root.join("destination");
+        fs::write(&source, b"live upper").unwrap();
+        assert_eq!(
+            fs::metadata(&source).unwrap().dev(),
+            fs::metadata(&destination).unwrap().dev()
+        );
+        let error = fs::rename(&source, destination.join("sealed.commit")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        assert!(!on_same_mount(&source, &destination).unwrap());
+        assert_eq!(fs::read(source).unwrap(), b"live upper");
+    }
 
     #[tokio::test]
     async fn capture_owner_outlives_publish_future() {
@@ -1069,6 +1159,47 @@ mod tests {
         assert_eq!(PathBuf::from(&latest.file), snapshot_lower);
         assert_eq!(latest.digest, "sha256:descriptor");
         assert_eq!(latest.size, 8);
+    }
+
+    #[tokio::test]
+    async fn memory_staging_adopts_explicit_root_and_preserves_external_prefix() {
+        let ancestor = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let owned_layer = ancestor.path().join("ram.commit");
+        let external_layer = external.path().join("durable.commit");
+        let delta = output.path().join("delta.commit");
+        fs::write(&owned_layer, b"ancestor RAM").unwrap();
+        fs::write(&external_layer, b"external RAM").unwrap();
+        fs::write(&delta, b"delta RAM").unwrap();
+        let config = ancestor.path().join("memory.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&ImageConfig {
+                lowers: vec![
+                    local_layer_config(&external_layer),
+                    local_layer_config(&owned_layer),
+                ],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let staged = build_mem_snapshot_image_config_with_runtime_roots(
+            Some(&config),
+            &delta,
+            output.path(),
+            OverlaybdCompactOutput::Raw,
+            &[ancestor.path().canonicalize().unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(Path::new(&staged.lowers[0].file), external_layer);
+        assert!(Path::new(&staged.lowers[1].file).starts_with(output.path()));
+        drop(ancestor);
+        assert_eq!(fs::read(&staged.lowers[1].file).unwrap(), b"ancestor RAM");
+        assert_eq!(fs::read(external_layer).unwrap(), b"external RAM");
+        assert_eq!(Path::new(&staged.lowers[2].file), delta);
     }
 
     #[tokio::test]
