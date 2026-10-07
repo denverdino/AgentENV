@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "76.21%",
+    "missed": 1631,
+    "total": 6855
+  },
+  "generated_at": "2026-10-07T13:26:39Z",
+  "lines": {
+    "coverage": "80.25%",
+    "missed": 11743,
+    "total": 59469
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "79.15%",
+    "missed": 17690,
+    "total": 84833
+  },
+  "run_url": "https://github.com/denverdino/AgentENV/actions/runs/37625531690"
+}
