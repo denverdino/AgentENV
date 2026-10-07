@@ -1,0 +1,300 @@
+From 9b0d2852e4a9d4c66a391c32fccb93b65e937f8f Mon Sep 17 00:00:00 2001
+From: Li Yi <denverdino@gmail.com>
+Date: Wed, 7 Oct 2026 17:41:32 +0800
+Subject: [PATCH] perf: allow held memory maps without zero-page classification
+
+---
+ src/dragonball/src/address_space_manager.rs | 37 ++++++----
+ src/dragonball/src/api/v1/vmm_action.rs     | 21 ++++++
+ src/dragonball/src/memory_tracking.rs       |  1 +
+ src/dragonball/src/vm/capture.rs            | 81 +++++++++++++++++++--
+ 4 files changed, 121 insertions(+), 19 deletions(-)
+
+diff --git a/src/dragonball/src/address_space_manager.rs b/src/dragonball/src/address_space_manager.rs
+index 12cace92e..c40fc3136 100644
+--- a/src/dragonball/src/address_space_manager.rs
++++ b/src/dragonball/src/address_space_manager.rs
+@@ -1063,12 +1063,13 @@ impl AddressSpaceMgr {
+         })
+     }
+
+-    /// Merge KVM pages into the fixed-base history and classify current zero pages.
++    /// Merge KVM pages into the fixed-base history, optionally classifying zero pages.
+     #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+     pub(crate) fn frozen_memory_map(
+         &mut self,
+         vmfd: &VmFd,
+         generation: u64,
++        classify_zeros: bool,
+     ) -> Result<crate::memory_tracking::FrozenMemoryMap> {
+         use crate::memory_tracking::{push_page, FrozenMemoryMap, FrozenMemoryRegion};
+         use vm_memory::Bytes;
+@@ -1116,13 +1117,18 @@ impl AddressSpaceMgr {
+                 }
+                 if self.memory_tracker.dirty(image_offset) {
+                     push_page(&mut map.changed_ranges, image_offset);
+-                    memory
+-                        .read_slice(&mut page, GuestAddress(region.guest_addr + offset))
+-                        .map_err(|e| {
+-                            AddressManagerError::AccessGuestMemory(region.guest_addr + offset, e)
+-                        })?;
+-                    if page == [0u8; 4096] {
+-                        push_page(&mut map.zero_ranges, image_offset);
++                    if classify_zeros {
++                        memory
++                            .read_slice(&mut page, GuestAddress(region.guest_addr + offset))
++                            .map_err(|e| {
++                                AddressManagerError::AccessGuestMemory(
++                                    region.guest_addr + offset,
++                                    e,
++                                )
++                            })?;
++                        if page == [0u8; 4096] {
++                            push_page(&mut map.zero_ranges, image_offset);
++                        }
+                     }
+                 }
+             }
+@@ -1817,7 +1823,7 @@ mod tests {
+             )
+             .unwrap();
+         assert!(memory
+-            .frozen_memory_map(&vm, 1)
++            .frozen_memory_map(&vm, 1, true)
+             .unwrap()
+             .changed_ranges
+             .is_empty());
+@@ -1878,7 +1884,7 @@ mod tests {
+             .insert(4u64 << 30, u32::MAX)
+             .unwrap();
+         assert!(
+-            memory.frozen_memory_map(&vm, 2).is_err(),
++            memory.frozen_memory_map(&vm, 2, true).is_err(),
+             "later slot failure must not discard the already-read low bitmap"
+         );
+         memory
+@@ -1886,7 +1892,7 @@ mod tests {
+             .lock()
+             .unwrap()
+             .insert(4u64 << 30, high_slot);
+-        let first = memory.frozen_memory_map(&vm, 2).unwrap();
++        let first = memory.frozen_memory_map(&vm, 2, true).unwrap();
+         let contains = |ranges: &[crate::memory_tracking::MemoryRange], offset| {
+             ranges.iter().any(|range| {
+                 range.image_offset <= offset && range.image_offset + range.length > offset
+@@ -1904,12 +1910,15 @@ mod tests {
+         );
+         ram.write_obj(0u8, GuestAddress((4u64 << 30) + 0x2000))
+             .unwrap();
+-        let zero = memory.frozen_memory_map(&vm, 3).unwrap();
++        let unclassified = memory.frozen_memory_map(&vm, 3, false).unwrap();
++        assert_eq!(unclassified.changed_ranges, first.changed_ranges);
++        assert!(unclassified.zero_ranges.is_empty());
++        let zero = memory.frozen_memory_map(&vm, 3, true).unwrap();
+         assert_eq!(zero.changed_ranges, first.changed_ranges);
+         assert!(contains(&zero.zero_ranges, (3u64 << 30) + 0x2000));
+         ram.write_obj(0x91u8, GuestAddress((4u64 << 30) + 0x2000))
+             .unwrap();
+-        let rewritten = memory.frozen_memory_map(&vm, 4).unwrap();
++        let rewritten = memory.frozen_memory_map(&vm, 4, true).unwrap();
+         assert!(!contains(&rewritten.zero_ranges, (3u64 << 30) + 0x2000));
+         let mut lower = [0];
+         file.read_exact_at(&mut lower, (3u64 << 30) + 0x2000)
+@@ -1943,7 +1952,7 @@ mod tests {
+         ram.write_obj(1u8, GuestAddress(4095)).unwrap();
+         ram.write_obj(1u8, GuestAddress((9u64 << 30) - 1)).unwrap();
+         let started = std::time::Instant::now();
+-        let map = memory.frozen_memory_map(&vm, 1).unwrap();
++        let map = memory.frozen_memory_map(&vm, 1, true).unwrap();
+         let elapsed = started.elapsed();
+         eprintln!("8 GiB cold memory-map export: {elapsed:?}");
+         assert_eq!(map.regions.len(), 2);
+diff --git a/src/dragonball/src/api/v1/vmm_action.rs b/src/dragonball/src/api/v1/vmm_action.rs
+index 60133305d..804735934 100644
+--- a/src/dragonball/src/api/v1/vmm_action.rs
++++ b/src/dragonball/src/api/v1/vmm_action.rs
+@@ -198,6 +198,14 @@ pub enum VmmAction {
+         /// Export deadline.
+         deadline: std::time::Instant,
+     },
++    /// Export the same cumulative changed ranges without zero-page classification.
++    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
++    ExportHeldMemoryMapWithoutZeroScan {
++        /// Confirmed generation.
++        generation: u64,
++        /// Export deadline.
++        deadline: std::time::Instant,
++    },
+     /// Confirm that all external reads of this generation have finished.
+     #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+     ReleaseHeldMemoryMap {
+@@ -463,6 +471,7 @@ impl VmmService {
+                     | VmmAction::ExportHeldSnapshot { .. }
+                     | VmmAction::ExportHeldState { .. }
+                     | VmmAction::ExportHeldMemoryMap { .. }
++                    | VmmAction::ExportHeldMemoryMapWithoutZeroScan { .. }
+                     | VmmAction::ReleaseHeldMemoryMap { .. }
+                     | VmmAction::LoadSnapshotHeld { .. }
+                     | VmmAction::ShutdownMicroVm
+@@ -504,6 +513,18 @@ impl VmmService {
+                         .map_err(VmmActionError::Capture)
+                 }),
+             #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
++            VmmAction::ExportHeldMemoryMapWithoutZeroScan {
++                generation,
++                deadline,
++            } => vmm
++                .get_vm_mut()
++                .ok_or(VmmActionError::InvalidVMID)
++                .and_then(|vm| {
++                    vm.export_held_memory_map_without_zero_scan(generation, deadline)
++                        .map(VmmData::FrozenMemoryMap)
++                        .map_err(VmmActionError::Capture)
++                }),
++            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+             VmmAction::ReleaseHeldMemoryMap { generation } => vmm
+                 .get_vm_mut()
+                 .ok_or(VmmActionError::InvalidVMID)
+diff --git a/src/dragonball/src/memory_tracking.rs b/src/dragonball/src/memory_tracking.rs
+index 737e7a38d..72827f85c 100644
+--- a/src/dragonball/src/memory_tracking.rs
++++ b/src/dragonball/src/memory_tracking.rs
+@@ -37,6 +37,7 @@ pub struct FrozenMemoryMap {
+     /// Cumulative changes since cold start or the last load.
+     pub changed_ranges: Vec<MemoryRange>,
+     /// Currently zero pages, always a subset of changed ranges.
++    /// Empty when zero-page classification was not requested.
+     pub zero_ranges: Vec<MemoryRange>,
+ }
+
+diff --git a/src/dragonball/src/vm/capture.rs b/src/dragonball/src/vm/capture.rs
+index ceb36af3a..65025fb48 100644
+--- a/src/dragonball/src/vm/capture.rs
++++ b/src/dragonball/src/vm/capture.rs
+@@ -20,7 +20,7 @@ use crate::memory_tracking::FrozenMemoryMap;
+ pub(super) struct VmCaptureSession {
+     generation: u64,
+     report: Option<CaptureReport>,
+-    read_map: Option<FrozenMemoryMap>,
++    read_map: Option<(bool, FrozenMemoryMap)>,
+ }
+
+ fn terminal(error: impl std::fmt::Display) -> CaptureError {
+@@ -58,6 +58,25 @@ impl Vm {
+         &mut self,
+         generation: u64,
+         deadline: Instant,
++    ) -> CaptureResult<FrozenMemoryMap> {
++        self.export_held_memory_map_with_zero_scan(generation, deadline, true)
++    }
++
++    /// Export the same layout and cumulative dirty ranges without reading RAM
++    /// to classify zeros. Consumers must copy changed zero pages explicitly.
++    pub fn export_held_memory_map_without_zero_scan(
++        &mut self,
++        generation: u64,
++        deadline: Instant,
++    ) -> CaptureResult<FrozenMemoryMap> {
++        self.export_held_memory_map_with_zero_scan(generation, deadline, false)
++    }
++
++    fn export_held_memory_map_with_zero_scan(
++        &mut self,
++        generation: u64,
++        deadline: Instant,
++        classify_zeros: bool,
+     ) -> CaptureResult<FrozenMemoryMap> {
+         let layout = self
+             .held_report(generation, deadline)?
+@@ -71,19 +90,25 @@ impl Vm {
+         {
+             return Err(terminal("held memory layout changed"));
+         }
+-        if let Some(map) = &self.capture_session.as_ref().unwrap().read_map {
+-            return Ok(map.clone());
++        if let Some((classified, map)) = &self.capture_session.as_ref().unwrap().read_map {
++            if !classify_zeros || *classified {
++                let mut map = map.clone();
++                if !classify_zeros {
++                    map.zero_ranges.clear();
++                }
++                return Ok(map);
++            }
+         }
+         let map = self
+             .address_space
+-            .frozen_memory_map(&self.vm_fd, generation)
++            .frozen_memory_map(&self.vm_fd, generation, classify_zeros)
+             .map_err(|e| CaptureError::Export(e.into()))?;
+         if Instant::now() >= deadline {
+             return Err(CaptureError::Rejected(
+                 "memory export deadline expired; session remains held".into(),
+             ));
+         }
+-        self.capture_session.as_mut().unwrap().read_map = Some(map.clone());
++        self.capture_session.as_mut().unwrap().read_map = Some((classify_zeros, map.clone()));
+         Ok(map)
+     }
+
+@@ -1274,6 +1299,45 @@ mod tests {
+         assert_eq!(output.state.metadata().unwrap().len(), before);
+     }
+
++    #[test]
++    fn m2_optional_zero_scan_preserves_ranges_cache_and_pin() {
++        let (mut vm, _real) = paused_counter_vm();
++        let ram = vm.address_space.vm_memory().unwrap();
++        ram.write_slice(&[0u8; 4096], vm_memory::GuestAddress(0x5000))
++            .unwrap();
++        vm.begin_capture(1, deadline()).unwrap();
++        let fast = vm
++            .export_held_memory_map_without_zero_scan(1, deadline())
++            .unwrap();
++        assert!(fast.zero_ranges.is_empty());
++        assert!(fast
++            .changed_ranges
++            .iter()
++            .any(|r| { r.image_offset <= 0x5000 && r.image_offset + r.length > 0x5000 }));
++        assert!(vm.end_capture(1, deadline(), false).is_err());
++        assert!(vm
++            .export_held_memory_map_without_zero_scan(2, deadline())
++            .is_err());
++        let classified = vm.export_held_memory_map(1, deadline()).unwrap();
++        assert_eq!(classified.changed_ranges, fast.changed_ranges);
++        assert_eq!(classified.regions, fast.regions);
++        assert!(classified
++            .zero_ranges
++            .iter()
++            .any(|r| { r.image_offset <= 0x5000 && r.image_offset + r.length > 0x5000 }));
++        let fast_again = vm
++            .export_held_memory_map_without_zero_scan(1, deadline())
++            .unwrap();
++        assert_eq!(fast_again, fast);
++        assert_eq!(
++            vm.export_held_memory_map(1, deadline()).unwrap(),
++            classified
++        );
++        vm.release_held_memory_map(1).unwrap();
++        vm.end_capture(1, deadline(), false).unwrap();
++        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
++    }
++
+     #[test]
+     fn m2_actions_preserve_read_pin_and_owned_state_output() {
+         use crate::api::v1::{VmmAction, VmmData, VmmService};
+@@ -1302,6 +1366,13 @@ mod tests {
+             }),
+             Ok(VmmData::CaptureReport(_))
+         ));
++        assert!(matches!(
++            call(VmmAction::ExportHeldMemoryMapWithoutZeroScan {
++                generation: 1,
++                deadline: deadline()
++            }),
++            Ok(VmmData::FrozenMemoryMap(map)) if map.zero_ranges.is_empty()
++        ));
+         assert!(matches!(
+             call(VmmAction::ExportHeldMemoryMap {
+                 generation: 1,
+--
+2.54.0 (Apple Git-157)

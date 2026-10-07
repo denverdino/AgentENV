@@ -1,0 +1,120 @@
+From 72741853ede25b9134856afbdae42ca2f5aa7e4f Mon Sep 17 00:00:00 2001
+From: Li Yi <denverdino@gmail.com>
+Date: Tue, 6 Oct 2026 14:55:43 +0800
+Subject: [PATCH] fix: respect optional Dragonball hotplug feature boundaries
+
+---
+ src/dragonball/src/api/v1/vmm_action.rs       | 14 ++++++++++++++
+ .../src/device_manager/mem_dev_mgr.rs         | 19 ++++++++++++++-----
+ src/dragonball/src/vm/mod.rs                  |  2 +-
+ src/dragonball/src/vmm.rs                     |  4 ++--
+ 4 files changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/src/dragonball/src/api/v1/vmm_action.rs b/src/dragonball/src/api/v1/vmm_action.rs
+index 622864adb..60133305d 100644
+--- a/src/dragonball/src/api/v1/vmm_action.rs
++++ b/src/dragonball/src/api/v1/vmm_action.rs
+@@ -2230,6 +2230,7 @@ mod tests {
+ 
+         let tests = &mut [
+             // hotplug unready
++            #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+             TestData::new(
+                 VmmAction::InsertMemDevice(MemDeviceConfigInfo::default()),
+                 InstanceState::Running,
+@@ -2248,6 +2249,19 @@ mod tests {
+                     assert_eq!(err_string, expected_err);
+                 },
+             ),
++            #[cfg(not(all(feature = "hotplug", feature = "dbs-upcall")))]
++            TestData::new(
++                VmmAction::InsertMemDevice(MemDeviceConfigInfo::default()),
++                InstanceState::Running,
++                &|result| {
++                    assert!(matches!(
++                        result,
++                        Err(VmmActionError::StartMicroVm(
++                            StartMicroVmError::MicroVMAlreadyRunning
++                        ))
++                    ));
++                },
++            ),
+             // success
+             TestData::new(
+                 VmmAction::InsertMemDevice(MemDeviceConfigInfo::default()),
+diff --git a/src/dragonball/src/device_manager/mem_dev_mgr.rs b/src/dragonball/src/device_manager/mem_dev_mgr.rs
+index f73599a0f..8fa1c8836 100644
+--- a/src/dragonball/src/device_manager/mem_dev_mgr.rs
++++ b/src/dragonball/src/device_manager/mem_dev_mgr.rs
+@@ -205,7 +205,7 @@ impl MemDeviceMgr {
+                 )
+                 .map_err(MemDeviceError::CreateMmioDevice)?;
+ 
+-            #[cfg(not(test))]
++            #[cfg(all(not(test), feature = "hotplug"))]
+             ctx.insert_hotplug_mmio_device(&mmio_device, None)
+                 .map_err(|e| {
+                     error!(
+@@ -676,11 +676,20 @@ mod tests {
+         );
+ 
+         let dummy_mem_device = MemDeviceConfigInfo::default();
+-        vm.device_manager_mut()
++        let result = vm
++            .device_manager_mut()
+             .mem_manager
+-            .insert_or_update_device(device_op_ctx, dummy_mem_device)
+-            .unwrap();
+-        assert_eq!(vm.device_manager().mem_manager.info_list.len(), 1);
++            .insert_or_update_device(device_op_ctx, dummy_mem_device);
++        if cfg!(feature = "hotplug") {
++            result.unwrap();
++            assert_eq!(vm.device_manager().mem_manager.info_list.len(), 1);
++        } else {
++            assert!(matches!(
++                result,
++                Err(MemDeviceError::UpdateNotAllowedPostBoot)
++            ));
++            assert!(vm.device_manager().mem_manager.info_list.is_empty());
++        }
+     }
+ 
+     #[test]
+diff --git a/src/dragonball/src/vm/mod.rs b/src/dragonball/src/vm/mod.rs
+index 2b46e79b6..0fe1615f5 100644
+--- a/src/dragonball/src/vm/mod.rs
++++ b/src/dragonball/src/vm/mod.rs
+@@ -653,7 +653,7 @@ impl Vm {
+     }
+ 
+     /// Remove upcall client when the VM is destoryed.
+-    #[cfg(feature = "dbs-upcall")]
++    #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+     pub fn remove_upcall(&mut self) -> std::result::Result<(), StopMicrovmError> {
+         self.upcall_client = None;
+         Ok(())
+diff --git a/src/dragonball/src/vmm.rs b/src/dragonball/src/vmm.rs
+index 333effaba..338b21109 100644
+--- a/src/dragonball/src/vmm.rs
++++ b/src/dragonball/src/vmm.rs
+@@ -173,7 +173,7 @@ impl Vmm {
+                     warn!("failed to remove devices: {e:?}");
+                 }
+ 
+-                #[cfg(feature = "dbs-upcall")]
++                #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+                 if let Err(e) = vm.remove_upcall() {
+                     warn!("failed to remove upcall: {e:?}");
+                 }
+@@ -190,7 +190,7 @@ impl Vmm {
+                         if let Err(e) = mgr.exit_all_vcpus() {
+                             warn!("Failed to exit vcpu thread. {e:?}");
+                         }
+-                        #[cfg(feature = "dbs-upcall")]
++                        #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+                         mgr.set_upcall_channel(None);
+                     }
+                     Err(e) => warn!("Failed to get vcpu manager {e:?}"),
+-- 
+2.54.0 (Apple Git-157)
+

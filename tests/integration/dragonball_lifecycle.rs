@@ -4,70 +4,26 @@ use std::{
     time::Duration,
 };
 
+use super::dragonball_support::{
+    asset, fixture, fork_command, fork_spec, guest_command, launch, posix_manager,
+    publish_metadata, runtime_frame, spec, start_active_io, start_echo, ActiveTraffic,
+};
 use agentenv::{
     cfg::AppConfig,
     sandbox::{
         dragonball::{DragonballRuntimePolicy, DragonballSandboxFactory},
-        BaseSandboxNetworkPolicy, ExtraDrive, FreshSandboxBuildSpec, SandboxAccessTokenGenerator,
-        SandboxBackend, SandboxBackendFactory, SandboxExecutor, SandboxForkSpec,
-        SandboxLaunchConfig, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+        ExtraDrive, SandboxBackend, SandboxBackendFactory, SandboxExecutor,
     },
-    snapshot::CommandContext,
-    types::{SandboxId, SandboxResources},
+    types::SandboxId,
     virtualization::VirtualizationMode,
 };
 use agentenv_vmm_protocol::runtime::RuntimePhase;
 use anyhow::{Context, Result};
-use serde_json::{Map, Value};
-
-pub(super) fn posix_manager(root: &std::path::Path) -> Result<agentenv::snapshot::SnapshotManager> {
-    use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
-    let (repository, resolver) = PosixFsBackend::new(PosixFsBackendConfig {
-        root: root.join("repository"),
-        cache_root: Some(root.join("cache")),
-        runtime_cache_root: Some(root.join("runtime-cache")),
-    })?
-    .into_parts();
-    Ok(agentenv::snapshot::SnapshotManager::from_parts(
-        repository, resolver, None,
-    ))
-}
-
-pub(super) fn publish_metadata(
-    source: SandboxId,
-    spec: &FreshSandboxBuildSpec,
-    assets: &Value,
-    captured: &agentenv::sandbox::CapturedSandboxSnapshot,
-) -> Result<agentenv::snapshot::SnapshotPublishMetadata> {
-    use agentenv::snapshot::{
-        SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
-    };
-    Ok(SnapshotPublishMetadata {
-        id: SnapshotId::generate(),
-        alias: None,
-        source: SnapshotPublishSource::Sandbox {
-            source_sandbox_id: source.to_string(),
-        },
-        context: spec.context.clone(),
-        startup: None,
-        resources: spec.resources,
-        runtime_versions: SnapshotRuntimeVersions::from_dragonball(
-            captured
-                .manifest()
-                .restore_identity
-                .clone()
-                .context("capture identity")?,
-        )?,
-        virtualization_mode: VirtualizationMode::Kvm,
-        image_configs: serde_json::from_value(assets["image_configs"].clone())?,
-        volume_snapshots: vec![],
-        custom_extension_params: None,
-    })
-}
+use serde_json::Value;
 
 #[tokio::test]
 #[ignore = "real POSIX VM snapshot with managed volumes, attached disk and deleted source catalogs"]
-async fn dragonball_m1_posix_volume_snapshot_rebinds_logical_devices() -> Result<()> {
+async fn dragonball_lifecycle_posix_volume_snapshot_rebinds_logical_devices() -> Result<()> {
     use agentenv::snapshot::{
         repository::backends::{PosixFsBackend, PosixFsBackendConfig},
         SnapshotManager, SnapshotVolume,
@@ -203,6 +159,7 @@ async fn dragonball_m1_posix_volume_snapshot_rebinds_logical_devices() -> Result
         .context("published VM")?;
     let mut target_launch = launch(&assets)?;
     target_launch.snapshot_id = record.id.to_string();
+    target_launch.extra_drives_in_snapshot = true;
     let target_owner = target_launch.sandbox_id.to_string();
     let mut replacements = vec![];
     for saved in &runnable.committed().volume_snapshots {
@@ -325,7 +282,7 @@ async fn dragonball_m1_posix_volume_snapshot_rebinds_logical_devices() -> Result
 
 #[tokio::test]
 #[ignore = "real Linux KVM/ublk POSIX publication and committed full-RAM restore"]
-async fn dragonball_m1_posix_publication_restores_after_source_stop() -> Result<()> {
+async fn dragonball_lifecycle_posix_publication_restores_after_source_stop() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -359,10 +316,15 @@ async fn dragonball_m1_posix_publication_restores_after_source_stop() -> Result<
     assert!(ram_progress(&source, &marker).await? > before);
     source.stop().await?;
     drop(source);
-    assert!(
-        !capture_root.exists(),
-        "publication still depends on a node-local capture owner"
-    );
+    // Publication may still own this capture through its asynchronous startup
+    // recorder. Source stop does not synchronously drain that independent VM.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while capture_root.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("publication/recording retained the node-local capture owner")?;
     let runnable = manager
         .load_runnable(record.id.to_string())
         .await?
@@ -512,10 +474,10 @@ async fn m1_runner_death_retains_leases_until_reap() -> Result<()> {
     let captured = source.snapshot().await?;
     let capture_root = captured
         .manifest()
-        .vm_state
-        .path
+        .rootfs
+        .image_config_path
         .parent()
-        .context("capture root")?
+        .context("captured disk root")?
         .to_path_buf();
     drop(captured);
     let work = source.work_dir()?.to_path_buf();
@@ -610,92 +572,44 @@ async fn m1_runner_death_retains_leases_until_reap() -> Result<()> {
         "immutable tools asset was deleted during cleanup"
     );
     if namespace.exists() {
-        // Release may return the namespace to the warm pool instead of destroying it.
-        // A new runner must actually acquire it; path existence alone is not a leak.
-        let mut next = factory.build_fresh(spec(&assets)?, launch(&assets)?)?;
-        next.start().await?;
-        let socket = tokio::net::UnixStream::connect(next.work_dir()?.join("runner.sock")).await?;
-        let next_pid = socket
-            .peer_cred()?
-            .pid()
-            .context("replacement runner PID")?;
-        let next_ns = std::fs::metadata(format!("/proc/{next_pid}/ns/net"))?;
-        assert_eq!(
-            (next_ns.dev(), next_ns.ino()),
-            (ns_metadata.dev(), ns_metadata.ino()),
-            "released namespace was not available for reuse"
+        // Other warm slots can precede the released slot. Keep acquisitions
+        // live so the pool cannot repeatedly return an unrelated namespace.
+        let slots = std::fs::read_dir(app.runtime_path.join("netns"))?.count();
+        let mut replacements = Vec::new();
+        let mut reused = false;
+        for _ in 0..=slots {
+            if !namespace.exists() {
+                break; // Background maintenance may destroy the idle slot.
+            }
+            let mut next = factory.build_fresh(spec(&assets)?, launch(&assets)?)?;
+            next.start().await?;
+            let socket =
+                tokio::net::UnixStream::connect(next.work_dir()?.join("runner.sock")).await?;
+            let next_pid = socket
+                .peer_cred()?
+                .pid()
+                .context("replacement runner PID")?;
+            let next_ns = std::fs::metadata(format!("/proc/{next_pid}/ns/net"))?;
+            reused = (next_ns.dev(), next_ns.ino()) == (ns_metadata.dev(), ns_metadata.ino());
+            replacements.push(next);
+            if reused {
+                break;
+            }
+        }
+        for next in &mut replacements {
+            next.stop().await?;
+        }
+        assert!(
+            reused || !namespace.exists(),
+            "released namespace was neither reusable nor destroyed"
         );
-        drop(socket);
-        next.stop().await?;
     }
     Ok(())
 }
 
-pub(super) async fn fork_command(
-    sandbox: &dyn SandboxBackend,
-    token: Option<&agentenv::sandbox::EnvdAccessToken>,
-    script: &str,
-) -> Result<agentenv::sandbox::ProcessOutput> {
-    let address = format!(
-        "http://{}:49983",
-        sandbox.host_interaction_ip().context("child IP")?
-    );
-    guest_command(&address, token, script).await
-}
-
-async fn guest_command(
-    address: &str,
-    token: Option<&agentenv::sandbox::EnvdAccessToken>,
-    script: &str,
-) -> Result<agentenv::sandbox::ProcessOutput> {
-    use envd::process::{process_event, ProcessClient, ProcessConfig, StartRequest};
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut client = ProcessClient::connect(address, token.map(|token| token.expose())).await?;
-        let mut stream = client
-            .start(StartRequest {
-                process: Some(ProcessConfig {
-                    cmd: "/bin/sh".into(),
-                    args: vec!["-ec".into(), script.into()],
-                    envs: HashMap::new(),
-                    cwd: None,
-                }),
-                pty: None,
-                tag: None,
-                stdin: Some(false),
-            })
-            .await?
-            .into_inner();
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        while let Some(response) = stream.message().await? {
-            match response.event.and_then(|event| event.event) {
-                Some(process_event::Event::Data(data)) => match data.output {
-                    Some(process_event::data_event::Output::Stdout(bytes)) => {
-                        stdout.push_str(std::str::from_utf8(&bytes)?)
-                    }
-                    Some(process_event::data_event::Output::Stderr(bytes)) => {
-                        stderr.push_str(std::str::from_utf8(&bytes)?)
-                    }
-                    _ => {}
-                },
-                Some(process_event::Event::End(end)) => {
-                    return Ok(agentenv::sandbox::ProcessOutput {
-                        stdout,
-                        stderr,
-                        exit_code: end.exit_code,
-                    })
-                }
-                _ => {}
-            }
-        }
-        anyhow::bail!("guest process stream ended without exit")
-    })
-    .await?
-}
-
 #[tokio::test]
 #[ignore = "requires separate real server processes and disposable KVM/ublk/network fixture"]
-async fn dragonball_m1_server_restart_loads_same_paused_id() -> Result<()> {
+async fn dragonball_lifecycle_server_restart_loads_same_paused_id() -> Result<()> {
     use agentenv::orchestrator::{
         CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore, NewTimeout,
         Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
@@ -814,7 +728,7 @@ async fn dragonball_m1_server_restart_loads_same_paused_id() -> Result<()> {
                     .args([
                         "--ignored",
                         "--exact",
-                        "dragonball_m1::dragonball_m1_server_restart_loads_same_paused_id",
+                        "dragonball_lifecycle::dragonball_lifecycle_server_restart_loads_same_paused_id",
                         "--nocapture",
                         "--test-threads=1",
                     ])
@@ -1058,18 +972,6 @@ async fn dragonball_m1_server_restart_loads_same_paused_id() -> Result<()> {
         orchestrator.shutdown().await?;
     }
     Ok(())
-}
-
-pub(super) fn fork_spec() -> Result<SandboxForkSpec> {
-    let sandbox_id = SandboxId::new();
-    Ok(SandboxForkSpec {
-        sandbox_id,
-        envd_access_token: Some(
-            SandboxAccessTokenGenerator::new("dragonball-m1-child")?.generate(sandbox_id),
-        ),
-        extra_drives: vec![],
-        replace_drive_ids: vec![],
-    })
 }
 
 async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
@@ -1396,26 +1298,232 @@ async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires real forked guests in isolated KVM/ublk fixture"]
-async fn dragonball_m1_fork_has_independent_writable_disks() -> Result<()> {
+async fn dragonball_lifecycle_fork_has_independent_writable_disks() -> Result<()> {
     fork_isolation(false, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires real forked guests in isolated KVM/ublk fixture"]
-async fn dragonball_m1_failed_child_keeps_source_and_sibling_running() -> Result<()> {
+async fn dragonball_lifecycle_failed_child_keeps_source_and_sibling_running() -> Result<()> {
     fork_isolation(true, false).await?;
     fork_isolation(true, true).await
 }
 
 #[tokio::test]
 #[ignore = "requires real volume-backed forked guests in isolated KVM/ublk fixture"]
-async fn dragonball_m1_exclusive_volumes_fork_and_ro_share() -> Result<()> {
+async fn dragonball_lifecycle_exclusive_volumes_fork_and_ro_share() -> Result<()> {
     fork_isolation(false, true).await
 }
 
 #[tokio::test]
+#[ignore = "requires real volume-backed pause and cold reopen in isolated KVM/ublk fixture"]
+async fn dragonball_lifecycle_pause_preserves_dirty_volume_after_ram_is_deleted() -> Result<()> {
+    use agentenv::volume::{VolumeManager, VolumeMode};
+
+    let (app, assets) = fixture().await?;
+    let root = tempfile::tempdir()?;
+    let (_, _, repository) = crate::common::snapshot_test_parts(root.path());
+    let volumes =
+        VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
+    let volume = volumes
+        .create(
+            "pause-dirty-volume".into(),
+            VolumeMode::Exclusive,
+            None,
+            None,
+            128,
+        )
+        .await?;
+    let config = volume.backing_image_config.context("volume backing")?;
+    let mut build = spec(&assets)?;
+    build.context.user = Some("root".into());
+    build.extra_drives.push(ExtraDrive::Overlaybd {
+        drive_id: volume.id.clone(),
+        snapshot_output_dir: Some(config.parent().context("backing parent")?.to_path_buf()),
+        image_config_path: config,
+        read_only: false,
+        mount_path: "/mnt/data".into(),
+        virtual_size: Some(128 << 20),
+        sub_path: None,
+        volume: true,
+    });
+    let source_launch = launch(&assets)?;
+    let owner = source_launch.sandbox_id.to_string();
+    volumes.reserve(&volume.id, &owner).await?;
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut source = factory.build_fresh(build.clone(), source_launch)?;
+    source.start().await?;
+    let result: Result<()> = async {
+        // Keep the overwrite dirty until pause explicitly syncs it. Reuse the
+        // allocated file so the oracle is its bytes, not journal replay timing.
+        let output = source
+            .run_command(
+                "/bin/sh",
+                &[
+                    "-ec",
+                    r#"
+            mount -o remount,commit=600 /mnt/data
+            echo 0 >/proc/sys/vm/dirty_writeback_centisecs
+            echo 60000 >/proc/sys/vm/dirty_expire_centisecs
+            printf before >/mnt/data/marker
+            sync
+            printf 'after!' | dd of=/mnt/data/marker conv=notrunc status=none
+            test "$(cat /mnt/data/marker)" = 'after!'
+        "#,
+                ],
+            )
+            .await?;
+        assert_eq!(output.exit_code, 0, "dirty volume setup: {}", output.stderr);
+        let paused = source.pause(None).await?;
+        // Paused deletion publishes the captured backing without another guest
+        // sync, then discards RAM. A cold guest must see the completed write.
+        volumes
+            .publish_backings(&owner, std::slice::from_ref(&volume.id))
+            .await?;
+        source.stop().await?;
+        drop(paused);
+        volumes
+            .replace_owner_for(&owner, None, std::slice::from_ref(&volume.id))
+            .await?;
+        let mut reopened = factory.build_fresh(build, launch(&assets)?)?;
+        reopened.start().await?;
+        let output = reopened
+            .run_command("/bin/sh", &["-ec", "cat /mnt/data/marker"])
+            .await;
+        reopened.stop().await?;
+        let output = output?;
+        assert_eq!(output.exit_code, 0, "cold volume read: {}", output.stderr);
+        assert_eq!(
+            output.stdout, "after!",
+            "pause lost dirty guest volume pages when RAM was deleted"
+        );
+        Ok(())
+    }
+    .await;
+    source.stop().await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires real guest volume sync refusal in isolated KVM/ublk fixture"]
+async fn dragonball_lifecycle_pause_volume_sync_failure_preserves_running() -> Result<()> {
+    use agentenv::volume::{VolumeManager, VolumeMode};
+
+    let (app, assets) = fixture().await?;
+    let root = tempfile::tempdir()?;
+    let (_, _, repository) = crate::common::snapshot_test_parts(root.path());
+    let volumes =
+        VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
+    let volume = volumes
+        .create(
+            "pause-sync-refusal".into(),
+            VolumeMode::Exclusive,
+            None,
+            None,
+            128,
+        )
+        .await?;
+    let config = volume.backing_image_config.context("volume backing")?;
+    let mut build = spec(&assets)?;
+    build.context.user = Some("root".into());
+    build.extra_drives.push(ExtraDrive::Overlaybd {
+        drive_id: volume.id,
+        snapshot_output_dir: Some(config.parent().context("backing parent")?.to_path_buf()),
+        image_config_path: config,
+        read_only: false,
+        mount_path: "/mnt/data".into(),
+        virtual_size: Some(128 << 20),
+        sub_path: None,
+        volume: true,
+    });
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut source = factory.build_fresh(build, launch(&assets)?)?;
+    source.start().await?;
+    let result: Result<()> = async {
+        // Refuse only sync in the real guest; all other maintenance applets
+        // retain their actual behavior and the runner remains unmodified.
+        let output = source
+            .run_command(
+                "/bin/sh",
+                &[
+                    "-ec",
+                    r#"
+            mkdir -p /tmp/db-m1-real
+            cp /agentenv/bin/busybox /tmp/db-m1-real/busybox
+            cat >/tmp/db-m1-refuse-sync <<'EOF'
+#!/bin/sh
+if [ "$1" = sync ]; then
+    echo deliberate-volume-sync-refusal >&2
+    exit 42
+fi
+exec /tmp/db-m1-real/busybox "$@"
+EOF
+            chmod 755 /tmp/db-m1-refuse-sync
+            mount --bind /tmp/db-m1-refuse-sync /agentenv/bin/busybox
+            printf before >/mnt/data/marker
+        "#,
+                ],
+            )
+            .await?;
+        assert_eq!(output.exit_code, 0, "sync refusal setup: {}", output.stderr);
+        let error = source
+            .pause(None)
+            .await
+            .err()
+            .context("pause succeeded despite guest volume sync refusal")?;
+        assert!(
+            !error.is_terminal(),
+            "known sync refusal must remain recoverable: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("deliberate-volume-sync-refusal"),
+            "{error:#}"
+        );
+        assert_eq!(source.runtime_status().await?.phase, RuntimePhase::Running);
+        let output = source
+            .run_command(
+                "/bin/sh",
+                &[
+                    "-ec",
+                    r#"
+            test "$(cat /mnt/data/marker)" = before
+            printf recovered >/mnt/data/marker
+            umount /agentenv/bin/busybox
+        "#,
+                ],
+            )
+            .await?;
+        assert_eq!(
+            output.exit_code, 0,
+            "source unusable after sync refusal: {}",
+            output.stderr
+        );
+        let paused = source.pause(None).await?;
+        source.resume().await?;
+        drop(paused);
+        let output = source
+            .run_command("/bin/sh", &["-ec", "cat /mnt/data/marker"])
+            .await?;
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "recovered");
+        Ok(())
+    }
+    .await;
+    source.stop().await?;
+    result
+}
+
+#[tokio::test]
 #[ignore = "requires real volume freeze/thaw in isolated KVM/ublk fixture"]
-async fn dragonball_m1_volume_freeze_failure_thaws_prior_mount() -> Result<()> {
+async fn dragonball_lifecycle_volume_freeze_failure_thaws_prior_mount() -> Result<()> {
     use agentenv::volume::{VolumeManager, VolumeMode};
     let (app, assets) = fixture().await?;
     let root = tempfile::tempdir()?;
@@ -1475,7 +1583,7 @@ async fn dragonball_m1_volume_freeze_failure_thaws_prior_mount() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires real concurrent child startup and cancellation in disposable namespace"]
-async fn dragonball_m1_fork_cancellation_reaps_unclaimed_children() -> Result<()> {
+async fn dragonball_lifecycle_fork_cancellation_reaps_unclaimed_children() -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut app, assets) = fixture().await?;
     let prior_works = std::fs::read_dir(&app.runtime_path)?
@@ -1622,7 +1730,7 @@ async fn disk_counter(path: &std::path::Path) -> Result<u64> {
 
 #[tokio::test]
 #[ignore = "requires real captured guest and disposable KVM/ublk/network fixture"]
-async fn dragonball_m1_load_held_does_not_run_before_identity() -> Result<()> {
+async fn dragonball_lifecycle_load_held_does_not_run_before_identity() -> Result<()> {
     let (app, assets) = fixture().await?;
     let mut limited = app.clone();
     limited.machine.disk_rate_limit.enabled = true;
@@ -1728,78 +1836,6 @@ async fn dragonball_m1_load_held_does_not_run_before_identity() -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn start_active_io(
-    sandbox: &agentenv::sandbox::dragonball::DragonballSandbox,
-    app: &AppConfig,
-    token: Option<&agentenv::sandbox::EnvdAccessToken>,
-) -> Result<String> {
-    let build = tempfile::tempdir()?;
-    let source = build.path().join("active-io.c");
-    let binary = build.path().join("active-io");
-    std::fs::write(
-        &source,
-        include_bytes!("../fixtures/dragonball-active-io.c"),
-    )?;
-    let compiled = tokio::process::Command::new("cc")
-        .args(["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
-        .output()
-        .await?;
-    anyhow::ensure!(
-        compiled.status.success(),
-        "compile workload: {}",
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-    let address = format!(
-        "http://{}:{}/files",
-        sandbox.host_interaction_ip().context("guest IP")?,
-        app.tools.control_plane_port
-    );
-    let body = reqwest::multipart::Form::new().part(
-        "file",
-        reqwest::multipart::Part::bytes(std::fs::read(binary)?).file_name("active-io"),
-    );
-    let mut upload = reqwest::Client::new()
-        .post(address)
-        .query(&[("path", "/tmp/db-m1-active-io")])
-        .multipart(body);
-    if let Some(token) = token {
-        upload = upload.header("X-Access-Token", token.expose());
-    }
-    let response = upload.send().await?;
-    let status = response.status();
-    let mut detail = response.text().await?;
-    if let Some(token) = token {
-        detail = detail.replace(token.expose(), "<redacted>");
-    }
-    anyhow::ensure!(
-        status.is_success(),
-        "workload upload refused {status}: {detail}"
-    );
-    let marker = format!("DBM1-RAM-CUT:::{}", uuid::Uuid::new_v4().simple());
-    assert_eq!(marker.len(), 47);
-    let command = format!("chmod +x /tmp/db-m1-active-io; nohup /tmp/db-m1-active-io write '{marker}' >/tmp/db-m1-active-io.log 2>&1 </dev/null &");
-    let output = sandbox.run_command("/bin/sh", &["-ec", &command]).await?;
-    assert_eq!(output.exit_code, 0, "{}", output.stderr);
-    for _ in 0..100 {
-        let output = sandbox
-            .run_command("/tmp/db-m1-active-io", &["read", &marker])
-            .await?;
-        if output.exit_code == 0
-            && output
-                .stdout
-                .split_whitespace()
-                .last()
-                .is_some_and(|value| value.parse::<u64>().is_ok_and(|n| n > 10))
-        {
-            return Ok(marker);
-        }
-    }
-    anyhow::bail!("active writer did not establish real fdatasync progress")
-}
-
 async fn ram_progress(
     sandbox: &agentenv::sandbox::dragonball::DragonballSandbox,
     marker: &str,
@@ -1853,18 +1889,6 @@ impl Drop for RuntimeReplyFault {
     }
 }
 
-pub(super) async fn runtime_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut header = [0; 4];
-    stream.read_exact(&mut header).await?;
-    let size = u32::from_be_bytes(header) as usize;
-    anyhow::ensure!(size <= 1024 * 1024, "test proxy frame too large");
-    let mut frame = vec![0; size + 4];
-    frame[..4].copy_from_slice(&header);
-    stream.read_exact(&mut frame[4..]).await?;
-    Ok(frame)
-}
-
 fn install_reply_fault(
     work: &std::path::Path,
     drop_reply: &'static str,
@@ -1898,7 +1922,7 @@ fn install_reply_fault(
 
 #[tokio::test]
 #[ignore = "real runner completes Export but response is lost; source must actually recover"]
-async fn dragonball_m1_capture_export_reply_loss_recovers_running() -> Result<()> {
+async fn dragonball_lifecycle_capture_export_reply_loss_recovers_running() -> Result<()> {
     let (app, assets) = fault_fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -1927,7 +1951,7 @@ async fn dragonball_m1_capture_export_reply_loss_recovers_running() -> Result<()
 
 #[tokio::test]
 #[ignore = "real runner holds but BeginCapture response is lost; Terminal requires teardown"]
-async fn dragonball_m1_capture_begin_reply_loss_tears_down() -> Result<()> {
+async fn dragonball_lifecycle_capture_begin_reply_loss_tears_down() -> Result<()> {
     let (app, assets) = fault_fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -1955,7 +1979,7 @@ async fn dragonball_m1_capture_begin_reply_loss_tears_down() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "actual production Export deadline expires after real export, same-token release only"]
-async fn dragonball_m1_capture_export_timeout_recovers_running() -> Result<()> {
+async fn dragonball_lifecycle_capture_export_timeout_recovers_running() -> Result<()> {
     let (app, assets) = fault_fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -1996,7 +2020,7 @@ async fn dragonball_m1_capture_export_timeout_recovers_running() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "actual BeginCapture deadline expires; unknown ack requires confirmed process reap"]
-async fn dragonball_m1_capture_begin_timeout_tears_down() -> Result<()> {
+async fn dragonball_lifecycle_capture_begin_timeout_tears_down() -> Result<()> {
     let (app, assets) = fault_fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -2035,7 +2059,7 @@ async fn dragonball_m1_capture_begin_timeout_tears_down() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real Export barrier cancels caller while owned capture retains live leases"]
-async fn dragonball_m1_capture_cancellation_keeps_owner_until_reap() -> Result<()> {
+async fn dragonball_lifecycle_capture_cancellation_keeps_owner_until_reap() -> Result<()> {
     let (app, assets) = fault_fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -2082,141 +2106,6 @@ async fn dragonball_m1_capture_cancellation_keeps_owner_until_reap() -> Result<(
     );
     source.stop().await?;
     Ok(())
-}
-
-pub(super) struct ActiveTraffic {
-    task: Option<tokio::task::JoinHandle<Result<()>>>,
-    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl Drop for ActiveTraffic {
-    fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-}
-
-impl ActiveTraffic {
-    pub(super) async fn start(sandbox: &dyn SandboxBackend) -> Result<Self> {
-        use std::sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc,
-        };
-        let address = (
-            sandbox.host_interaction_ip().context("traffic guest IP")?,
-            50001,
-        );
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(address).await?;
-        let progress = Arc::new(AtomicU64::new(0));
-        let observed = progress.clone();
-        let task = tokio::spawn(async move {
-            let mut response = [0u8; 4096];
-            for sequence in 1u64.. {
-                let mut packet = [0u8; 4096];
-                for (index, word) in packet.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                    word.copy_from_slice(
-                        &(sequence ^ (index as u64).wrapping_mul(0x9e3779b97f4a7c15)).to_le_bytes(),
-                    );
-                }
-                tokio::time::timeout(Duration::from_secs(60), async {
-                    loop {
-                        anyhow::ensure!(
-                            socket.send(&packet).await? == packet.len(),
-                            "short UDP send"
-                        );
-                        match tokio::time::timeout(
-                            Duration::from_secs(1),
-                            socket.recv(&mut response),
-                        )
-                        .await
-                        {
-                            Err(_) => continue, // UDP may drop a datagram; capture must still resume progress.
-                            Ok(length) => {
-                                anyhow::ensure!(length? == response.len(), "short UDP echo")
-                            }
-                        }
-                        let echoed = u64::from_le_bytes(response[..8].try_into()?);
-                        for (index, word) in response.as_chunks::<8>().0.iter().enumerate() {
-                            anyhow::ensure!(
-                                u64::from_le_bytes(*word)
-                                    == echoed ^ (index as u64).wrapping_mul(0x9e3779b97f4a7c15),
-                                "corrupt echoed word {index}"
-                            );
-                        }
-                        anyhow::ensure!(echoed <= sequence, "echo from a future request");
-                        if echoed == sequence {
-                            break;
-                        }
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await
-                .context("network queue did not resume")??;
-                observed.fetch_add(1, Ordering::Release);
-            }
-            Ok(())
-        });
-        let traffic = Self {
-            task: Some(task),
-            progress,
-        };
-        traffic.wait_after(10).await?;
-        Ok(traffic)
-    }
-
-    pub(super) fn count(&self) -> u64 {
-        self.progress.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(super) async fn wait_after(&self, before: u64) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self.count() <= before {
-                anyhow::ensure!(
-                    !self.task.as_ref().unwrap().is_finished(),
-                    "traffic worker terminated"
-                );
-                tokio::task::yield_now().await;
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("no verified RX/TX progress")??;
-        Ok(())
-    }
-
-    pub(super) async fn stop(mut self) -> Result<()> {
-        let task = self.task.take().unwrap();
-        task.abort();
-        match task.await {
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(error.into()),
-            Ok(result) => result,
-        }
-    }
-}
-
-pub(super) async fn start_echo(
-    source: &agentenv::sandbox::dragonball::DragonballSandbox,
-    marker: &str,
-) -> Result<()> {
-    let command = format!(
-        "nohup /tmp/db-m1-active-io echo '{marker}' >/tmp/db-m1-echo.log 2>&1 </dev/null &"
-    );
-    let output = source.run_command("/bin/sh", &["-ec", &command]).await?;
-    anyhow::ensure!(output.exit_code == 0, "echo startup: {}", output.stderr);
-    for _ in 0..100 {
-        if source
-            .run_command("/bin/sh", &["-ec", "test -f /dev/shm/db-m1-echo-ready"])
-            .await?
-            .exit_code
-            == 0
-        {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("UDP workload did not bind its guest socket")
 }
 
 async fn held_io_cut(
@@ -2324,7 +2213,7 @@ async fn held_io_cut(
 
 #[tokio::test]
 #[ignore = "real Linux KVM/ublk active-I/O capture and held restore"]
-async fn dragonball_m1_capture_under_active_io_is_one_cut() -> Result<()> {
+async fn dragonball_lifecycle_capture_under_active_io_is_one_cut() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -2363,9 +2252,10 @@ async fn active_io_memory_case(memory_mib: u32) -> Result<()> {
     println!("large-memory runtime evidence: {}", runtime_path.display());
     app.runtime_path = runtime_path.clone();
     let scratch_mount = if memory_mib > 3072 {
-        // The test server's block filesystem cannot fsync an 8GiB ordinary
-        // file within the existing 60s export budget. A private tmpfs is still
-        // the full-file oracle, not M2 lazy/COW restore or a benchmark result.
+        // Use private tmpfs to keep full-file export within the 60s budget
+        // independently of host block-storage throughput. The 32GiB scratch
+        // and 40GiB available RAM requirements account for full copies and VMs.
+        // This checks full-file correctness, not lazy/COW restore or performance.
         let available_kib: u64 = std::fs::read_to_string("/proc/meminfo")?
             .lines()
             .find_map(|line| {
@@ -2549,25 +2439,25 @@ async fn active_io_memory_case(memory_mib: u32) -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real 1GiB full RAM, active block/RX/TX, repeated pause and concurrent children"]
-async fn dragonball_m1_active_io_memory_1g() -> Result<()> {
+async fn dragonball_lifecycle_active_io_memory_1g() -> Result<()> {
     active_io_memory_case(1024).await
 }
 
 #[tokio::test]
 #[ignore = "real 2GiB full RAM, active block/RX/TX, repeated pause and concurrent children"]
-async fn dragonball_m1_active_io_memory_2g() -> Result<()> {
+async fn dragonball_lifecycle_active_io_memory_2g() -> Result<()> {
     active_io_memory_case(2048).await
 }
 
 #[tokio::test]
 #[ignore = "real 8GiB full RAM with above-4GiB GPA marker and active block/RX/TX"]
-async fn dragonball_m1_active_io_memory_8g() -> Result<()> {
+async fn dragonball_lifecycle_active_io_memory_8g() -> Result<()> {
     active_io_memory_case(8192).await
 }
 
 #[tokio::test]
 #[ignore = "real rootfs restack succeeds then staging fails; source must teardown"]
-async fn dragonball_m1_capture_post_restack_failure_is_terminal() -> Result<()> {
+async fn dragonball_lifecycle_capture_post_restack_failure_is_terminal() -> Result<()> {
     let (app, assets) = fault_fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -2608,8 +2498,158 @@ async fn dragonball_m1_capture_post_restack_failure_is_terminal() -> Result<()> 
 }
 
 #[tokio::test]
+#[ignore = "requires Linux KVM/ublk; released capture RAM must not stay pinned by source disks"]
+async fn dragonball_lifecycle_released_capture_reclaims_memory_while_source_runs() -> Result<()> {
+    let (app, assets) = fixture().await?;
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut source = factory.build_fresh(spec(&assets)?, launch(&assets)?)?;
+    source.start().await?;
+    for _ in 0..3 {
+        let capture = source.snapshot().await?;
+        let memory = capture.manifest().memory.image_config_path.clone();
+        let state = capture.manifest().vm_state.path.clone();
+        let disk = capture.manifest().rootfs.image_config_path.clone();
+        assert!(memory.is_file() && state.is_file() && disk.is_file());
+        drop(capture);
+        assert!(
+            !memory.exists() && !state.exists(),
+            "source retained capture-only files"
+        );
+        assert!(disk.is_file(), "source still uses sealed disk lowers");
+        assert_eq!(
+            source
+                .run_command("/agentenv/bin/busybox", &["true"])
+                .await?
+                .exit_code,
+            0
+        );
+    }
+    source.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Linux KVM/ublk; API split readiness failure must retain bounded diagnostics"]
+async fn dragonball_lifecycle_split_readiness_failure_preserves_archive() -> Result<()> {
+    let (mut app, assets) = fixture().await?;
+    let local = tempfile::tempdir()?;
+    app.runtime_path = local.path().join("runtime");
+    // The real envd readiness loop rejects a zero budget before probing health.
+    app.envd.init_timeout_secs = 0;
+    let evidence = app.runtime_path.join("dragonball-evidence/failures-v1");
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut sandbox = factory.build_fresh(spec(&assets)?, launch(&assets)?)?;
+    sandbox.start_nowait().await?;
+    let work = sandbox.work_dir()?.to_owned();
+    // Exercise the API's split start/wait/stop path, not start()'s rollback.
+    let result = sandbox.wait_for_ready().await;
+    sandbox.stop().await?;
+    sandbox.stop().await?;
+    let error = result.expect_err("zero readiness budget unexpectedly succeeded");
+    assert!(
+        format!("{error:#}").contains("timed out waiting for envd"),
+        "unexpected readiness failure: {error:#}"
+    );
+    assert!(!work.exists(), "failed runtime work was not released");
+    assert!(runtime_work_is_released(&app.runtime_path)?);
+    assert!(
+        evidence.is_dir(),
+        "split readiness failure lost its diagnostic archive"
+    );
+    let archives = std::fs::read_dir(&evidence)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(archives.len(), 1, "one failure must produce one archive");
+    let archive = &archives[0];
+    for name in [
+        "serial.log",
+        "runner-error.log",
+        "runtime-directory.txt",
+        "metadata-requests.json",
+    ] {
+        let metadata = std::fs::metadata(archive.join(name))?;
+        assert!(metadata.is_file(), "missing diagnostic file {name}");
+        assert!(metadata.len() <= 64 * 1024, "unbounded diagnostic {name}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(archive.join("runtime-directory.txt"))?,
+        work.display().to_string()
+    );
+    let requests: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(archive.join("metadata-requests.json"))?)?;
+    assert!(requests.len() <= 64, "unbounded metadata request history");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Linux KVM/ublk; normal Held shutdown must preserve persisted RAM without failure evidence"]
+async fn dragonball_lifecycle_pause_stop_preserves_committed_memory_without_failure_archive(
+) -> Result<()> {
+    let (mut app, assets) = fixture().await?;
+    let local = tempfile::tempdir()?;
+    app.runtime_path = local.path().join("runtime");
+    let evidence = app.runtime_path.join("dragonball-evidence/failures-v1");
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let launch = launch(&assets)?;
+    let id = launch.sandbox_id;
+    let token = launch.envd_access_token.clone();
+    let mut source = factory.build_fresh(spec(&assets)?, launch)?;
+    source.start().await?;
+    let pause_root = local.path().join("paused");
+    let paused = source.pause(Some(&pause_root)).await?;
+    let encoded = paused.encode()?;
+    let original_disk = PathBuf::from(
+        encoded["spec"]["image_config_path"]
+            .as_str()
+            .context("rootfs path")?,
+    );
+    let memory = PathBuf::from(
+        encoded["memory_image_config_path"]
+            .as_str()
+            .context("memory path")?,
+    );
+    let state = PathBuf::from(encoded["vm_state_path"].as_str().context("state path")?);
+    paused.persistence_committed();
+    source.stop().await?;
+    drop(source);
+    drop(paused);
+    assert!(
+        memory.is_file() && state.is_file(),
+        "persisted pause lost memory artifacts"
+    );
+    assert!(!evidence.exists(), "normal Held stop archived a failure");
+    let decoded = factory.decode_paused_state(pause_root, encoded)?;
+    let mut restored = factory.build_paused(id, decoded.as_ref(), token)?;
+    restored.start().await?;
+    let capture = restored.snapshot().await?;
+    let disk: overlaybd::config::ImageConfig = serde_json::from_slice(&std::fs::read(
+        &capture.manifest().rootfs.image_config_path,
+    )?)?;
+    assert!(
+        disk.lowers
+            .iter()
+            .all(|lower| !Path::new(&lower.file).starts_with(original_disk.parent().unwrap())),
+        "capture retained disk paths in the previous custom pause directory"
+    );
+    restored.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "real full-RAM lower ENOSPC in isolated mount namespace; source must be Running"]
-async fn dragonball_m1_capture_enospc_is_recoverable_running() -> Result<()> {
+async fn dragonball_lifecycle_capture_enospc_is_recoverable_running() -> Result<()> {
     use std::ffi::CString;
     let (app, assets) = fixture().await?;
     let output = tempfile::tempdir()?;
@@ -2679,7 +2719,7 @@ async fn dragonball_m1_capture_enospc_is_recoverable_running() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real snapshot must return with source Running and payload owning artifacts"]
-async fn dragonball_m1_snapshot_source_continues() -> Result<()> {
+async fn dragonball_lifecycle_snapshot_source_continues() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -2711,7 +2751,7 @@ async fn dragonball_m1_snapshot_source_continues() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "M2 same-held process_vm_readv/full-export oracle; real KVM/ublk/guest"]
-async fn dragonball_m2_leased_map_matches_held_full_ram_oracle() -> Result<()> {
+async fn dragonball_memory_leased_map_matches_held_full_ram_oracle() -> Result<()> {
     use agentenv_vmm_protocol::{runtime::*, runtime_memory::MemoryMapAssembler, *};
     use std::{io::IoSliceMut, os::unix::fs::FileExt};
     use tokio::io::AsyncWriteExt;
@@ -2876,7 +2916,7 @@ async fn dragonball_m2_leased_map_matches_held_full_ram_oracle() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real same-ID in-place pause/resume retains RAM and idempotency"]
-async fn dragonball_m1_pause_resume_keeps_id_and_ram() -> Result<()> {
+async fn dragonball_lifecycle_pause_resume_keeps_id_and_ram() -> Result<()> {
     let (app, assets) = fixture().await?;
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -2908,80 +2948,9 @@ async fn dragonball_m1_pause_resume_keeps_id_and_ram() -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn fixture() -> Result<(AppConfig, Value)> {
-    anyhow::ensure!(
-        std::env::var("AENV_DRAGONBALL_M0_ISOLATED").as_deref() == Ok("1"),
-        "use the isolated capability runner"
-    );
-    anyhow::ensure!(
-        std::fs::read_link("/proc/thread-self/ns/net")?.to_string_lossy()
-            != std::env::var("AENV_DRAGONBALL_M0_PARENT_NETNS")?,
-        "test namespace not isolated"
-    );
-    anyhow::ensure!(
-        unsafe { libc::geteuid() } != 0,
-        "non-root build/test required"
-    );
-    let app = super::common::setup_runtime_only().await.clone();
-    let assets = serde_json::from_slice(&std::fs::read(
-        std::env::var_os("AENV_DRAGONBALL_M0_ASSETS").context("prepared guest assets")?,
-    )?)?;
-    Ok((app, assets))
-}
-
-pub(super) fn asset(assets: &Value, key: &str) -> Result<PathBuf> {
-    Ok(assets[key]
-        .as_str()
-        .with_context(|| format!("missing {key}"))?
-        .into())
-}
-
-pub(super) fn spec(assets: &Value) -> Result<FreshSandboxBuildSpec> {
-    Ok(FreshSandboxBuildSpec {
-        image_config_path: asset(assets, "image_path")?,
-        resources: SandboxResources {
-            cpu_count: 1,
-            memory_mib: 512,
-            disk_size_mib: 0,
-        },
-        context: CommandContext {
-            env_vars: HashMap::from([("DB_M1_ENV".into(), "guest-contract".into())]),
-            workdir: "/tmp".into(),
-            user: Some("1000:1000".into()),
-            exposed_ports: vec![],
-            entrypoint: None,
-            cmd: None,
-            volumes: vec![],
-            labels: HashMap::new(),
-        },
-        extra_drives: vec![],
-        extra_boot_args: None,
-    })
-}
-
-pub(super) fn launch(assets: &Value) -> Result<SandboxLaunchConfig> {
-    let sandbox_id = SandboxId::new();
-    let mut extra = Map::new();
-    extra.insert("imageConfigs".into(), assets["image_configs"].clone());
-    Ok(SandboxLaunchConfig {
-        sandbox_id,
-        snapshot_id: "dragonball-m1-existing-guest".into(),
-        network: Some(SandboxNetworkPolicy::new(
-            true,
-            BaseSandboxNetworkPolicy::Deny,
-            SandboxNetworkEgressPolicy::default(),
-        )),
-        extra_mmds: extra,
-        envd_access_token: Some(
-            SandboxAccessTokenGenerator::new("dragonball-m1-qualification")?.generate(sandbox_id),
-        ),
-        ..Default::default()
-    })
-}
-
 #[tokio::test]
 #[ignore = "requires two actual guests in disposable namespaces"]
-async fn dragonball_m1_auth_metadata_neighbor_deny_all_and_runner_exit() -> Result<()> {
+async fn dragonball_lifecycle_auth_metadata_neighbor_deny_all_and_runner_exit() -> Result<()> {
     let (app, assets) = fixture().await?;
     let policy = DragonballRuntimePolicy::from_app_config(
         &app,
@@ -3063,9 +3032,20 @@ async fn dragonball_m1_auth_metadata_neighbor_deny_all_and_runner_exit() -> Resu
     Ok(())
 }
 
+fn runtime_work_is_released(path: &Path) -> Result<bool> {
+    for entry in std::fs::read_dir(path)? {
+        // Failed/cancelled starts retain bounded diagnostics, independently of
+        // the runtime directories and leases that must have been released.
+        if entry?.file_name() != "dragonball-evidence" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[tokio::test]
 #[ignore = "requires disposable namespace; proves metadata failure rolls back allocations"]
-async fn dragonball_m1_metadata_failure_rolls_back() -> Result<()> {
+async fn dragonball_lifecycle_metadata_failure_rolls_back() -> Result<()> {
     let (app, assets) = fixture().await?;
     let isolated = tempfile::tempdir()?;
     let mut app = app.clone();
@@ -3094,7 +3074,7 @@ async fn dragonball_m1_metadata_failure_rolls_back() -> Result<()> {
     sandbox.stop().await?;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if std::fs::read_dir(&app.runtime_path)?.next().is_none() {
+            if runtime_work_is_released(&app.runtime_path)? {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;
@@ -3106,7 +3086,7 @@ async fn dragonball_m1_metadata_failure_rolls_back() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires real configured extension HTTP failure and disposable namespace"]
-async fn dragonball_m1_extension_failure_fails_start_and_pairs_stop() -> Result<()> {
+async fn dragonball_lifecycle_extension_failure_fails_start_and_pairs_stop() -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut app, assets) = fixture().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -3177,7 +3157,7 @@ async fn dragonball_m1_extension_failure_fails_start_and_pairs_stop() -> Result<
 
 #[tokio::test]
 #[ignore = "requires real detached startup and disposable namespace"]
-async fn dragonball_m1_cancel_during_startup_keeps_owner_until_reap() -> Result<()> {
+async fn dragonball_lifecycle_cancel_during_startup_keeps_owner_until_reap() -> Result<()> {
     let (mut app, assets) = fixture().await?;
     let isolated = tempfile::tempdir()?;
     app.runtime_path = isolated.path().join("runtime");
@@ -3206,7 +3186,7 @@ async fn dragonball_m1_cancel_during_startup_keeps_owner_until_reap() -> Result<
     assert!(sandbox.executor().is_err());
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if std::fs::read_dir(&app.runtime_path)?.next().is_none() {
+            if runtime_work_is_released(&app.runtime_path)? {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3219,7 +3199,7 @@ async fn dragonball_m1_cancel_during_startup_keeps_owner_until_reap() -> Result<
 
 #[tokio::test]
 #[ignore = "requires Linux KVM/ublk/assets and disposable network/mount namespace"]
-async fn dragonball_m1_fresh_ready_preserves_guest_contract() -> Result<()> {
+async fn dragonball_lifecycle_fresh_ready_preserves_guest_contract() -> Result<()> {
     let (app, assets) = fixture().await?;
     let policy = DragonballRuntimePolicy::from_app_config(
         &app,
@@ -3261,8 +3241,92 @@ async fn dragonball_m1_fresh_ready_preserves_guest_contract() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "real guest readiness with non-root USER and WORKDIR on a newly mounted volume"]
+async fn dragonball_lifecycle_readiness_with_user_and_volume_workdir() -> Result<()> {
+    use agentenv::volume::{VolumeManager, VolumeMode};
+    let (app, assets) = fixture().await?;
+    let root = tempfile::tempdir()?;
+    let (_, _, repository) = crate::common::snapshot_test_parts(root.path());
+    let manager =
+        VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
+    let volume = manager
+        .create(
+            "readiness-workdir".into(),
+            VolumeMode::Exclusive,
+            None,
+            None,
+            128,
+        )
+        .await?;
+    let mut build = spec(&assets)?;
+    build.context.user = Some("nobody".into());
+    build.context.workdir = "/mnt/readiness-workdir".into();
+    build.extra_drives.push(ExtraDrive::Overlaybd {
+        drive_id: volume.id.clone(),
+        image_config_path: volume.backing_image_config.context("volume backing")?,
+        read_only: false,
+        mount_path: build.context.workdir.clone().into(),
+        virtual_size: Some(128 << 20),
+        sub_path: None,
+        snapshot_output_dir: None,
+        volume: true,
+    });
+    let mut launch = launch(&assets)?;
+    launch.env_vars = Some(HashMap::from([(
+        "DB_M1_ENV".into(),
+        "launch-override".into(),
+    )]));
+    let id = launch.sandbox_id;
+    manager.reserve(&volume.id, &id.to_string()).await?;
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut sandbox = factory.build_fresh(build, launch)?;
+    sandbox.start().await?;
+    for resumed in [false, true] {
+        if resumed {
+            let paused = sandbox.pause(None).await?;
+            sandbox.resume().await?;
+            drop(paused);
+        }
+        let output = sandbox.run_command("/agentenv/bin/busybox", &["sh", "-ec",
+            "test \"$(id -un)\" = nobody; test \"$PWD\" = /mnt/readiness-workdir; mountpoint -q .; test \"$DB_M1_ENV\" = launch-override; printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\""
+        ]).await?;
+        assert_eq!(output.exit_code, 0, "resumed={resumed}: {}", output.stderr);
+        assert_eq!(output.stdout, format!("{id}\ndragonball-m1-existing-guest"));
+    }
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real guest startup with empty image USER and WORKDIR"]
+async fn dragonball_lifecycle_readiness_empty_context_keeps_bootstrap_defaults() -> Result<()> {
+    let (app, assets) = fixture().await?;
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut build = spec(&assets)?;
+    build.context.user = Some(String::new());
+    build.context.workdir.clear();
+    let mut sandbox = factory.build_fresh(build, launch(&assets)?)?;
+    sandbox.start().await?;
+    let output = sandbox
+        .run_command("/agentenv/bin/busybox", &["sh", "-ec", "id -un; pwd"])
+        .await?;
+    sandbox.stop().await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "root\n/\n");
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires prepared assets; validates refusal before any managed allocation"]
-async fn dragonball_m1_unsupported_profile_allocates_nothing() -> Result<()> {
+async fn dragonball_lifecycle_unsupported_profile_allocates_nothing() -> Result<()> {
     let (mut app, assets) = fixture().await?;
     let isolated = tempfile::tempdir()?;
     app.runtime_path = isolated.path().join("must-not-allocate");

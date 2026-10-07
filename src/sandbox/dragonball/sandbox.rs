@@ -19,25 +19,25 @@ use async_trait::async_trait;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use super::{
-    capture::DragonballPausedState, factory::DragonballSandboxFactory, probe::ProbeResources,
-    process::spawn_runner, runtime_client::RuntimeClient,
+    capture::DragonballPausedState, factory::DragonballSandboxFactory,
+    process::spawn_logged_runner, resources::RuntimeResources, runtime_client::RuntimeClient,
 };
 use crate::sandbox::{
     custom_extension::{
         custom_extension_params_is_empty, CustomExtensionHookGuard, CustomExtensionParams,
     },
+    dragonball::restore_identity::RestoreReader,
     envd::EnvdInstance,
     extra_drive::{
         build_drives_boot_arg, prepare_extra_drives, prepare_volume_drive_slots,
         ExtraDrivePrepareMode, VOLUME_DRIVE_SLOT_PREFIX,
     },
     network::metadata::MetadataListener,
-    restore_identity::RestoreReader,
     ublk::OverlaybdRuntimeHandle,
     CapturedSandboxSnapshot, Executor, FreshSandboxBuildSpec, NetworkManager, PausedSandboxState,
-    RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxLaunchConfig, SandboxMetadataDocument,
-    SandboxNetworkPolicy, SandboxRuntimeInfo, UblkDeviceManager,
+    ProcessOpts, RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
+    SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxLaunchConfig,
+    SandboxMetadataDocument, SandboxNetworkPolicy, SandboxRuntimeInfo, UblkDeviceManager,
 };
 
 pub struct DragonballSandbox {
@@ -51,7 +51,7 @@ pub struct DragonballSandbox {
 
 pub(super) struct RuntimeStarted {
     // Drop uses the previously qualified reap-before-leases guard, also on cancellation.
-    pub(super) resources: ProbeResources,
+    pub(super) resources: RuntimeResources,
     pub(super) client: Arc<tokio::sync::Mutex<RuntimeClient>>,
     pub(super) envd: EnvdInstance,
     pub(super) pid: u32,
@@ -63,8 +63,15 @@ pub(super) struct RuntimeStarted {
     pub(super) volume_slots: Vec<SnapshotVolumeSlot>,
     new_volume_mounts: Vec<(usize, crate::sandbox::ExtraDrive)>,
     pub(super) ready: AtomicBool,
+    readiness_failed: AtomicBool,
     extension: Option<CustomExtensionHookGuard>,
     pub(super) frozen_volume_mounts: Vec<(PathBuf, String)>,
+}
+
+impl Drop for RuntimeStarted {
+    fn drop(&mut self) {
+        self.envd.invalidate();
+    }
 }
 
 impl DragonballSandbox {
@@ -149,6 +156,7 @@ impl DragonballSandbox {
         restore: Option<Arc<DragonballPausedState>>,
         recording: Option<super::startup_pack::RecordingConfig>,
     ) -> Result<RuntimeStarted> {
+        let started = std::time::Instant::now();
         let attached_count = spec
             .extra_drives
             .iter()
@@ -265,10 +273,15 @@ impl DragonballSandbox {
         let evidence = app
             .runtime_path
             .join("dragonball-evidence")
-            .join(work.path().file_name().context("runtime work directory")?);
-        let mut resources = ProbeResources::new(work, evidence);
+            .join("failures-v1");
+        let mut resources = RuntimeResources::new(work, Some(evidence));
         if let Some(saved) = &restore {
             resources.retained_artifacts.push(saved.artifacts.clone());
+        }
+        if let Some(recording) = &recording {
+            // Template captures borrow their builder workspace. Keep its owner
+            // through failed boot/cleanup, including detached startup rollback.
+            resources.retained_artifacts.push(recording.lease.clone());
         }
         let instance = uuid::Uuid::new_v4().to_string();
         let socket = resources.work.path().join("runner.sock");
@@ -469,26 +482,33 @@ impl DragonballSandbox {
             .arg("--parent-pid")
             .arg(std::process::id().to_string())
             .current_dir(resources.work.path())
-            .stdin(Stdio::null())
-            .stdout(File::create(resources.work.path().join("serial.log"))?)
-            .stderr(File::create(
-                resources.work.path().join("runner-error.log"),
-            )?);
-        resources.process = Some(spawn_runner(command, Some(File::open(namespace)?)).await?);
+            .stdin(Stdio::null());
+        let provisioned_us = started.elapsed().as_micros() as u64;
+        resources.process = Some(
+            spawn_logged_runner(
+                command,
+                Some(File::open(namespace)?),
+                resources.work.clone(),
+            )
+            .await?,
+        );
         let until = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            ensure!(
-                resources
-                    .process
-                    .as_mut()
-                    .unwrap()
-                    .child
-                    .try_wait()?
-                    .is_none(),
-                "runner exited before Hello: {}",
-                fs::read_to_string(resources.work.path().join("runner-error.log"))
-                    .unwrap_or_default()
-            );
+            if resources
+                .process
+                .as_ref()
+                .unwrap()
+                .child
+                .try_wait()?
+                .is_some()
+            {
+                resources.reap().await?;
+                anyhow::bail!(
+                    "runner exited before Hello: {}",
+                    super::logging::read_tail(&resources.work.path().join("runner-error.log"))
+                        .unwrap_or_default()
+                );
+            }
             if socket.exists() {
                 break;
             }
@@ -496,7 +516,7 @@ impl DragonballSandbox {
                 tokio::time::Instant::now() < until,
                 "runtime socket readiness timed out"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let mut client = RuntimeClient::new(socket, instance);
         client.bind_process(
@@ -520,6 +540,7 @@ impl DragonballSandbox {
                 && hello.feature_profile == factory.build.feature_profile,
             "runtime binary changed after preflight"
         );
+        let hello_us = started.elapsed().as_micros() as u64;
         let reader = RestoreReader::new(hello)?;
         let identity = if let Some(saved) = &restore {
             reader.validate_restore(&saved.artifacts.envelope.identity)?;
@@ -553,6 +574,8 @@ impl DragonballSandbox {
                 Duration::from_secs(15),
             )
             .await?;
+        let configured_us = started.elapsed().as_micros() as u64;
+        let mut memory_ready_us = configured_us;
         let mut memory_base = None;
         let mut startup_prefetch = None;
         // Metadata listener and configured rate buckets are ready before the first KVM_RUN.
@@ -641,6 +664,7 @@ impl DragonballSandbox {
                     }
                 }
             };
+            memory_ready_us = started.elapsed().as_micros() as u64;
             client
                 .request(
                     RuntimeCommand::LoadHeld(RuntimeSnapshotInput {
@@ -663,6 +687,13 @@ impl DragonballSandbox {
             .and_then(|process| process.child.id())
             .context("runner PID missing")?;
         verify_runner_security(pid)?;
+        tracing::debug!(
+            sandbox_id = %launch.sandbox_id,
+            restored = restore.is_some(),
+            provisioned_us, hello_us, configured_us, memory_ready_us,
+            started_us = started.elapsed().as_micros() as u64,
+            "Dragonball boot cumulative timing"
+        );
         Ok(RuntimeStarted {
             resources,
             client: Arc::new(tokio::sync::Mutex::new(client)),
@@ -676,9 +707,191 @@ impl DragonballSandbox {
             volume_slots,
             new_volume_mounts,
             ready: AtomicBool::new(false),
+            readiness_failed: AtomicBool::new(false),
             extension,
             frozen_volume_mounts: vec![],
         })
+    }
+
+    async fn wait_for_ready_inner(&self) -> Result<()> {
+        let runtime = self.live_runtime()?;
+        if runtime.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let app = &self.factory.policy.app;
+        {
+            let mut client = runtime.client.lock().await;
+            let RuntimeReply::Status(status) = client
+                .request(RuntimeCommand::Status, Duration::from_secs(5))
+                .await?
+            else {
+                anyhow::bail!("unexpected runtime Status");
+            };
+            if status.phase == RuntimePhase::LoadedHeld {
+                ensure!(
+                    runtime.resources.metadata.is_some(),
+                    "metadata must be ready before held release"
+                );
+                verify_runner_security(runtime.pid)?;
+                let token = status.capture.context("missing loaded-held proof")?.token;
+                client
+                    .request(RuntimeCommand::Resume { token }, Duration::from_secs(30))
+                    .await?;
+            } else {
+                ensure!(
+                    status.phase == RuntimePhase::Running,
+                    "runtime is not running or loaded-held"
+                );
+            }
+        }
+        let resumed_us = started.elapsed().as_micros() as u64;
+        let budget = Duration::from_secs(app.envd.init_timeout_secs);
+        runtime
+            .envd
+            .wait_for_ready(budget, Duration::from_millis(app.envd.poll_ms))
+            .await
+            .with_context(|| {
+                format!(
+                    "envd not ready; serial: {}",
+                    super::logging::read_tail(&runtime.resources.work.path().join("serial.log"))
+                        .unwrap_or_default()
+                )
+            })?;
+        let envd_us = started.elapsed().as_micros() as u64;
+        // Release the actual daemon image keys once envd can serve requests.
+        // The recorder uses its own image config; FullFileOracle has no daemon RAM device.
+        let manager = UblkDeviceManager::global();
+        if let Some(root) = &runtime.root {
+            manager.notify_sandbox_ready(&root.image_config_path).await;
+        }
+        if let Some(recording) = &self.recording {
+            manager.notify_sandbox_ready(&recording.memory_config).await;
+        } else if let Some(base) = &runtime.memory_base {
+            manager
+                .notify_sandbox_ready(&base.artifacts.manifest.memory.image_config_path)
+                .await;
+        }
+        let mut vars = self.spec.context.env_vars.clone();
+        if let Some(overrides) = &self.launch.env_vars {
+            vars.extend(overrides.clone());
+        }
+        // Initialize the final context once. Internal readiness/mount commands
+        // select root and / explicitly, independently of USER and WORKDIR.
+        // Preserve the bootstrap defaults for empty USER/WORKDIR as well.
+        let user = self
+            .spec
+            .context
+            .user
+            .clone()
+            .filter(|user| !user.is_empty())
+            .unwrap_or_else(|| "root".into());
+        let workdir = if self.spec.context.workdir.is_empty() {
+            "/"
+        } else {
+            &self.spec.context.workdir
+        };
+        tokio::time::timeout(
+            budget,
+            runtime.envd.init(
+                (!vars.is_empty()).then_some(vars),
+                Some(workdir.into()),
+                Some(user),
+            ),
+        )
+        .await??;
+        let initialized_us = started.elapsed().as_micros() as u64;
+        let executor = Executor::new(runtime.envd.clone()).with_root_user();
+        let expected = format!("{}\n{}", self.launch.sandbox_id, self.launch.snapshot_id);
+        let mut attempts = 0usize;
+        let mut completed = 0usize;
+        let mut last_stdout = None;
+        let identity_started = tokio::time::Instant::now();
+        tokio::time::timeout(budget, async {
+            loop {
+                attempts += 1;
+                let output = executor
+                    .run_command_with_opts(
+                        "/agentenv/bin/busybox",
+                        &[
+                            "sh",
+                            "-ec",
+                            "printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\"",
+                        ],
+                        &ProcessOpts::default().with_cwd("/"),
+                    )
+                    .await?;
+                completed += 1;
+                last_stdout = Some(output.stdout.chars().take(512).collect::<String>());
+                ensure!(output.exit_code == 0, "guest identity probe failed");
+                if output.stdout == expected {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                // envd refreshes metadata asynchronously after /init. Probe
+                // promptly during that first refresh, then retain the slower
+                // cadence if metadata stays unavailable. The deadline and
+                // exact identity check remain unchanged.
+                let retry_ms = if identity_started.elapsed() < Duration::from_millis(100) {
+                    5
+                } else {
+                    50
+                };
+                tokio::time::sleep(Duration::from_millis(retry_ms)).await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "envd did not acquire current runtime identity: attempts={attempts}, completed={completed}, last_stdout={last_stdout:?}"
+            )
+        })??;
+        let identity_us = started.elapsed().as_micros() as u64;
+        for (index, drive) in &runtime.new_volume_mounts {
+            crate::sandbox::guest::mount_volume(&executor, *index, drive).await?;
+        }
+        verify_runner_security(runtime.pid)?;
+        runtime.ready.store(true, Ordering::Release);
+        tracing::debug!(
+            sandbox_id = %self.launch.sandbox_id,
+            resumed_us, envd_us, initialized_us, identity_us, attempts,
+            ready_us = started.elapsed().as_micros() as u64,
+            "Dragonball readiness cumulative timing"
+        );
+        Ok(())
+    }
+
+    pub(super) async fn stop_runtime(&mut self, mut archive_failure: bool) -> Result<()> {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Ok(());
+        };
+        archive_failure |= runtime.readiness_failed.load(Ordering::Acquire);
+        runtime.ready.store(false, Ordering::Release);
+        if let Some(prefetch) = runtime.startup_prefetch.take() {
+            prefetch.stop(Duration::from_secs(5)).await;
+        }
+        runtime.envd.invalidate();
+        if let Err(error) = runtime
+            .client
+            .lock()
+            .await
+            .request(RuntimeCommand::Stop, Duration::from_secs(10))
+            .await
+        {
+            archive_failure = true;
+            tracing::warn!(%error, "runtime Stop not confirmed; requiring process reap");
+        }
+        if let Some(process) = runtime.resources.process.as_mut() {
+            process.terminate_and_wait(Duration::from_secs(10)).await?;
+        }
+        if archive_failure {
+            runtime.resources.archive_failure();
+        }
+        if let Some(extension) = runtime.extension.take() {
+            extension.stop().await;
+        }
+        runtime.resources.cleanup().await?;
+        self.runtime = None;
+        Ok(())
     }
 
     fn live_runtime(&self) -> Result<&RuntimeStarted> {
@@ -724,60 +937,6 @@ fn verify_runner_security(pid: u32) -> Result<()> {
     Ok(())
 }
 
-async fn mount_volume(
-    executor: &Executor,
-    index: usize,
-    drive: &crate::sandbox::ExtraDrive,
-) -> Result<()> {
-    async fn command(executor: &Executor, name: &str, args: &[&str]) -> Result<()> {
-        let mut tools_args = vec![name];
-        tools_args.extend_from_slice(args);
-        let output = executor
-            .run_command("/agentenv/bin/busybox", &tools_args)
-            .await?;
-        ensure!(
-            output.exit_code == 0,
-            "guest {name} failed: {}",
-            output.stderr
-        );
-        Ok(())
-    }
-    let device = format!("/dev/vd{}", char::from(b'c' + u8::try_from(index)?));
-    let target = drive
-        .mount_path()
-        .to_str()
-        .context("volume mount must be UTF-8")?;
-    command(executor, "mkdir", &["-p", "--", target]).await?;
-    let stage = format!("/run/agentenv-drive-{}", drive.drive_id());
-    let mount = if drive.sub_path().is_some() {
-        stage.as_str()
-    } else {
-        target
-    };
-    command(executor, "mkdir", &["-p", "--", mount]).await?;
-    let options = if drive.read_only() { "ro,noload" } else { "rw" };
-    command(executor, "mount", &["-o", options, "--", &device, mount]).await?;
-    if let Some(sub_path) = drive.sub_path() {
-        let source = Path::new(mount).join(sub_path);
-        command(
-            executor,
-            "mount",
-            &[
-                "--bind",
-                "--",
-                source.to_str().context("volume subpath UTF-8")?,
-                target,
-            ],
-        )
-        .await?;
-        if drive.read_only() {
-            command(executor, "mount", &["-o", "remount,bind,ro", "--", target]).await?;
-        }
-        command(executor, "umount", &["-l", "--", mount]).await?;
-    }
-    Ok(())
-}
-
 #[async_trait(?Send)]
 impl SandboxExecutor for DragonballSandbox {
     fn executor(&self) -> Result<Executor> {
@@ -792,10 +951,17 @@ impl SandboxExecutor for DragonballSandbox {
 
 #[async_trait]
 impl SandboxBackend for DragonballSandbox {
+    fn metrics_sample(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<crate::sandbox::SandboxMetric>>> {
+        let envd = self.runtime.as_ref()?.envd.clone();
+        Some(Box::pin(async move { envd.metrics().await }))
+    }
+
     async fn start(&mut self) -> Result<()> {
         self.start_nowait().await?;
         if let Err(error) = self.wait_for_ready().await {
-            if let Err(cleanup) = self.stop().await {
+            if let Err(cleanup) = self.stop_runtime(true).await {
                 tracing::error!(%cleanup, "Dragonball readiness rollback incomplete");
             }
             return Err(error);
@@ -819,96 +985,13 @@ impl SandboxBackend for DragonballSandbox {
         Ok(())
     }
     async fn wait_for_ready(&self) -> Result<()> {
-        let runtime = self.live_runtime()?;
-        if runtime.ready.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let app = &self.factory.policy.app;
-        {
-            let mut client = runtime.client.lock().await;
-            let RuntimeReply::Status(status) = client
-                .request(RuntimeCommand::Status, Duration::from_secs(5))
-                .await?
-            else {
-                anyhow::bail!("unexpected runtime Status");
-            };
-            if status.phase == RuntimePhase::LoadedHeld {
-                ensure!(
-                    runtime.resources.metadata.is_some(),
-                    "metadata must be ready before held release"
-                );
-                verify_runner_security(runtime.pid)?;
-                let token = status.capture.context("missing loaded-held proof")?.token;
-                client
-                    .request(RuntimeCommand::Resume { token }, Duration::from_secs(30))
-                    .await?;
-            } else {
-                ensure!(
-                    status.phase == RuntimePhase::Running,
-                    "runtime is not running or loaded-held"
-                );
+        let result = self.wait_for_ready_inner().await;
+        if result.is_err() {
+            if let Some(runtime) = &self.runtime {
+                runtime.readiness_failed.store(true, Ordering::Release);
             }
         }
-        let budget = Duration::from_secs(app.envd.init_timeout_secs);
-        runtime
-            .envd
-            .wait_for_ready(budget, Duration::from_millis(app.envd.poll_ms))
-            .await
-            .with_context(|| {
-                format!(
-                    "envd not ready; serial: {}",
-                    fs::read_to_string(runtime.resources.work.path().join("serial.log"))
-                        .unwrap_or_default()
-                )
-            })?;
-        tokio::time::timeout(
-            budget,
-            runtime
-                .envd
-                .init(None, Some("/".into()), Some("root".into())),
-        )
-        .await??;
-        let executor = Executor::new(runtime.envd.clone()).with_root_user();
-        let expected = format!("{}\n{}", self.launch.sandbox_id, self.launch.snapshot_id);
-        tokio::time::timeout(budget, async {
-            loop {
-                let output = executor
-                    .run_command(
-                        "/bin/sh",
-                        &[
-                            "-ec",
-                            "printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\"",
-                        ],
-                    )
-                    .await?;
-                ensure!(output.exit_code == 0, "guest identity probe failed");
-                if output.stdout == expected {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .context("envd did not acquire current runtime identity")??;
-        for (index, drive) in &runtime.new_volume_mounts {
-            mount_volume(&executor, *index, drive).await?;
-        }
-        let mut vars = self.spec.context.env_vars.clone();
-        if let Some(overrides) = &self.launch.env_vars {
-            vars.extend(overrides.clone());
-        }
-        tokio::time::timeout(
-            budget,
-            runtime.envd.init(
-                (!vars.is_empty()).then_some(vars),
-                Some(self.spec.context.workdir.clone()),
-                self.spec.context.user.clone(),
-            ),
-        )
-        .await??;
-        verify_runner_security(runtime.pid)?;
-        runtime.ready.store(true, Ordering::Release);
-        Ok(())
+        result
     }
     async fn pause(
         &mut self,
@@ -974,38 +1057,21 @@ impl SandboxBackend for DragonballSandbox {
     }
     async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         let artifacts = self.capture_owned(Some(at.into()), None, true).await?;
+        let volumes = artifacts
+            .spec
+            .extra_drives
+            .iter()
+            .filter(|drive| drive.is_volume())
+            .cloned()
+            .collect();
         Ok(
             CapturedSandboxSnapshot::new(artifacts.manifest.clone(), artifacts)
+                .with_volume_drives(volumes)
                 .with_recording_factory(super::startup_pack::startup_recording),
         )
     }
     async fn stop(&mut self) -> Result<()> {
-        let Some(runtime) = self.runtime.as_mut() else {
-            return Ok(());
-        };
-        runtime.ready.store(false, Ordering::Release);
-        if let Some(prefetch) = runtime.startup_prefetch.take() {
-            prefetch.stop(Duration::from_secs(5)).await;
-        }
-        runtime.envd.invalidate();
-        if let Err(error) = runtime
-            .client
-            .lock()
-            .await
-            .request(RuntimeCommand::Stop, Duration::from_secs(10))
-            .await
-        {
-            tracing::warn!(%error, "runtime Stop not confirmed; requiring process reap");
-        }
-        if let Some(process) = runtime.resources.process.as_mut() {
-            process.terminate_and_wait(Duration::from_secs(10)).await?;
-        }
-        if let Some(extension) = runtime.extension.take() {
-            extension.stop().await;
-        }
-        runtime.resources.cleanup().await?;
-        self.runtime = None;
-        Ok(())
+        self.stop_runtime(false).await
     }
     async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
         self.volume_operation(super::volume::VolumeOperation::Freeze)

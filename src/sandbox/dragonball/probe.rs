@@ -16,7 +16,8 @@ use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use super::{
     client::{ProbeClient, M0_PROFILE, M0_REVISION},
-    process::{spawn_runner, RunnerProcessGuard},
+    process::spawn_runner,
+    resources::{RetainedWork, RuntimeResources},
 };
 use crate::{
     cfg::ConfigManager,
@@ -26,7 +27,7 @@ use crate::{
             build_drives_boot_arg, prepare_extra_drives, prepare_volume_drive_slots,
             ExtraDrivePrepareMode,
         },
-        network::{metadata::MetadataListener, Slot},
+        network::metadata::MetadataListener,
         ublk::UblkDevice,
         EnvdAccessToken, Executor, ExtraDrive, NetworkManager, SandboxMetadataDocument,
         SandboxNetworkPolicy, UblkDeviceManager,
@@ -75,37 +76,10 @@ struct ProbeBacking {
     devices: Vec<UblkDevice>,
     work: Arc<TempDir>,
 }
-// A cancelled daemon-release task must retain a still-live device's files.
-struct RetainedWork(Option<Arc<TempDir>>);
-struct RetainedArtifacts(Option<Vec<Arc<dyn std::any::Any + Send + Sync>>>);
-impl Drop for RetainedArtifacts {
-    fn drop(&mut self) {
-        if let Some(artifacts) = self.0.take() {
-            std::mem::forget(artifacts);
-        }
-    }
-}
-impl Drop for RetainedWork {
-    fn drop(&mut self) {
-        if let Some(work) = self.0.take() {
-            std::mem::forget(work);
-        }
-    }
-}
-
-pub(super) struct ProbeResources {
-    pub(super) process: Option<RunnerProcessGuard>,
-    pub(super) metadata: Option<MetadataListener>,
-    pub(super) devices: Vec<UblkDevice>,
-    pub(super) dedicated_devices: Vec<UblkDevice>,
-    pub(super) slot: Option<Slot>,
-    pub(super) work: Arc<TempDir>,
+struct ProbeResources {
+    runtime: RuntimeResources,
     backing: Option<Arc<ProbeBacking>>,
-    restore_directory: Option<Arc<TempDir>>,
-    pub(super) evidence_dir: PathBuf,
-    pub(super) retained_artifacts: Vec<Arc<dyn std::any::Any + Send + Sync>>,
-    #[cfg(test)]
-    _release_observer: Option<tests::ReleaseObserver>,
+    evidence_dir: PathBuf,
 }
 
 fn validate_profile(mode: VirtualizationMode, arch: &str, cpu_policy: &str) -> Result<()> {
@@ -130,6 +104,7 @@ impl DragonballM0Probe {
             .resources
             .as_ref()
             .context("probe stopped")?
+            .runtime
             .work
             .path())
     }
@@ -152,7 +127,7 @@ impl DragonballM0Probe {
             .context("checkpoint parent")?
             .canonicalize()?;
         anyhow::ensure!(
-            output_dir.is_absolute() && parent.starts_with(resources.work.path()),
+            output_dir.is_absolute() && parent.starts_with(resources.runtime.work.path()),
             "checkpoint must be within this instance's work root"
         );
         fs::create_dir(output_dir)?;
@@ -171,10 +146,12 @@ impl DragonballM0Probe {
         let backing = resources
             .backing
             .get_or_insert_with(|| {
-                Arc::new(ProbeBacking {
-                    devices: std::mem::take(&mut resources.devices),
-                    work: resources.work.clone(),
-                })
+                let backing = Arc::new(ProbeBacking {
+                    devices: std::mem::take(&mut resources.runtime.devices),
+                    work: resources.runtime.work.clone(),
+                });
+                resources.runtime.retained_artifacts.push(backing.clone());
+                backing
             })
             .clone();
         Ok(QuiescedProbeArtifacts {
@@ -183,7 +160,7 @@ impl DragonballM0Probe {
             machine: self.machine.clone().context("machine not configured")?,
             config: self.config.clone().context("probe inputs missing")?,
             backing,
-            directory: resources.work.clone(),
+            directory: resources.runtime.work.clone(),
         })
     }
     pub async fn restore_quiesced(
@@ -279,18 +256,9 @@ impl DragonballM0Probe {
             .join(work.path().file_name().context("probe work directory")?);
         let mut probe = Self {
             resources: Some(ProbeResources {
-                process: None,
-                metadata: None,
-                devices: Vec::new(),
-                dedicated_devices: Vec::new(),
-                slot: None,
-                work: Arc::new(work),
+                runtime: RuntimeResources::new(work, None),
                 backing: None,
-                restore_directory: None,
                 evidence_dir,
-                retained_artifacts: Vec::new(),
-                #[cfg(test)]
-                _release_observer: None,
             }),
             client: ProbeClient::new(socket, config.sandbox_instance_id.clone()),
             envd: None,
@@ -317,12 +285,12 @@ impl DragonballM0Probe {
     ) -> Result<()> {
         let app = ConfigManager::global_config();
         let resources = self.resources.as_mut().context("probe resources missing")?;
-        resources.slot = Some(NetworkManager::global().allocate_any()?);
-        let slot = resources.slot.as_mut().unwrap();
+        resources.runtime.slot = Some(NetworkManager::global().allocate_any()?);
+        let slot = resources.runtime.slot.as_mut().unwrap();
         slot.set_egress_policy(Some(&config.network_policy))?;
         slot.prepare_metadata()?;
         let netns_path = slot.namespace_path();
-        resources.metadata = Some(MetadataListener::start(
+        resources.runtime.metadata = Some(MetadataListener::start(
             &netns_path,
             &config.sandbox_instance_id,
             config.metadata.clone(),
@@ -337,14 +305,21 @@ impl DragonballM0Probe {
         );
         let disks = if let Some(artifacts) = restore {
             resources.backing = Some(artifacts.backing.clone());
-            resources.restore_directory = Some(artifacts.directory.clone());
+            resources
+                .runtime
+                .retained_artifacts
+                .push(artifacts.backing.clone());
+            resources
+                .runtime
+                .retained_artifacts
+                .push(artifacts.directory.clone());
             artifacts.machine.block_devices.clone()
         } else {
             let root = UblkDeviceManager::global()
                 .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
                     source_image_config: &config.image_path,
                     global_config: &app.ublk.overlaybd.global_config_path,
-                    runtime_dir: &resources.work.path().join("overlaybd"),
+                    runtime_dir: &resources.runtime.work.path().join("overlaybd"),
                     read_only: false,
                     runtime_upper_mode: app.ublk.overlaybd.runtime_upper_mode,
                     requested_virtual_size: None,
@@ -366,11 +341,11 @@ impl DragonballM0Probe {
                     is_root: false,
                 },
             ];
-            resources.devices.push(root.device);
+            resources.runtime.devices.push(root.device);
             let prepared = prepare_extra_drives(
                 &config.extra_drives,
                 &app.ublk.overlaybd.global_config_path,
-                resources.work.path(),
+                resources.runtime.work.path(),
                 app.ublk.overlaybd.runtime_upper_mode,
                 ExtraDrivePrepareMode::Fresh {
                     allow_shrink: false,
@@ -379,17 +354,18 @@ impl DragonballM0Probe {
             .await?;
             let (mounts, runtimes) = prepared.into_parts();
             resources
+                .runtime
                 .devices
                 .extend(runtimes.into_iter().map(|runtime| runtime.device));
             let slot_count = app.volume.max_volume_count.min(24 - mounts.len());
             for mount in mounts.into_iter().chain(prepare_volume_drive_slots(
                 config.extra_drives.len(),
                 slot_count,
-                resources.work.path(),
+                resources.runtime.work.path(),
             )?) {
                 disks.push(ProbeBlockDevice {
                     drive_id: mount.drive_id,
-                    path_on_host: resources.work.path().join(mount.attachment_path),
+                    path_on_host: resources.runtime.work.path().join(mount.attachment_path),
                     read_only: mount.read_only,
                     is_root: false,
                 });
@@ -405,23 +381,26 @@ impl DragonballM0Probe {
             .arg("--socket")
             .arg(&self.client.socket)
             .arg("--work-dir")
-            .arg(resources.work.path())
+            .arg(resources.runtime.work.path())
             .arg("--instance-id")
             .arg(&config.sandbox_instance_id)
             .arg("--parent-pid")
             .arg(std::process::id().to_string())
-            .current_dir(resources.work.path())
+            .current_dir(resources.runtime.work.path())
             .stdin(Stdio::null())
-            .stdout(File::create(resources.work.path().join("serial.log"))?)
+            .stdout(File::create(
+                resources.runtime.work.path().join("serial.log"),
+            )?)
             .stderr(File::create(
-                resources.work.path().join("runner-error.log"),
+                resources.runtime.work.path().join("runner-error.log"),
             )?);
         let namespace = File::open(netns_path)?;
         // Current UID/groups; the runner inherits no capabilities.
-        resources.process = Some(spawn_runner(command, Some(namespace)).await?);
+        resources.runtime.process = Some(spawn_runner(command, Some(namespace)).await?);
         let until = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if resources
+                .runtime
                 .process
                 .as_mut()
                 .unwrap()
@@ -431,7 +410,7 @@ impl DragonballM0Probe {
             {
                 anyhow::bail!(
                     "runner exited before Hello: {}",
-                    fs::read_to_string(resources.work.path().join("runner-error.log"))
+                    fs::read_to_string(resources.runtime.work.path().join("runner-error.log"))
                         .unwrap_or_default()
                 );
             }
@@ -457,7 +436,7 @@ impl DragonballM0Probe {
                 && identity.feature_profile == M0_PROFILE,
             "unqualified runner identity {identity:?}"
         );
-        tracing::info!(?identity, uid = unsafe { libc::geteuid() }, work = %resources.work.path().display(), "M0 runner ready");
+        tracing::info!(?identity, uid = unsafe { libc::geteuid() }, work = %resources.runtime.work.path().display(), "M0 runner ready");
         let machine = ProbeVmConfig {
             vcpu_count: config.vcpu_count,
             memory_mib: config.memory_mib,
@@ -479,7 +458,7 @@ impl DragonballM0Probe {
         self.client
             .request(ProbeCommand::Configure(machine), Duration::from_secs(15))
             .await?;
-        tracing::info!(restore = restore.is_some(), work = %resources.work.path().display(), "M0 guest start requested");
+        tracing::info!(restore = restore.is_some(), work = %resources.runtime.work.path().display(), "M0 guest start requested");
         self.client
             .request(
                 if let Some(artifacts) = restore {
@@ -500,7 +479,7 @@ impl DragonballM0Probe {
             .with_context(|| {
                 format!(
                     "guest not ready; serial: {}",
-                    fs::read_to_string(resources.work.path().join("serial.log"))
+                    fs::read_to_string(resources.runtime.work.path().join("serial.log"))
                         .unwrap_or_default()
                 )
             })?;
@@ -537,6 +516,7 @@ impl DragonballM0Probe {
         .await
         .context("envd did not acquire this instance's metadata identity")??;
         let pid = resources
+            .runtime
             .process
             .as_ref()
             .and_then(|p| p.child.id())
@@ -568,7 +548,7 @@ impl DragonballM0Probe {
             resources.evidence_dir.join("runner-security.txt"),
             security.join("\n"),
         )?;
-        tracing::info!(work = %resources.work.path().display(), "M0 guest ready");
+        tracing::info!(work = %resources.runtime.work.path().display(), "M0 guest ready");
         Ok(())
     }
 
@@ -588,7 +568,7 @@ impl DragonballM0Probe {
 
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(resources) = &self.resources {
-            tracing::info!(work = %resources.work.path().display(), "M0 runner stop requested");
+            tracing::info!(work = %resources.runtime.work.path().display(), "M0 runner stop requested");
         }
         if let Some(envd) = self.envd.take() {
             envd.invalidate();
@@ -596,7 +576,7 @@ impl DragonballM0Probe {
         if self
             .resources
             .as_mut()
-            .and_then(|r| r.process.as_mut())
+            .and_then(|r| r.runtime.process.as_mut())
             .is_some_and(|p| matches!(p.child.try_wait(), Ok(None)))
         {
             // Best-effort orderly worker shutdown, followed by mandatory wait/kill.
@@ -622,123 +602,10 @@ impl Drop for DragonballM0Probe {
 }
 
 impl ProbeResources {
-    /// Shared runner-reap-before-leases owner. Probe-only backing stays private.
-    pub(super) fn new(work: TempDir, evidence_dir: PathBuf) -> Self {
-        Self {
-            process: None,
-            metadata: None,
-            devices: Vec::new(),
-            dedicated_devices: Vec::new(),
-            slot: None,
-            work: Arc::new(work),
-            backing: None,
-            restore_directory: None,
-            evidence_dir,
-            retained_artifacts: Vec::new(),
-            #[cfg(test)]
-            _release_observer: None,
-        }
-    }
-    pub(super) async fn cleanup(&mut self) -> Result<()> {
-        if let Some(process) = self.process.as_mut() {
-            process.terminate_and_wait(Duration::from_secs(10)).await?;
-        }
-        self.process = None;
-        fs::create_dir_all(&self.evidence_dir)?;
-        for name in ["serial.log", "runner-error.log"] {
-            let source = self.work.path().join(name);
-            if source.exists() {
-                fs::copy(source, self.evidence_dir.join(name))?;
-            }
-        }
-        if let Some(metadata) = &self.metadata {
-            fs::write(
-                self.evidence_dir.join("metadata-requests.json"),
-                serde_json::to_vec_pretty(&metadata.recorded_requests()?)?,
-            )?;
-        }
-        if let Some(metadata) = self.metadata.as_mut() {
-            metadata.stop().await?;
-        }
-        self.metadata = None;
-        while let Some(device) = self.dedicated_devices.last() {
-            UblkDeviceManager::global().delete_device(device).await?;
-            self.dedicated_devices.pop();
-        }
-        while let Some(device) = self.devices.last() {
-            UblkDeviceManager::global().release_device(device).await?;
-            self.devices.pop();
-        }
-        if let Some(slot) = self.slot.take() {
-            NetworkManager::global().release(slot)?;
-        }
-        tracing::info!(work = %self.work.path().display(), "M0 runner reaped; metadata stopped; device and network leases released");
-        Ok(())
-    }
-}
-
-impl Drop for ProbeResources {
-    fn drop(&mut self) {
-        if let Some(process) = self.process.as_mut() {
-            if let Err(error) = process.terminate_blocking(Duration::from_secs(10)) {
-                tracing::error!(%error, "retaining M0 leases: runner exit unconfirmed");
-                // Fail closed: never recycle disks/netns behind a live VMM.
-                std::mem::forget(self.metadata.take());
-                std::mem::forget(self.slot.take());
-                std::mem::forget(std::mem::take(&mut self.devices));
-                std::mem::forget(std::mem::take(&mut self.dedicated_devices));
-                std::mem::forget(self.backing.take());
-                std::mem::forget(self.restore_directory.take());
-                std::mem::forget(self.work.clone());
-                std::mem::forget(std::mem::take(&mut self.retained_artifacts));
-                return;
-            }
-        }
-        self.metadata = None; // join before slot release, including cancelled startup
-        if self.devices.is_empty() && self.dedicated_devices.is_empty() && self.slot.is_none() {
-            return;
-        }
-        let work = RetainedWork(Some(self.work.clone()));
-        let devices = std::mem::take(&mut self.devices);
-        let dedicated_devices = std::mem::take(&mut self.dedicated_devices);
-        let artifacts = std::mem::take(&mut self.retained_artifacts);
-        let slot = self.slot.take();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                // If cancellation/release fails, do not delete layers still opened by ublk.
-                let artifacts = RetainedArtifacts(Some(artifacts));
-                for device in dedicated_devices {
-                    if let Err(error) = UblkDeviceManager::global().delete_device(&device).await {
-                        tracing::error!(%error, "recording device rollback; retaining artifacts");
-                        return;
-                    }
-                }
-                for device in devices {
-                    if let Err(error) = UblkDeviceManager::global().release_device(&device).await {
-                        tracing::error!(%error, "M0 device rollback; retaining work directory");
-                        return;
-                    }
-                }
-                if let Some(slot) = slot {
-                    if let Err(error) = NetworkManager::global().release(slot) {
-                        tracing::error!(%error, "M0 network rollback");
-                        return;
-                    }
-                }
-                let mut work = work;
-                work.0.take();
-                let mut artifacts = artifacts;
-                artifacts.0.take();
-            });
-        } else {
-            // Runtime shutdown cannot service daemon RPCs: retain their artifacts.
-            std::mem::forget(devices);
-            std::mem::forget(dedicated_devices);
-            std::mem::forget(artifacts);
-            if let Some(slot) = slot {
-                let _ = NetworkManager::global().release(slot);
-            }
-        }
+    async fn cleanup(&mut self) -> Result<()> {
+        self.runtime.reap().await?;
+        self.runtime.archive_diagnostics(&self.evidence_dir);
+        self.runtime.cleanup().await
     }
 }
 
@@ -860,6 +727,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_diagnostic_io_failure_still_releases_artifacts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let evidence_dir = fixture.path().join("not-a-directory");
+        fs::write(&evidence_dir, b"occupied").unwrap();
+        let mut runtime = RuntimeResources::new(tempfile::tempdir().unwrap(), None);
+        let artifact = Arc::new(tempfile::tempdir().unwrap());
+        let artifact_path = artifact.path().to_owned();
+        runtime.retained_artifacts.push(artifact);
+        let mut resources = ProbeResources {
+            runtime,
+            backing: None,
+            evidence_dir,
+        };
+        resources.cleanup().await.unwrap();
+        drop(resources);
+        assert!(!artifact_path.exists());
+    }
+
+    #[tokio::test]
     async fn probe_cancel_keeps_cleanup_owned() {
         let child = tokio::process::Command::new("/bin/sleep")
             .arg("60")
@@ -869,25 +755,21 @@ mod tests {
         let pid = child.id().unwrap();
         let (released, evidence) = tokio::sync::oneshot::channel();
         let evidence_work = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeResources::new(tempfile::tempdir().unwrap(), None);
+        runtime.process = Some(super::super::process::RunnerProcessGuard {
+            child: child.into(),
+            logs: None,
+            fail_blocking_reap: false,
+        });
+        runtime.retained_artifacts.push(Arc::new(ReleaseObserver {
+            pid,
+            released: Some(released),
+        }));
         let mut probe = DragonballM0Probe {
             resources: Some(ProbeResources {
-                process: Some(RunnerProcessGuard {
-                    child: child.into(),
-                    fail_blocking_reap: false,
-                }),
-                metadata: None,
-                devices: Vec::new(),
-                dedicated_devices: Vec::new(),
-                slot: None,
-                work: Arc::new(tempfile::tempdir().unwrap()),
+                runtime,
                 backing: None,
-                restore_directory: None,
                 evidence_dir: evidence_work.path().to_owned(),
-                retained_artifacts: Vec::new(),
-                _release_observer: Some(ReleaseObserver {
-                    pid,
-                    released: Some(released),
-                }),
             }),
             client: ProbeClient::new("/unused".into(), "cancel-test".into()),
             envd: None,
@@ -904,68 +786,6 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             "a lease dropped before confirmed runner exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_reap_retains_shared_backing_and_restore_directory() {
-        let fixture = tempfile::tempdir().unwrap();
-        let child = tokio::process::Command::new("/bin/sleep")
-            .arg("60")
-            .kill_on_drop(false)
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap();
-        let backing = Arc::new(ProbeBacking {
-            devices: Vec::new(),
-            work: Arc::new(tempfile::tempdir_in(fixture.path()).unwrap()),
-        });
-        let backing_observer = Arc::downgrade(&backing);
-        let directory = Arc::new(tempfile::tempdir_in(fixture.path()).unwrap());
-        let directory_path = directory.path().to_owned();
-        let sealed_layers = Arc::new(tempfile::tempdir_in(fixture.path()).unwrap());
-        let layers_observer = Arc::downgrade(&sealed_layers);
-        let resources = ProbeResources {
-            process: Some(RunnerProcessGuard {
-                child: child.into(),
-                fail_blocking_reap: true,
-            }),
-            metadata: None,
-            devices: Vec::new(),
-            slot: None,
-            dedicated_devices: Vec::new(),
-            work: Arc::new(tempfile::tempdir_in(fixture.path()).unwrap()),
-            backing: Some(backing),
-            restore_directory: Some(directory),
-            evidence_dir: fixture.path().join("evidence"),
-            retained_artifacts: vec![sealed_layers],
-            _release_observer: None,
-        };
-        drop(resources);
-        let runner_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        let backing_retained = backing_observer.strong_count() > 0;
-        let directory_retained = directory_path.exists();
-        let layers_retained = layers_observer.strong_count() > 0;
-        // Always reap this injected fixture even if the ownership assertion fails.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-            libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
-        }
-        assert!(
-            runner_alive,
-            "fixture did not exercise an unconfirmed live runner"
-        );
-        assert!(
-            backing_retained,
-            "shared backing dropped before confirmed exit"
-        );
-        assert!(
-            directory_retained,
-            "restore artifact directory removed before confirmed exit"
-        );
-        assert!(
-            layers_retained,
-            "sealed lower leases dropped before confirmed exit"
         );
     }
 

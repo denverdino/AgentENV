@@ -7,13 +7,13 @@ use sha2::Sha256;
 use std::{
     fs::File,
     io::{Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream},
-    os::fd::AsFd,
-    path::Path,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+    net::{Ipv4Addr, Shutdown, TcpListener, TcpStream},
+    os::{
+        fd::{AsFd, AsRawFd},
+        unix::net::UnixStream,
     },
+    path::Path,
+    sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -169,7 +169,8 @@ fn checked_document(document: SandboxMetadataDocument) -> anyhow::Result<serde_j
 
 pub(crate) struct MetadataListener {
     state: Arc<Mutex<MetadataState>>,
-    stopping: Arc<AtomicBool>,
+    shutdown: UnixStream,
+    completed: tokio::sync::oneshot::Receiver<()>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -208,10 +209,12 @@ impl MetadataListener {
         F: FnOnce() -> anyhow::Result<(TcpListener, Box<dyn Send>)> + Send + 'static,
     {
         let state = Arc::new(Mutex::new(state));
-        let stopping = Arc::new(AtomicBool::new(false));
+        // Socketpair wake-up works across network namespaces and cannot fill
+        // up: closing the write half leaves a persistent readable EOF.
+        let (shutdown, shutdown_rx) = UnixStream::pair()?;
+        let (completed_tx, completed) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let shared_state = state.clone();
-        let stop = stopping.clone();
         let worker = thread::Builder::new()
             .name("aenv-metadata".into())
             .spawn(move || {
@@ -227,13 +230,43 @@ impl MetadataListener {
                     return;
                 }
                 let _ = ready_tx.send(Ok(()));
-                while !stop.load(Ordering::Acquire) {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: shutdown_rx.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                loop {
+                    // Only this worker accepts. Keep the listener nonblocking
+                    // so a spurious readiness notification cannot delay stop.
+                    if unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) } < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        tracing::warn!(%error, "metadata listener wait failed");
+                        break;
+                    }
+                    if descriptors[1].revents != 0 {
+                        break;
+                    }
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let _ = serve_connection(stream, &shared_state);
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5))
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue
                         }
                         Err(error) => {
                             tracing::warn!(%error, "metadata listener failed");
@@ -241,11 +274,13 @@ impl MetadataListener {
                         }
                     }
                 }
+                let _ = completed_tx.send(());
             })?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 state,
-                stopping,
+                shutdown,
+                completed,
                 worker: Some(worker),
             }),
             ready => {
@@ -267,15 +302,11 @@ impl MetadataListener {
             .replace(instance, document)
     }
     pub(crate) async fn stop(&mut self) -> anyhow::Result<()> {
-        self.stopping.store(true, Ordering::Release);
+        let _ = self.shutdown.shutdown(Shutdown::Write);
         // Keep the join owned by self across awaits: cancellation falls back
         // to Drop joining it before the namespace lease can be returned.
-        while self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        if self.worker.is_some() {
+            let _ = (&mut self.completed).await;
         }
         if let Some(worker) = self.worker.take() {
             worker
@@ -288,7 +319,7 @@ impl MetadataListener {
 
 impl Drop for MetadataListener {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
+        let _ = self.shutdown.shutdown(Shutdown::Write);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -410,6 +441,7 @@ fn handle_http(state: &MetadataState, bytes: &[u8], now: Instant) -> MetadataRep
 }
 
 fn serve_connection(mut stream: TcpStream, state: &Mutex<MetadataState>) -> anyhow::Result<()> {
+    stream.set_nonblocking(false)?;
     let deadline = Instant::now() + Duration::from_millis(250);
     let mut buffer = Vec::new();
     let mut chunk = [0; 1024];
@@ -550,6 +582,30 @@ mod tests {
         );
         listener.stop().await.unwrap();
         assert!(released.load(Ordering::Acquire));
+        listener.stop().await.unwrap();
+    }
+
+    #[test]
+    fn dropping_idle_listener_wakes_worker_and_releases_lease() {
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let lease = Arc::new(());
+        let released = Arc::downgrade(&lease);
+        let state =
+            MetadataState::new("runtime-1", document("template-1"), Instant::now()).unwrap();
+        let listener =
+            MetadataListener::start_with_setup(state, move || Ok((socket, Box::new(lease))))
+                .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(listener);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("idle metadata worker did not wake on drop");
+        // Inspect this worker's lifetime: another parallel test may already
+        // have rebound the port by the time Drop's join returns.
+        assert!(released.upgrade().is_none());
     }
 
     #[test]

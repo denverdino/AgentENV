@@ -93,7 +93,7 @@ fn memory_checksum(path: &std::path::Path) -> Result<String> {
 
 #[tokio::test]
 #[ignore = "requires quiesced Linux x86_64 KVM/ublk guest in isolated namespace"]
-async fn dragonball_m0_quiesced_full_restore() -> Result<()> {
+async fn dragonball_probe_quiesced_full_restore() -> Result<()> {
     let (config, _) = fixture_config(false).await?;
     let mut source = DragonballM0Probe::start(config.clone()).await?;
     let executor = source.executor()?;
@@ -282,7 +282,7 @@ async fn dragonball_m0_quiesced_full_restore() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires Linux x86_64 KVM/ublk/assets and an isolated outer network namespace"]
-async fn dragonball_m0_cold_start_uses_existing_guest() -> Result<()> {
+async fn dragonball_probe_cold_start_uses_existing_guest() -> Result<()> {
     let (mut probe, _) = start(false).await?;
     let output = probe.executor()?.run_command("/bin/sh", &["-ec", "test -b /dev/vda; test -b /dev/vdb; test -b /dev/vdc; test -x /agentenv/envd; findmnt -n -o SOURCE /; findmnt -n -o OPTIONS /agentenv; printf 'DRAGONBALL_GUEST_OK\\n'"]).await?;
     probe.stop().await?;
@@ -296,7 +296,7 @@ async fn dragonball_m0_cold_start_uses_existing_guest() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires Linux x86_64 KVM/ublk/assets and an isolated outer network namespace"]
-async fn dragonball_m0_secure_token_and_metadata_match_instance() -> Result<()> {
+async fn dragonball_probe_secure_token_and_metadata_match_instance() -> Result<()> {
     let (mut probe, id) = start(false).await?;
     let output = probe.executor()?.run_command("/bin/sh", &["-ec", "t=$(curl --fail --silent -X PUT -H X-metadata-token-ttl-seconds:60 http://169.254.169.254/latest/api/token); curl --fail --silent -H \"X-metadata-token: $t\" -H Accept:application/json http://169.254.169.254/; printf '\\n'; printf '%s %s\\n' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\""]).await?;
     let mut wrong =
@@ -339,7 +339,7 @@ async fn dragonball_m0_secure_token_and_metadata_match_instance() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "requires Linux x86_64 KVM/ublk/assets and an isolated outer network namespace"]
-async fn dragonball_m0_metadata_survives_deny_all() -> Result<()> {
+async fn dragonball_probe_metadata_survives_deny_all() -> Result<()> {
     let (mut probe, _) = start(true).await?;
     let output = probe.executor()?.run_command("/bin/sh", &["-ec", "t=$(curl --fail --silent -X PUT -H X-metadata-token-ttl-seconds:60 http://169.254.169.254/latest/api/token); curl --fail --silent -H \"X-metadata-token: $t\" http://169.254.169.254/envID"]).await?;
     probe.stop().await?;
@@ -350,7 +350,7 @@ async fn dragonball_m0_metadata_survives_deny_all() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires two Linux x86_64 KVM/ublk guests in isolated network namespaces"]
-async fn dragonball_m0_metadata_isolated_from_another_namespace() -> Result<()> {
+async fn dragonball_probe_metadata_isolated_from_another_namespace() -> Result<()> {
     let (mut first, first_id) = start(false).await?;
     let (mut second, second_id) = start(false).await?;
     let token = first.executor()?.run_command("/bin/sh", &["-ec", "curl --fail --silent -X PUT -H X-metadata-token-ttl-seconds:60 http://169.254.169.254/latest/api/token"]).await?;

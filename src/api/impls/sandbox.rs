@@ -369,27 +369,6 @@ async fn prepare_volume_fork_specs(
     Ok((specs, children))
 }
 
-async fn snapshot_sandbox_volumes(
-    api: &ApiImpl,
-    metadata: &SandboxMetadata,
-) -> Result<Vec<SnapshotVolume>, models::Error> {
-    let mut snapshots = Vec::with_capacity(metadata.volume_mounts.len());
-    for (mount_path, reference) in &metadata.volume_mounts {
-        let snapshot = api
-            .volume_manager
-            .snapshot_volume_state(reference)
-            .await
-            .map_err(|error| volume_error_response(error).1)?;
-        snapshots.push(SnapshotVolume {
-            mount_path: mount_path.clone(),
-            mode: snapshot.mode,
-            size_mb: snapshot.size_mb,
-            layers: snapshot.backing_layers,
-        });
-    }
-    Ok(snapshots)
-}
-
 async fn restore_snapshot_volume_mounts(
     api: &ApiImpl,
     snapshot: &crate::snapshot::RunnableSnapshot,
@@ -2046,21 +2025,6 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let volume_snapshots = match if capture.captured_snapshot.volume_drives().is_some() {
-            // publish_captured consumes this capture's immutable volume generations.
-            Ok(Vec::new())
-        } else {
-            snapshot_sandbox_volumes(self, &capture.metadata).await
-        } {
-            Ok(snapshots) => snapshots,
-            Err(error) => {
-                return Ok(match error.code {
-                    500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
-                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
-                });
-            }
-        };
-
         let published = match timer
             .time(
                 "publish",
@@ -2079,7 +2043,7 @@ impl Sandboxes<()> for ApiImpl {
                         runtime_versions: capture.metadata.runtime_versions.clone(),
                         virtualization_mode: capture.metadata.virtualization_mode,
                         image_configs: capture.metadata.image_configs.clone(),
-                        volume_snapshots,
+                        volume_snapshots: Vec::new(),
                         custom_extension_params: capture.metadata.custom_extension_params.clone(),
                     },
                     capture.captured_snapshot,

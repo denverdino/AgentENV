@@ -8,24 +8,40 @@ mod hypervisor_components;
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-#[path = "integration/dragonball_m0.rs"]
-mod dragonball_m0;
+#[path = "integration/dragonball_compatibility.rs"]
+mod dragonball_compatibility;
 
 #[cfg(all(
     feature = "hypervisor-dragonball",
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-#[path = "integration/dragonball_m1.rs"]
-mod dragonball_m1;
+#[path = "integration/dragonball_probe.rs"]
+mod dragonball_probe;
 
 #[cfg(all(
     feature = "hypervisor-dragonball",
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-#[path = "integration/dragonball_m2.rs"]
-mod dragonball_m2;
+#[path = "integration/dragonball_support.rs"]
+mod dragonball_support;
+
+#[cfg(all(
+    feature = "hypervisor-dragonball",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[path = "integration/dragonball_lifecycle.rs"]
+mod dragonball_lifecycle;
+
+#[cfg(all(
+    feature = "hypervisor-dragonball",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[path = "integration/dragonball_memory.rs"]
+mod dragonball_memory;
 
 #[cfg(all(
     feature = "hypervisor-dragonball",
@@ -40,24 +56,24 @@ mod dragonball_apf;
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-#[path = "integration/dragonball_m2_slots.rs"]
-mod dragonball_m2_slots;
+#[path = "integration/dragonball_slots.rs"]
+mod dragonball_slots;
 
 #[cfg(all(
     feature = "hypervisor-dragonball",
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-#[path = "integration/dragonball_m2_startup.rs"]
-mod dragonball_m2_startup;
+#[path = "integration/dragonball_startup.rs"]
+mod dragonball_startup;
 
 #[cfg(all(
     feature = "hypervisor-dragonball",
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-#[path = "integration/dragonball_m3.rs"]
-mod dragonball_m3;
+#[path = "integration/dragonball_platform.rs"]
+mod dragonball_platform;
 
 #[cfg(feature = "hypervisor-firecracker")]
 #[path = "integration/envd_supervisor.rs"]

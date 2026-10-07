@@ -32,14 +32,12 @@ pub fn read_envelope(path: &Path) -> Result<RuntimeSnapshotEnvelope> {
 }
 
 pub fn read_for_restore(
-    reader: &super::super::restore_identity::RestoreReader,
+    reader: &super::restore_identity::RestoreReader,
     record: &crate::snapshot::SnapshotRecord,
     manifest: &crate::sandbox::SandboxSnapshotManifest,
 ) -> Result<RuntimeSnapshotEnvelope> {
     let envelope = read_envelope(&manifest.vm_state.path)?;
-    super::super::restore_identity::validate_artifact_identity(
-        reader, record, manifest, &envelope,
-    )?;
+    super::restore_identity::validate_artifact_identity(reader, record, manifest, &envelope)?;
     Ok(envelope)
 }
 

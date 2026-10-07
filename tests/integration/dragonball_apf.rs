@@ -2,17 +2,18 @@
 use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
 use agentenv::sandbox::{
     dragonball::{DragonballMemoryMode, DragonballRuntimePolicy, DragonballSandboxFactory},
-    SandboxBackend, SandboxExecutor,
+    ProcessOpts, SandboxBackend, SandboxExecutor,
 };
 use anyhow::{Context, Result};
 
-use super::dragonball_m1::{asset, fixture, launch, spec};
-use super::dragonball_m2::memory_device;
+use super::dragonball_support::memory_device;
+use super::dragonball_support::{asset, fixture, launch, spec};
 
 struct StoppedDaemon(OwnedFd);
 
@@ -64,7 +65,11 @@ async fn dragonball_apf_runner_death_during_blocked_memory_io() -> Result<()> {
     let launch = launch(&assets)?;
     let id = launch.sandbox_id;
     let access = launch.envd_access_token.clone();
-    let mut source = factory.build_fresh(spec(&assets)?, launch)?;
+    // Keep another vCPU schedulable if the first faults synchronously while
+    // ublk is gated; this test must observe an actual asynchronous fault.
+    let mut resources = spec(&assets)?;
+    resources.resources.cpu_count = 2;
+    let mut source = factory.build_fresh(resources, launch)?;
     source.start().await?;
     let output = source.run_command("/bin/sh", &["-ec", "dd if=/dev/urandom of=/dev/shm/apf-payload bs=1M count=64; sha256sum /dev/shm/apf-payload"]).await?;
     anyhow::ensure!(output.exit_code == 0, "payload: {}", output.stderr);
@@ -94,6 +99,35 @@ async fn dragonball_apf_runner_death_during_blocked_memory_io() -> Result<()> {
         "daemon must belong to this isolated fixture"
     );
     drop(daemon);
+    // Start the reader before blocking ublk. Otherwise envd's shell/nice
+    // wrappers can stall loading from rootfs before any memory APF is issued.
+    // The tools executable stays outside the stopped daemon's disk path.
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let ready_signal = ready.clone();
+    let mut reader = restored
+        .executor()?
+        .start_process(
+            "/agentenv/bin/busybox",
+            &[
+                "sh",
+                "-ec",
+                "printf ready; read go; exec /agentenv/bin/busybox sha256sum /dev/shm/apf-payload",
+            ],
+            &ProcessOpts::default().with_output_callback(move |stderr, bytes| {
+                if !stderr && !bytes.is_empty() {
+                    ready_signal.notify_one();
+                }
+            }),
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = ready.notified() => Ok(()),
+            result = reader.wait() => anyhow::bail!("APF reader exited before trigger: {result:?}"),
+        }
+    })
+    .await
+    .context("APF reader did not reach its I/O trigger")??;
     let start = std::fs::metadata(&trace)?.len() as usize;
     let gate = StoppedDaemon::new(daemon_pid)?;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -142,7 +176,10 @@ async fn dragonball_apf_runner_death_during_blocked_memory_io() -> Result<()> {
         }
     };
     {
-        let read = restored.run_command("/bin/sh", &["-ec", "sha256sum /dev/shm/apf-payload"]);
+        let read = async {
+            reader.send_stdin(b"go\n").await?;
+            reader.wait().await
+        };
         tokio::pin!(read);
         let event = tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(15), observed) => result.context("no actual APF while daemon I/O blocked")??,

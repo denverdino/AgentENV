@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshot::SnapshotVolume;
 use std::sync::Arc;
 use std::{
     future::{poll_fn, Future},

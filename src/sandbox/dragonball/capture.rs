@@ -16,12 +16,11 @@ use crate::sandbox::ublk::OverlaybdCompactOutput;
 use crate::sandbox::{
     storage_snapshot::{
         canonicalized_runtime_owned_roots, managed_snapshot_base,
-        restack_snapshot_overlaybd_device_with_runtime_roots,
-        stage_overlaybd_snapshot_from_live_runtime, PersistentSnapshotRootGuard,
+        restack_snapshot_overlaybd_device_with_runtime_roots, PersistentSnapshotRootGuard,
         StorageCaptureOwner,
     },
-    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxLaunchConfig, SandboxSnapshotManifest,
+    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxCaptureError,
+    SandboxCaptureResult, SandboxLaunchConfig, SandboxSnapshotManifest,
 };
 
 #[derive(Debug)]
@@ -32,10 +31,10 @@ pub(super) struct DragonballCaptureArtifacts {
     pub(super) launch: SandboxLaunchConfig,
     pub(super) recording_policy: super::DragonballRuntimePolicy,
     pub(super) storage: Option<StorageCaptureOwner>,
+    // Source disks retain the outer capture root, but not capture-only RAM/state.
+    pub(super) memory_owner: Option<Arc<PersistentSnapshotRootGuard>>,
     // Preserve resolved cache pins across a derivative capture/fork and source teardown.
     pub(super) runnable_snapshot: Option<crate::snapshot::RunnableSnapshot>,
-    // Keep ancestral lowers/device alive through publication and derived forks.
-    pub(super) _memory_base: Option<Arc<super::memory::DragonballMemoryBase>>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +50,9 @@ impl PausedSandboxState for DragonballPausedState {
     fn persistence_committed(&self) {
         if let Some(storage) = &self.artifacts.storage {
             storage.snapshot_root.persistence_committed();
+        }
+        if let Some(memory) = &self.artifacts.memory_owner {
+            memory.persistence_committed();
         }
     }
 
@@ -158,7 +160,7 @@ impl DragonballSandbox {
                     (guard.path().join("capture"), Some(guard))
                 };
                 let artifacts = runtime
-                    .capture_held(&spec, &launch, &at, guard, recording_policy)
+                    .capture_held(&spec, &launch, &at, guard, recording_policy, keep_held)
                     .await?;
                 if !keep_held {
                     runtime
@@ -183,7 +185,7 @@ impl DragonballSandbox {
             .map_err(|error| SandboxCaptureError::terminal(error.into()))?;
         self.runtime = Some(runtime);
         if result.as_ref().is_err_and(SandboxCaptureError::is_terminal) {
-            if let Err(error) = self.stop().await {
+            if let Err(error) = self.stop_runtime(true).await {
                 tracing::error!(%error, "terminal Dragonball capture teardown not confirmed; leases remain owned");
             }
         }
@@ -202,13 +204,22 @@ impl DragonballSandbox {
         let (runtime, result) = task.await?;
         self.runtime = Some(runtime);
         if result.is_err() {
-            self.stop().await?;
+            self.stop_runtime(true).await?;
         }
         result
     }
 }
 
 impl RuntimeStarted {
+    pub(super) async fn begin_capture(&self) -> SandboxCaptureResult<CaptureReport> {
+        self.ready.store(false, Ordering::Release);
+        let result = self.client.lock().await.begin_capture().await;
+        if result.as_ref().is_err_and(|error| !error.is_terminal()) {
+            self.ready.store(true, Ordering::Release);
+        }
+        result
+    }
+
     pub(super) async fn confirm_running(&self) -> Result<()> {
         let reply = self
             .client
@@ -277,6 +288,7 @@ impl RuntimeStarted {
         at: &Path,
         root_guard: Option<Arc<PersistentSnapshotRootGuard>>,
         recording_policy: super::DragonballRuntimePolicy,
+        sync_persistent_volumes: bool,
     ) -> SandboxCaptureResult<DragonballCaptureArtifacts> {
         if !self.ready.load(Ordering::Acquire) {
             return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
@@ -298,23 +310,30 @@ impl RuntimeStarted {
             );
             Ok(())
         })()?;
-        self.ready.store(false, Ordering::Release);
-        let RuntimeReply::Held(report) = self
-            .client
-            .lock()
-            .await
-            .request(RuntimeCommand::BeginCapture, Duration::from_secs(30))
-            .await
-            .map_err(SandboxCaptureError::terminal)?
-        else {
-            return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                "missing held capture proof"
-            )));
-        };
-        self.ready.store(false, Ordering::Release);
+        if sync_persistent_volumes
+            && spec
+                .extra_drives
+                .iter()
+                .any(|drive| !drive.read_only() && drive.snapshot_output_dir().is_some())
+        {
+            // Paused deletion publishes disk backings without resuming guest
+            // RAM, so completed writes must reach the devices before the hold.
+            self.sync_writable_volume_filesystems().await?;
+        }
+        let started = std::time::Instant::now();
+        let report = self.begin_capture().await?;
+        let held_us = started.elapsed().as_micros() as u64;
         let token = report.token.clone();
         let mut storage_may_have_changed = false;
         let captured: Result<DragonballCaptureArtifacts> = async {
+            let memory_owner = if root_guard.is_some() {
+                let guard = Arc::new(PersistentSnapshotRootGuard::new(at.join("memory")));
+                guard.prepare().await?;
+                Some(guard)
+            } else {
+                None
+            };
+            let memory_dir = memory_owner.as_ref().map_or(at, |owner| owner.path());
             let export = tempfile::Builder::new()
                 .prefix("export-")
                 .tempdir_in(self.resources.work.path())?;
@@ -336,7 +355,8 @@ impl RuntimeStarted {
                     && envelope.memory_layout == report.memory_layout,
                 "captured identity/layout conflict"
             );
-            write_new_json(&at.join("vm-state.json"), &envelope)?;
+            write_new_json(&memory_dir.join("vm-state.json"), &envelope)?;
+            let exported_us = started.elapsed().as_micros() as u64;
             let reader = super::memory_reader::FrozenMemoryReadLease::acquire(
                 self.client.clone(),
                 self.resources
@@ -349,16 +369,19 @@ impl RuntimeStarted {
                 self.machine.identity.memory_layout_id.clone(),
             )
             .await?;
+            let mapped_us = started.elapsed().as_micros() as u64;
             let memory_config_path = super::memory::write_incremental_memory(
                 reader.map(),
                 reader.reader(),
                 self.memory_base.as_deref(),
-                at,
+                memory_dir,
                 OverlaybdCompactOutput::Raw,
             )
             .await;
             // Even an OverlayBD write failure must drain all reads before resume.
+            let written_us = started.elapsed().as_micros() as u64;
             reader.release().await?;
+            let released_us = started.elapsed().as_micros() as u64;
             let memory_config_path = memory_config_path?;
             let root = self.root.as_ref().context("rootfs runtime missing")?;
             if let Some(guard) = &root_guard {
@@ -372,15 +395,25 @@ impl RuntimeStarted {
                 if let Some(guard) = artifact.downcast_ref::<PersistentSnapshotRootGuard>() {
                     runtime_roots.push(guard.path().to_path_buf());
                 } else if let Some(saved) = artifact.downcast_ref::<DragonballCaptureArtifacts>() {
-                    runtime_roots.push(
-                        saved
-                            .manifest
-                            .vm_state
-                            .path
-                            .parent()
-                            .context("saved capture root")?
-                            .to_path_buf(),
-                    );
+                    if let Some(storage) = &saved.storage {
+                        runtime_roots.push(storage.snapshot_dir.clone());
+                    } else {
+                        // Decoded pauses have no cleanup guard. Their disks may
+                        // live outside the default roots, separately from RAM.
+                        for config in
+                            std::iter::once(saved.manifest.rootfs.image_config_path.as_path())
+                                .chain(
+                                    saved
+                                        .spec
+                                        .extra_drives
+                                        .iter()
+                                        .map(|drive| drive.image_config_path()),
+                                )
+                        {
+                            runtime_roots
+                                .push(config.parent().context("saved disk root")?.to_path_buf());
+                        }
+                    }
                 }
             }
             let root_config = restack_snapshot_overlaybd_device_with_runtime_roots(
@@ -393,56 +426,19 @@ impl RuntimeStarted {
                 &runtime_roots,
             )
             .await?;
-            ensure!(
-                spec.extra_drives.len() == self.extras.len(),
-                "extra drive bookkeeping conflict"
+            let extras = crate::sandbox::volume_snapshot::capture_extra_drives(
+                &spec.extra_drives,
+                &self.extras,
+                at,
+                &runtime_roots,
+            )
+            .await?;
+            tracing::debug!(
+                sandbox_id = %launch.sandbox_id,
+                held_us, exported_us, mapped_us, written_us, released_us,
+                disks_us = started.elapsed().as_micros() as u64,
+                "Dragonball capture cumulative timing"
             );
-            let mut extras = vec![];
-            for (drive, runtime) in spec.extra_drives.iter().zip(&self.extras) {
-                let mut drive_roots = runtime_roots.clone();
-                if drive.is_volume() {
-                    // Catalog paths are mutable and may be explicitly deleted.
-                    // The capture owns its own immutable copies of these lowers.
-                    let parent = drive
-                        .image_config_path()
-                        .parent()
-                        .context("volume config parent")?;
-                    drive_roots.push(fs::canonicalize(parent)?);
-                }
-                let destination = drive
-                    .snapshot_output_dir()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| at.join("drives").join(drive.drive_id()));
-                let layer_name = drive.snapshot_output_dir().map_or_else(
-                    || "snapshot.commit".to_owned(),
-                    |_| format!("snapshot-{}.commit", uuid::Uuid::new_v4()),
-                );
-                let mut config = restack_snapshot_overlaybd_device_with_runtime_roots(
-                    &runtime.device,
-                    drive.read_only(),
-                    &runtime.image_config_path,
-                    &destination,
-                    &layer_name,
-                    "drive",
-                    &drive_roots,
-                )
-                .await?;
-                if drive.is_volume() && drive.snapshot_output_dir().is_some() {
-                    drive_roots.push(fs::canonicalize(&destination)?);
-                    config = stage_overlaybd_snapshot_from_live_runtime(
-                        &config,
-                        &at.join("drives").join(drive.drive_id()),
-                        None,
-                        &drive_roots,
-                    )
-                    .await?;
-                }
-                extras.push(
-                    drive
-                        .with_image_config_path(config)
-                        .try_with_virtual_size(runtime.actual_virtual_size)?,
-                );
-            }
             let attached = extras
                 .iter()
                 .filter(|drive| !drive.is_volume())
@@ -450,7 +446,7 @@ impl RuntimeStarted {
                 .collect::<Vec<_>>();
             let mut manifest = SandboxSnapshotManifest::new_dragonball(
                 envelope.identity.clone(),
-                at.join("vm-state.json"),
+                memory_dir.join("vm-state.json"),
                 memory_config_path,
                 envelope.memory_layout.image_size,
                 root_config.clone(),
@@ -487,7 +483,7 @@ impl RuntimeStarted {
                 launch: launch.clone(),
                 recording_policy,
                 storage: root_guard.map(|guard| StorageCaptureOwner::new(at.into(), guard)),
-                _memory_base: self.memory_base.clone(),
+                memory_owner,
                 runnable_snapshot: self
                     .resources
                     .retained_artifacts

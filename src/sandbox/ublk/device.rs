@@ -291,7 +291,7 @@ impl UblkDeviceManager {
     /// Tell the daemon the sandbox owning `device_key` finished booting,
     /// releasing held background downloads. Best-effort: failures only mean
     /// the downloads start after the fallback timeout instead.
-    #[cfg(feature = "hypervisor-firecracker")]
+    #[cfg(any(feature = "hypervisor-firecracker", feature = "hypervisor-dragonball"))]
     pub(crate) async fn notify_sandbox_ready(&self, device_key: &Path) {
         let Ok(client) = self.require_client() else {
             return;
@@ -804,6 +804,33 @@ impl Drop for RetirementArtifacts {
     }
 }
 
+// Registered before scheduling so even an unpolled cleanup cannot strand waiters.
+struct SharedReleaseCompletion<'a> {
+    releases: &'a DashMap<PathBuf, Arc<Notify>>,
+    key: PathBuf,
+    notify: Arc<Notify>,
+}
+
+impl<'a> SharedReleaseCompletion<'a> {
+    fn new(releases: &'a DashMap<PathBuf, Arc<Notify>>, key: PathBuf) -> Self {
+        let notify = Arc::new(Notify::new());
+        releases.insert(key.clone(), notify.clone());
+        Self {
+            releases,
+            key,
+            notify,
+        }
+    }
+}
+
+impl Drop for SharedReleaseCompletion<'_> {
+    fn drop(&mut self) {
+        self.releases
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.notify));
+        self.notify.notify_waiters();
+    }
+}
+
 impl Drop for SharedReadOnlyDeviceInner {
     fn drop(&mut self) {
         if self.released.swap(true, Ordering::AcqRel) {
@@ -820,10 +847,10 @@ impl Drop for SharedReadOnlyDeviceInner {
             dev_id,
             device_path,
         };
-        let notify = Arc::new(Notify::new());
-        UblkDeviceManager::global()
-            .shared_readonly_releases
-            .insert(key.clone(), Arc::clone(&notify));
+        let completion = SharedReleaseCompletion::new(
+            &UblkDeviceManager::global().shared_readonly_releases,
+            key.clone(),
+        );
         info!(
             dev_id,
             key = %key.display(),
@@ -843,14 +870,11 @@ impl Drop for SharedReadOnlyDeviceInner {
                 dev_id,
                 "tokio runtime unavailable during drop, skipping async device cleanup"
             );
-            UblkDeviceManager::global()
-                .shared_readonly_releases
-                .remove_if(&key, |_, existing| Arc::ptr_eq(existing, &notify));
-            notify.notify_waiters();
             return;
         };
         handle.spawn(async move {
-            let _ = release_shared_readonly_device(key, device, notify, pooled, artifacts).await;
+            let _ =
+                release_shared_readonly_device(key, device, completion, pooled, artifacts).await;
         });
     }
 }
@@ -858,7 +882,7 @@ impl Drop for SharedReadOnlyDeviceInner {
 async fn release_shared_readonly_device(
     key: PathBuf,
     device: UblkDevice,
-    notify: Arc<Notify>,
+    _completion: SharedReleaseCompletion<'static>,
     pooled: bool,
     mut artifacts: RetirementArtifacts,
 ) -> Result<()> {
@@ -885,10 +909,7 @@ async fn release_shared_readonly_device(
     } else {
         artifacts.0.clear();
     }
-    UblkDeviceManager::global()
-        .shared_readonly_releases
-        .remove_if(&key, |_, existing| Arc::ptr_eq(existing, &notify));
-    notify.notify_waiters();
+
     release_result
 }
 
@@ -902,6 +923,11 @@ pub(crate) struct SharedReadOnlyDevice {
 }
 
 impl SharedReadOnlyDevice {
+    #[cfg(feature = "hypervisor-firecracker")]
+    pub(crate) fn retain_artifact(&self, artifact: Arc<dyn std::any::Any + Send + Sync>) {
+        self.inner.artifacts.lock().unwrap().push(artifact);
+    }
+
     /// Identity of this live device generation, not a recyclable kernel ID.
     /// The caller must retain a clone while using this identity.
     pub(crate) fn prefetch_identity(&self) -> usize {
@@ -919,6 +945,14 @@ impl SharedReadOnlyDevice {
     }
 
     pub async fn release(self) -> Result<()> {
+        crate::sandbox::runtime_cleanup::CleanupTask::new(
+            async move { self.release_owned().await },
+        )?
+        .wait()
+        .await
+    }
+
+    async fn release_owned(self) -> Result<()> {
         let key = self.inner.image_config_key.clone();
         let entry = UblkDeviceManager::global()
             .shared_readonly_devices
@@ -932,15 +966,15 @@ impl SharedReadOnlyDevice {
 
         let key = self.inner.image_config_key.clone();
         let device = self.inner.device.clone();
-        let notify = Arc::new(Notify::new());
-        UblkDeviceManager::global()
-            .shared_readonly_releases
-            .insert(key.clone(), Arc::clone(&notify));
+        let completion = SharedReleaseCompletion::new(
+            &UblkDeviceManager::global().shared_readonly_releases,
+            key.clone(),
+        );
         drop(entry);
         drop(self.inner.cache_fd.lock().unwrap().take());
         let artifacts =
             RetirementArtifacts(std::mem::take(&mut *self.inner.artifacts.lock().unwrap()));
-        release_shared_readonly_device(key, device, notify, self.inner.pooled, artifacts).await
+        release_shared_readonly_device(key, device, completion, self.inner.pooled, artifacts).await
     }
 }
 /// A handle to a single `/dev/ublkb<N>` device.
@@ -951,6 +985,15 @@ impl SharedReadOnlyDevice {
 pub(crate) struct UblkDevice {
     dev_id: u32,
     device_path: PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn unallocated_test_device() -> UblkDevice {
+    // Only for unpolled cleanup or tests with an unavailable daemon; never send this ID.
+    UblkDevice {
+        dev_id: u32::MAX,
+        device_path: "/unpolled-test-device".into(),
+    }
 }
 
 impl UblkDevice {
@@ -996,6 +1039,28 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_shared_release_notifies_same_image_waiters() {
+        let releases = DashMap::new();
+        let completion = SharedReleaseCompletion::new(&releases, "image.json".into());
+        let notify = completion.notify.clone();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let unpolled = async move {
+            let _completion = completion;
+            std::future::pending::<()>().await;
+        };
+        drop(unpolled);
+        assert!(
+            releases.is_empty(),
+            "cancelled release stranded the image key"
+        );
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn uncertain_retirement_retains_artifact_owner() {

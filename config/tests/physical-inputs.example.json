@@ -1,0 +1,10 @@
+{
+  "private_ip": "10.20.0.10",
+  "server": "/opt/agentenv-test/bin/server",
+  "daemon": "/opt/agentenv-test/bin/uvm-ublk-daemon",
+  "ublk_cli": "/opt/agentenv-test/bin/uvm-ublk",
+  "assets": "/opt/agentenv-test/assets.json",
+  "deps": "/opt/agentenv-test/deps",
+  "s3": "/opt/agentenv-test/bin/minio",
+  "registry": "/opt/agentenv-test/bin/registry"
+}

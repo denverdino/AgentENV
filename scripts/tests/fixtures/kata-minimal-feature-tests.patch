@@ -1,0 +1,247 @@
+From 3d5bb6569b6fb1c7116721f2dbd09d22170a6fe5 Mon Sep 17 00:00:00 2001
+From: Li Yi <denverdino@gmail.com>
+Date: Tue, 6 Oct 2026 07:52:55 +0800
+Subject: [PATCH] fix: respect enabled features in Dragonball block tests
+
+Use PCI only when host-device is enabled and assert the existing hotplug-dependent removal contract. Verify unsupported PCI insertion leaves configuration unchanged.
+
+Validated on Linux x86_64/KVM: original nine failures reproduced; corrected minimal profile 134 passed, 2 ignored; focused cases 10 passed. Expanded host-device/hotplug/dbs-upcall profile retains 8 passed and the existing PCI rate-limiter downcast failure. Runtime code and feature contracts are unchanged.
+---
+ src/dragonball/src/api/v1/vmm_action.rs       | 35 +++++++----
+ .../src/device_manager/blk_dev_mgr.rs         | 58 ++++++++++++++-----
+ 2 files changed, 66 insertions(+), 27 deletions(-)
+
+diff --git a/src/dragonball/src/api/v1/vmm_action.rs b/src/dragonball/src/api/v1/vmm_action.rs
+index b70f85107..f56623dc1 100644
+--- a/src/dragonball/src/api/v1/vmm_action.rs
++++ b/src/dragonball/src/api/v1/vmm_action.rs
+@@ -1867,7 +1867,7 @@ mod tests {
+                     queue_size: 256,
+                     use_shared_irq: None,
+                     use_generic_irq: None,
+-                    use_pci_bus: Some(true),
++                    use_pci_bus: Some(cfg!(feature = "host-device")),
+                 }),
+                 InstanceState::Uninitialized,
+                 &|result| {
+@@ -1939,21 +1939,32 @@ mod tests {
+                     assert_eq!(err_string, expected_err);
+                 },
+             ),
+-            // invalid id
++            // Removal is unavailable without hotplug, even before boot.
+             TestData::new(
+                 VmmAction::RemoveBlockDevice(String::from("1")),
+                 InstanceState::Uninitialized,
+                 &|result| {
+-                    assert!(matches!(
+-                        result,
+-                        Err(VmmActionError::Block(BlockDeviceError::InvalidDeviceId(_)))
+-                    ));
+-                    let err_string = format!("{}", result.unwrap_err());
+-                    let expected_err = String::from(
+-                        "virtio-blk device error: \
+-                    invalid block device id '1'",
+-                    );
+-                    assert_eq!(err_string, expected_err);
++                    if cfg!(feature = "hotplug") {
++                        assert!(matches!(
++                            result,
++                            Err(VmmActionError::Block(BlockDeviceError::InvalidDeviceId(_)))
++                        ));
++                        assert_eq!(
++                            result.unwrap_err().to_string(),
++                            "virtio-blk device error: invalid block device id '1'"
++                        );
++                    } else {
++                        assert!(matches!(
++                            result,
++                            Err(VmmActionError::Block(
++                                BlockDeviceError::UpdateNotAllowedPostBoot
++                            ))
++                        ));
++                        assert_eq!(
++                            result.unwrap_err().to_string(),
++                            "virtio-blk device error: block device does not support runtime update"
++                        );
++                    }
+                 },
+             ),
+         ];
+diff --git a/src/dragonball/src/device_manager/blk_dev_mgr.rs b/src/dragonball/src/device_manager/blk_dev_mgr.rs
+index 01c466990..c149e9bda 100644
+--- a/src/dragonball/src/device_manager/blk_dev_mgr.rs
++++ b/src/dragonball/src/device_manager/blk_dev_mgr.rs
+@@ -1387,6 +1387,34 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(not(feature = "host-device"))]
++    #[test]
++    fn test_insert_pci_block_device_without_host_device_preserves_config() {
++        skip_if_kvm_unaccessable!();
++        let dummy_file = TempFile::new().unwrap();
++        let mut vm = crate::vm::tests::create_vm_instance();
++        let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
++        let (sender, _receiver) = channel();
++        let config = BlockDeviceConfigInfo {
++            drive_id: "pci-root".into(),
++            path_on_host: dummy_file.as_path().to_owned(),
++            is_root_device: true,
++            use_pci_bus: Some(true),
++            ..Default::default()
++        };
++
++        assert!(matches!(
++            vm.device_manager_mut()
++                .block_manager
++                .insert_device(ctx, config, sender),
++            Err(BlockDeviceError::DeviceManager(
++                DeviceMgrError::InvalidOperation
++            ))
++        ));
++        assert!(vm.device_manager().block_manager.info_list.is_empty());
++        assert!(!vm.device_manager().block_manager.has_root_block_device());
++    }
++
+     #[test]
+     fn test_add_non_root_block_device() {
+         skip_if_kvm_unaccessable!();
+@@ -1410,7 +1438,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let mut vm = crate::vm::tests::create_vm_instance();
+@@ -1489,7 +1517,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+         let (sender, _receiver) = channel();
+         vm.device_manager_mut()
+@@ -1570,7 +1598,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let mut vm = crate::vm::tests::create_vm_instance();
+@@ -1615,7 +1643,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let dummy_file_2 = TempFile::new().unwrap();
+@@ -1637,7 +1665,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let mut vm = crate::vm::tests::create_vm_instance();
+@@ -1678,7 +1706,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let dummy_file_2 = TempFile::new().unwrap();
+@@ -1700,7 +1728,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let dummy_file_3 = TempFile::new().unwrap();
+@@ -1722,7 +1750,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let mut vm = crate::vm::tests::create_vm_instance();
+@@ -1786,7 +1814,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let dummy_file_2 = TempFile::new().unwrap();
+@@ -1808,7 +1836,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let dummy_file_3 = TempFile::new().unwrap();
+@@ -1830,7 +1858,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let mut vm = crate::vm::tests::create_vm_instance();
+@@ -1895,7 +1923,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let dummy_file_2 = TempFile::new().unwrap();
+@@ -1917,7 +1945,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+ 
+         let mut vm = crate::vm::tests::create_vm_instance();
+@@ -2017,7 +2045,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+         let root_block_device_new = BlockDeviceConfigInfo {
+             path_on_host: dummy_path_2,
+@@ -2036,7 +2064,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(true),
++            use_pci_bus: Some(cfg!(feature = "host-device")),
+         };
+         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+         vm.device_manager_mut()
+-- 
+2.54.0 (Apple Git-157)
+

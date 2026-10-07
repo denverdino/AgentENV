@@ -25,8 +25,7 @@ use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
 use crate::sandbox::storage_snapshot::{
-    build_mem_snapshot_image_config, restack_snapshot_overlaybd_device,
-    restack_snapshot_overlaybd_rootfs,
+    build_mem_snapshot_image_config, restack_snapshot_overlaybd_rootfs,
 };
 use crate::snapshot::SandboxSnapshotManifest;
 
@@ -165,7 +164,7 @@ use crate::sandbox::storage_snapshot::{managed_snapshot_base, StorageCaptureOwne
 pub struct FirecrackerSandbox {
     id: SandboxId,
     launch: LaunchMode,
-    work_dir: TempDir,
+    work_dir: Arc<TempDir>,
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
     resources: SandboxResources,
@@ -183,7 +182,10 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Capture/workspace owner supplied only by the private startup recorder.
+    pub(super) recording_lease: Option<Arc<dyn std::any::Any + Send + Sync>>,
     template_build: bool,
+    cleanup_task: Option<crate::sandbox::runtime_cleanup::CleanupTask>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -271,45 +273,14 @@ impl FirecrackerCaptureArtifacts {
     }
 }
 
-fn snapshot_config_for_fork(
+async fn snapshot_config_for_fork(
     source: &FirecrackerSnapshotConfig,
     child: &SandboxForkSpec,
 ) -> Result<FirecrackerSnapshotConfig> {
     let mut snapshot = source.clone();
-    if child.replace_drive_ids.is_empty() && child.extra_drives.is_empty() {
-        return Ok(snapshot);
-    }
-    let mut replacement_ids = std::collections::HashSet::new();
-    for (drive_id, replacement_id) in &child.replace_drive_ids {
-        anyhow::ensure!(
-            replacement_ids.insert(replacement_id.clone()),
-            "duplicate fork replacement drive {}",
-            replacement_id
-        );
-        let replacement = child
-            .extra_drives
-            .iter()
-            .find(|drive| drive.drive_id() == replacement_id)
-            .ok_or_else(|| anyhow::anyhow!("missing fork replacement drive {replacement_id}"))?;
-        let index = snapshot
-            .common
-            .extra_drives
-            .iter()
-            .position(|drive| drive.drive_id() == drive_id)
-            .ok_or_else(|| anyhow::anyhow!("fork source drive {drive_id} does not exist"))?;
-        snapshot.common.extra_drives[index] = replacement.clone();
-    }
-    for drive in &child.extra_drives {
-        anyhow::ensure!(
-            snapshot
-                .common
-                .extra_drives
-                .iter()
-                .any(|existing| existing.drive_id() == drive.drive_id()),
-            "fork cannot append drive {} to captured Firecracker state",
-            drive.drive_id()
-        );
-    }
+    snapshot.common.extra_drives =
+        crate::sandbox::volume_snapshot::bind_fork_drives(&source.common.extra_drives, child)
+            .await?;
     Ok(snapshot)
 }
 
@@ -369,20 +340,37 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
+        let volumes = snapshot_config
+            .common
+            .extra_drives
+            .iter()
+            .filter(|drive| drive.is_volume())
+            .cloned()
+            .collect();
         Ok(CapturedSandboxSnapshot::new(
             manifest,
             FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
         )
+        .with_volume_drives(volumes)
         .with_recording_factory(super::startup_pack::startup_recording))
     }
 
     async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         match self.pause_to_dir(at).await {
-            Ok((snapshot_config, manifest)) => Ok(CapturedSandboxSnapshot::new(
-                manifest,
-                (snapshot_config, at.to_path_buf()),
-            )
-            .with_recording_factory(super::startup_pack::template_startup_recording)),
+            Ok((snapshot_config, manifest)) => {
+                let volumes = snapshot_config
+                    .common
+                    .extra_drives
+                    .iter()
+                    .filter(|drive| drive.is_volume())
+                    .cloned()
+                    .collect();
+                Ok(
+                    CapturedSandboxSnapshot::new(manifest, (snapshot_config, at.to_path_buf()))
+                        .with_volume_drives(volumes)
+                        .with_recording_factory(super::startup_pack::template_startup_recording),
+                )
+            }
             Err(error) => self.recover_capture_failure("capture", error).await,
         }
     }
@@ -427,32 +415,30 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        let children = spec
-            .iter()
-            .map(|child| {
-                let physical_count = snapshot_config.common.physical_extra_drive_count;
-                if child.replace_drive_ids.iter().any(|(drive_id, _)| {
-                    snapshot_config
-                        .common
-                        .extra_drives
-                        .iter()
-                        .take(physical_count)
-                        .any(|drive| drive.drive_id() == drive_id)
-                }) {
-                    return Err(anyhow::anyhow!(
-                        "fork replacement drives must refer to launch-time volume drives"
-                    ));
-                }
-                let child_snapshot_config = snapshot_config_for_fork(&snapshot_config, child)?;
-                Self::from_snapshot_config_with_override(
-                    child_snapshot_config,
-                    child.sandbox_id,
-                    child.envd_access_token.clone(),
-                )
-                .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
-                .context("build forked sandbox")
-            })
-            .collect::<Vec<_>>();
+        let children = futures::future::join_all(spec.iter().map(|child| async {
+            let physical_count = snapshot_config.common.physical_extra_drive_count;
+            if child.replace_drive_ids.iter().any(|(drive_id, _)| {
+                snapshot_config
+                    .common
+                    .extra_drives
+                    .iter()
+                    .take(physical_count)
+                    .any(|drive| drive.drive_id() == drive_id)
+            }) {
+                return Err(anyhow::anyhow!(
+                    "fork replacement drives must refer to launch-time volume drives"
+                ));
+            }
+            let child_snapshot_config = snapshot_config_for_fork(&snapshot_config, child).await?;
+            Self::from_snapshot_config_with_override(
+                child_snapshot_config,
+                child.sandbox_id,
+                child.envd_access_token.clone(),
+            )
+            .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
+            .context("build forked sandbox")
+        }))
+        .await;
 
         let start_results = futures::future::join_all(children.into_iter().map(|child| {
             async move {
@@ -863,6 +849,10 @@ impl FirecrackerSandbox {
     /// This only waits for the Firecracker API socket to be available and
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
+        if let Some(cleanup) = self.cleanup_task.as_ref() {
+            cleanup.wait().await?;
+        }
+        self.cleanup_task = None;
         self.prepare_tools_drive().await?;
         self.launch.validate()?;
         trace!("launch config validated");
@@ -1234,10 +1224,108 @@ impl FirecrackerSandbox {
             envd.invalidate();
         }
         self.frozen_volume_mounts.clear();
+        self.begin_cleanup()?;
+        if let Some(cleanup) = self.cleanup_task.as_ref() {
+            cleanup.wait().await?;
+        }
+        Ok(())
+    }
 
-        self.resources.release(timeout).await?;
+    fn cleanup_artifacts(&self) -> crate::sandbox::runtime_cleanup::RetainedArtifacts {
+        let mut owners: Vec<Arc<dyn std::any::Any + Send + Sync>> = vec![self.work_dir.clone()];
+        if let Some(root) = self.live_snapshot_root.as_ref() {
+            owners.push(root.clone());
+        }
+        if let Some(root) = self.launch.managed_snapshot_root() {
+            owners.push(root);
+        }
+        if let Some(lease) = self.recording_lease.as_ref() {
+            owners.push(lease.clone());
+        }
+        crate::sandbox::runtime_cleanup::RetainedArtifacts(Some(owners))
+    }
 
-        debug!("firecracker sandbox stopped");
+    /// Called only after confirmed VMM exit. Move each device into one operation;
+    /// never retry a bare ID after a lost daemon reply or cancelled waiter.
+    fn begin_cleanup(&mut self) -> Result<()> {
+        if self.cleanup_task.is_some() {
+            return Ok(());
+        }
+        let mut artifacts = self.cleanup_artifacts();
+        let devices = std::mem::take(&mut self.resources.extra_drive_runtimes);
+        let root = self.resources.rootfs_runtime.take();
+        let dedicated = self.resources.mem_dedicated_device.take();
+        let memory = self.resources.mem_ublk_device.take();
+        let tools = self.resources.tools_ublk_device.take();
+        let slot = self.resources.network_slot.take();
+        let extension = self.resources.custom_extension_hook_guard.take();
+        let prefetch = self.resources.startup_prefetch_task.take();
+        let timeout = self.runtime_policy.socket_timeout;
+        if devices.is_empty()
+            && root.is_none()
+            && dedicated.is_none()
+            && memory.is_none()
+            && tools.is_none()
+            && slot.is_none()
+            && extension.is_none()
+            && prefetch.is_none()
+        {
+            artifacts.0.take();
+            return Ok(());
+        }
+        self.cleanup_task = Some(crate::sandbox::runtime_cleanup::CleanupTask::new(
+            async move {
+                // Keep the FC release order. An uncertain device result must not
+                // prevent independent cleanup, or cause a bare-ID retry later.
+                let mut errors = Vec::new();
+                if let Some(runtime) = root {
+                    if let Err(error) = UblkDeviceManager::global()
+                        .release_device(&runtime.device)
+                        .await
+                    {
+                        errors.push(format!("release rootfs: {error:#}"));
+                    }
+                }
+                if let Some(device) = tools {
+                    if let Err(error) = device.release().await {
+                        errors.push(format!("release tools: {error:#}"));
+                    }
+                }
+                if let Some(device) = dedicated {
+                    if let Err(error) = UblkDeviceManager::global().delete_device(&device).await {
+                        errors.push(format!("delete dedicated memory: {error:#}"));
+                    }
+                }
+                for device in devices {
+                    if let Err(error) = UblkDeviceManager::global()
+                        .release_device(&device.device)
+                        .await
+                    {
+                        errors.push(format!("release extra drive: {error:#}"));
+                    }
+                }
+                if let Some(guard) = extension {
+                    guard.stop().await;
+                }
+                if let Some(slot) = slot {
+                    if let Err(error) = NetworkManager::global().release(slot) {
+                        errors.push(format!("release network: {error:#}"));
+                    }
+                }
+                // The prefetch reader holds its own lease until it stops.
+                if let Some(task) = prefetch {
+                    task.stop(timeout).await;
+                }
+                if let Some(device) = memory {
+                    if let Err(error) = device.release().await {
+                        errors.push(format!("release shared memory: {error:#}"));
+                    }
+                }
+                anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+                artifacts.0.take();
+                Ok(())
+            },
+        )?);
         Ok(())
     }
 
@@ -1461,14 +1549,37 @@ fn relocate_warm_log(src: Option<&Path>, target: &Path) -> Result<()> {
 
 // ── Drop ─────────────────────────────────────────────────────────────────────
 
-/// Release resources when the sandbox is dropped without `stop()`.
+/// Ensure network resources are cleaned up when the sandbox is dropped.
+/// This handles cases where stop() wasn't called (panic, early return, etc.)
+///
+/// Confirm VMM exit before scheduling the single device/network cleanup owner.
+/// If exit or device release cannot be confirmed, retain backing artifacts.
 impl Drop for FirecrackerSandbox {
     fn drop(&mut self) {
         if let Some(envd) = self.envd_instance.as_ref() {
             envd.invalidate();
         }
-        // Release before the work directory and Firecracker process drop.
-        drop(std::mem::take(&mut self.resources));
+        if let Some(task) = self.resources.startup_prefetch_task.as_ref() {
+            task.cancel();
+        }
+        if let Err(error) = self
+            .fc_instance
+            .terminate_blocking(std::time::Duration::from_secs(10))
+        {
+            tracing::error!(%error, "retaining Firecracker leases: process exit unconfirmed");
+            let _artifacts = self.cleanup_artifacts();
+            std::mem::forget(self.resources.network_slot.take());
+            std::mem::forget(self.resources.rootfs_runtime.take());
+            std::mem::forget(self.resources.mem_ublk_device.take());
+            std::mem::forget(self.resources.tools_ublk_device.take());
+            std::mem::forget(self.resources.mem_dedicated_device.take());
+            std::mem::forget(std::mem::take(&mut self.resources.extra_drive_runtimes));
+            return;
+        }
+        if let Err(error) = self.begin_cleanup() {
+            warn!(%error, "Firecracker cleanup unavailable; retaining backing artifacts");
+        }
+        // Dropping the waiter detaches the sole cleanup owner, including on shutdown.
     }
 }
 
@@ -1492,7 +1603,7 @@ impl FirecrackerSandbox {
                 LaunchMode::Resume(config) => config.common.rootfs_virtual_size,
             },
             launch,
-            work_dir,
+            work_dir: Arc::new(work_dir),
             fc_instance,
             resources: SandboxResources::default(),
             current_network_policy,
@@ -1501,7 +1612,9 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
+            recording_lease: None,
             template_build: false,
+            cleanup_task: None,
         })
     }
 
@@ -2355,53 +2468,13 @@ impl FirecrackerSandbox {
     }
 
     async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
-        let extra_drives = &self.launch.common().extra_drives;
-        if extra_drives.is_empty() {
-            return Ok(Vec::new());
-        }
-        if extra_drives.len() != self.resources.extra_drive_runtimes.len() {
-            bail!(
-                "extra drive bookkeeping mismatch: {} configured drives but {} prepared devices",
-                extra_drives.len(),
-                self.resources.extra_drive_runtimes.len()
-            );
-        }
-
-        let mut snapped = Vec::with_capacity(extra_drives.len());
-        for (drive, runtime) in extra_drives
-            .iter()
-            .zip(self.resources.extra_drive_runtimes.iter())
-        {
-            let persistent_output_dir = drive.snapshot_output_dir();
-            let output_dir = persistent_output_dir.map_or_else(
-                || snapshot_dir.join("drives").join(drive.drive_id()),
-                PathBuf::from,
-            );
-            // A volume reuses its backing directory across pauses. Preserve every
-            // sealed upper under a unique name so a later restack cannot overwrite
-            // a lower that is still referenced by image.json.
-            let snapshot_layer_file_name = persistent_output_dir.map_or_else(
-                || "snapshot.commit".to_owned(),
-                |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
-            );
-            let snapshot_image_config_path = restack_snapshot_overlaybd_device(
-                &runtime.device,
-                drive.read_only(),
-                &runtime.image_config_path,
-                &output_dir,
-                &snapshot_layer_file_name,
-                "drive",
-            )
-            .await
-            .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
-            snapped.push(
-                drive
-                    .with_image_config_path(snapshot_image_config_path)
-                    .try_with_virtual_size(runtime.actual_virtual_size)?,
-            );
-        }
-
-        Ok(snapped)
+        crate::sandbox::volume_snapshot::capture_extra_drives(
+            &self.launch.common().extra_drives,
+            &self.resources.extra_drive_runtimes,
+            snapshot_dir,
+            crate::sandbox::storage_snapshot::canonicalized_runtime_owned_roots(),
+        )
+        .await
     }
 
     fn has_writable_persistent_volumes(&self) -> bool {
@@ -2578,6 +2651,122 @@ mod tests {
             "0.1.0".to_string(),
             "user-image.json".into(),
         )
+    }
+
+    #[tokio::test]
+    async fn recording_cleanup_retains_failed_backing_and_releases_successful_backing() -> Result<()>
+    {
+        UblkDeviceManager::init_global(None).await;
+        assert!(!UblkDeviceManager::global().is_available());
+        let fixture = tempfile::tempdir()?;
+        for fail_release in [false, true] {
+            let workspace = Arc::new(tempfile::tempdir_in(fixture.path())?);
+            let backing = workspace.path().join("memory.layer");
+            std::fs::write(&backing, b"recording backing")?;
+            let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+            sandbox.work_dir = Arc::new(tempfile::tempdir_in(fixture.path())?);
+            sandbox.recording_lease = Some(workspace.clone());
+            if fail_release {
+                sandbox.mem_dedicated_device =
+                    Some(crate::sandbox::ublk::unallocated_test_device());
+            }
+            drop(workspace); // Publisher/capture no longer owns the workspace.
+            assert_eq!(sandbox.stop().await.is_err(), fail_release);
+            drop(sandbox);
+            assert_eq!(backing.exists(), fail_release, "recording lease lifetime");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recording_cleanup_retains_backing_when_runtime_stops_before_poll() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = Arc::new(tempfile::tempdir_in(fixture.path())?);
+        let backing = workspace.path().to_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        {
+            let _entered = runtime.enter();
+            let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+            sandbox.work_dir = Arc::new(tempfile::tempdir_in(fixture.path())?);
+            sandbox.recording_lease = Some(workspace);
+            // No RPC runs: this runtime is deliberately never polled.
+            sandbox.mem_dedicated_device = Some(crate::sandbox::ublk::unallocated_test_device());
+            drop(sandbox);
+        }
+        runtime.shutdown_background();
+        assert!(backing.exists(), "unpolled cleanup lost recording backing");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_device_cleanup_still_returns_network_slot_and_retains_backing() -> Result<()> {
+        UblkDeviceManager::init_global(None).await;
+        assert!(!UblkDeviceManager::global().is_available());
+        let fixture = tempfile::tempdir()?;
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.work_dir = Arc::new(tempfile::tempdir_in(fixture.path())?);
+        let backing = sandbox.work_dir.path().to_path_buf();
+        sandbox.mem_dedicated_device = Some(crate::sandbox::ublk::unallocated_test_device());
+        sandbox.extra_drive_runtimes.push(OverlaybdRuntimeHandle {
+            device: crate::sandbox::ublk::unallocated_test_device(),
+            image_config_path: backing.join("extra/image.json"),
+            actual_virtual_size: 4096,
+        });
+        let manager = NetworkManager::global_for_cleanup_test();
+        let slot = manager.allocate_slot(301)?;
+        let index = slot.idx;
+        sandbox.network_slot = Some(slot);
+
+        let error = sandbox.stop().await.unwrap_err();
+        let replacement = manager
+            .allocate_slot(index)
+            .expect("device failure must not leak the network allocation");
+        assert!(error.to_string().contains("dedicated memory"));
+        assert!(error.to_string().contains("extra drive"));
+        // Cached failure must not repeat cleanup and free this new owner's slot.
+        assert!(sandbox.stop().await.is_err());
+        drop(sandbox);
+        assert!(manager.allocate_slot(index).is_err());
+        manager.release(replacement)?;
+        assert!(
+            backing.exists(),
+            "uncertain device release lost its backing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_unowned_writable_volume() -> Result<()> {
+        let mut common = fresh_config().common;
+        common.extra_drives =
+            vec![
+                ExtraDrive::try_new_overlaybd("volume", "captured/image.json", false)?
+                    .with_volume_snapshot_output_dir(None),
+            ];
+        let source = FirecrackerSnapshotConfig {
+            common,
+            vm_state_path: "snapshot/state".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: "snapshot/memory.json".into(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+            pack_recording: false,
+            memory_startup_pack: None,
+        };
+        let child = SandboxForkSpec {
+            sandbox_id: SandboxId::new(),
+            envd_access_token: None,
+            extra_drives: vec![],
+            replace_drive_ids: vec![],
+        };
+        assert!(
+            snapshot_config_for_fork(&source, &child).await.is_err(),
+            "writable volumes need independent child ownership"
+        );
+        Ok(())
     }
 
     #[test]

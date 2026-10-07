@@ -4,12 +4,16 @@ use std::{
 };
 
 use agentenv_vmm_protocol::{runtime::MemoryLayout, runtime_memory::FrozenMemoryMap};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use overlaybd::virtual_file::VirtualFile;
 
 use super::capture::DragonballCaptureArtifacts;
-use crate::sandbox::memory_snapshot::{write_memory_overlaybd, MemorySegment};
-use crate::sandbox::storage_snapshot::build_mem_snapshot_image_config;
+use crate::sandbox::memory_snapshot::{
+    write_memory_overlaybd, write_sparse_memory_overlaybd, MemorySegment,
+};
+use crate::sandbox::storage_snapshot::{
+    build_mem_snapshot_image_config_with_runtime_roots, canonicalized_runtime_owned_roots,
+};
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, SharedReadOnlyDevice, UblkCreateSpec, UblkDeviceManager,
 };
@@ -28,23 +32,37 @@ pub(super) async fn write_incremental_memory(
         );
     }
     let started = std::time::Instant::now();
-    let segments = capture_memory_segments(
-        map,
-        base.map(|base| &base.artifacts.envelope.memory_layout),
-        reader.as_ref(),
-    )
-    .await?;
-    let scan_ms = started.elapsed().as_millis();
+    let segments = memory_segments(map, base.map(|base| &base.artifacts.envelope.memory_layout))?;
     let layout = map.validate().map_err(anyhow::Error::msg)?;
-    let payload_bytes: u64 = segments.iter().map(|segment| segment.length).sum();
+    let source_bytes: u64 = segments.iter().map(|segment| segment.length).sum();
     let write_started = std::time::Instant::now();
-    let layer = write_memory_overlaybd(reader, &segments, layout.image_size, output, mode).await?;
+    let layer = if base.is_some() {
+        // Delta zeros must mask nonzero content in ancestral layers.
+        write_memory_overlaybd(reader, &segments, layout.image_size, output, mode).await?
+    } else {
+        write_sparse_memory_overlaybd(reader, &segments, layout.image_size, output, mode).await?
+    };
     let write_ms = write_started.elapsed().as_millis();
-    let config = build_mem_snapshot_image_config(
+    let mut memory_roots = canonicalized_runtime_owned_roots().to_vec();
+    if let Some(base) = base {
+        // Capture/paused files can be outside the configured managed roots.
+        // Adopt these lowers before releasing the live base's device lease.
+        memory_roots.push(
+            base.artifacts
+                .manifest
+                .memory
+                .image_config_path
+                .parent()
+                .context("base memory config parent")?
+                .canonicalize()?,
+        );
+    }
+    let config = build_mem_snapshot_image_config_with_runtime_roots(
         base.map(|base| base.artifacts.manifest.memory.image_config_path.as_path()),
         &layer,
         output,
         mode,
+        &memory_roots,
     )
     .await?;
     let path = output.join("memory-image.json");
@@ -52,60 +70,12 @@ pub(super) async fn write_incremental_memory(
     tracing::info!(
         incremental = base.is_some(),
         memory_bytes = layout.image_size,
-        payload_bytes,
-        scan_ms,
+        source_bytes,
         write_ms,
         total_ms = started.elapsed().as_millis(),
         "Dragonball memory capture completed"
     );
     Ok(path)
-}
-
-async fn capture_memory_segments(
-    map: &FrozenMemoryMap,
-    base: Option<&MemoryLayout>,
-    reader: &dyn VirtualFile,
-) -> Result<Vec<MemorySegment>> {
-    let segments = memory_segments(map, base)?;
-    // Only a standalone full layer has an implicit zero base. In a delta,
-    // explicit zero pages must continue masking nonzero ancestral content.
-    if base.is_some() {
-        return Ok(segments);
-    }
-    // The caller retains a frozen read lease through BOTH this bounded scan
-    // and the writer's reread. Do not advance the capture's dirty baseline.
-    let mut sparse: Vec<MemorySegment> = Vec::new();
-    for segment in segments {
-        let mut offset = 0;
-        while offset < segment.length {
-            let length = (segment.length - offset).min(1024 * 1024) as usize;
-            let bytes = reader
-                .read_at(segment.source_offset + offset, length)
-                .await?;
-            ensure!(bytes.len() == length, "short frozen RAM scan");
-            for (index, page) in bytes.as_chunks::<4096>().0.iter().enumerate() {
-                if page.iter().any(|byte| *byte != 0) {
-                    let relative = offset + (index * 4096) as u64;
-                    let image_offset = segment.image_offset + relative;
-                    let source_offset = segment.source_offset + relative;
-                    if let Some(last) = sparse.last_mut().filter(|last| {
-                        last.image_offset + last.length == image_offset
-                            && last.source_offset + last.length == source_offset
-                    }) {
-                        last.length += 4096;
-                    } else {
-                        sparse.push(MemorySegment {
-                            image_offset,
-                            source_offset,
-                            length: 4096,
-                        });
-                    }
-                }
-            }
-            offset += length as u64;
-        }
-    }
-    Ok(sparse)
 }
 
 fn memory_segments(
@@ -325,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn full_capture_omits_zero_pages_without_losing_untracked_nonzero_ram() {
         let mut bytes = vec![0; 4 * 1024 * 1024];
-        // Page, scan-chunk and packed-region boundaries, including a GPA hole.
+        // Page, copy-chunk and packed-region boundaries, including a GPA hole.
         for offset in [
             0,
             4095,
@@ -367,7 +337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_capture_rejects_failed_or_short_scan_without_publishing() {
+    async fn full_capture_rejects_failed_or_short_read_without_publishing() {
         for short in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let error = write_incremental_memory(
@@ -379,8 +349,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(error.to_string().contains(if short {
-                "short frozen RAM scan"
+            assert!(format!("{error:#}").contains(if short {
+                "failed to read"
             } else {
                 "injected RAM read failure"
             }));
@@ -432,13 +402,16 @@ mod tests {
             unchanged.read_at(0, 16384).await.unwrap().as_ref(),
             original.as_slice()
         );
-        for (index, value) in [0, 0x7b].into_iter().enumerate() {
+        for (index, (value, classified)) in [(0, true), (0x7b, true), (0, false), (0x7b, false)]
+            .into_iter()
+            .enumerate()
+        {
             let mut expected = original.clone();
             expected[4096..8192].fill(0x23);
             expected[8192..12288].fill(value);
             let mut current = map.clone();
             current.token.generation += index as u64;
-            if value != 0 {
+            if value != 0 || !classified {
                 current.zero_ranges.clear();
             }
             let delta = write_memory_overlaybd(
@@ -446,16 +419,7 @@ mod tests {
                     bytes: expected.clone(),
                     allowed: 4096..12288,
                 }),
-                &capture_memory_segments(
-                    &current,
-                    Some(&layout),
-                    &Pages {
-                        bytes: expected.clone(),
-                        allowed: 4096..12288,
-                    },
-                )
-                .await
-                .unwrap(),
+                &memory_segments(&current, Some(&layout)).unwrap(),
                 16384,
                 &dir.path().join(format!("delta-{index}")),
                 OverlaybdCompactOutput::Raw,

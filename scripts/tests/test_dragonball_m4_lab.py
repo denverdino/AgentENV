@@ -37,6 +37,7 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
 
+@unittest.skipUnless("--inside" in sys.argv, "explicit --linux namespace qualification required")
 class LinuxTests(unittest.TestCase):
     def test_private_tempdir_allows_same_mount_rename_and_masks_peer_paths(self):
         module = implementation()

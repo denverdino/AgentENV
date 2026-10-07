@@ -39,6 +39,14 @@ impl DragonballRuntimePolicy {
                 && config.virtualization_mode == VirtualizationMode::Kvm,
             "Dragonball runtime requires Linux x86_64/KVM with host-default CPU policy"
         );
+        ensure!(
+            !config.ublk.overlaybd.read_only,
+            "Dragonball does not support ublk.overlaybd.read_only=true"
+        );
+        ensure!(
+            !config.ublk.overlaybd.allow_shrink,
+            "Dragonball does not support ublk.overlaybd.allow_shrink=true"
+        );
         let tools = config
             .tools
             .drive_path
@@ -90,5 +98,62 @@ impl DragonballRuntimePolicy {
     pub fn with_memory_mode(mut self, mode: DragonballMemoryMode) -> Self {
         self.memory_mode = mode;
         self
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    fn policy_config(asset: &std::path::Path) -> AppConfig {
+        let mut config = AppConfig {
+            virtualization_mode: VirtualizationMode::Kvm,
+            runtime_path: asset.parent().unwrap().into(),
+            ..Default::default()
+        };
+        config.tools.drive_path = Some(asset.into());
+        config
+    }
+
+    #[test]
+    fn writable_nonshrinking_overlaybd_policy_is_supported() {
+        let asset = tempfile::NamedTempFile::new().unwrap();
+        let config = policy_config(asset.path());
+        DragonballRuntimePolicy::from_app_config(&config, asset.path().into(), asset.path().into())
+            .unwrap();
+    }
+
+    #[test]
+    fn read_only_overlaybd_policy_is_rejected() {
+        let asset = tempfile::NamedTempFile::new().unwrap();
+        let mut config = policy_config(asset.path());
+        config.ublk.overlaybd.read_only = true;
+        let error = DragonballRuntimePolicy::from_app_config(
+            &config,
+            asset.path().into(),
+            asset.path().into(),
+        )
+        .expect_err("read-only rootfs policy must not silently become writable");
+        assert!(
+            error.to_string().contains("ublk.overlaybd.read_only"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shrinking_overlaybd_policy_is_rejected() {
+        let asset = tempfile::NamedTempFile::new().unwrap();
+        let mut config = policy_config(asset.path());
+        config.ublk.overlaybd.allow_shrink = true;
+        let error = DragonballRuntimePolicy::from_app_config(
+            &config,
+            asset.path().into(),
+            asset.path().into(),
+        )
+        .expect_err("rootfs shrink policy must not silently be ignored");
+        assert!(
+            error.to_string().contains("ublk.overlaybd.allow_shrink"),
+            "{error}"
+        );
     }
 }

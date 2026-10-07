@@ -6,6 +6,8 @@ use std::{
 use anyhow::Result;
 use tokio::process::Child;
 
+use super::logging::RunnerLogs;
+
 /// Shares the actual unreaped child, never just a reusable numeric PID.
 #[derive(Clone)]
 pub(super) struct OwnedRunnerChild(Arc<Mutex<Child>>);
@@ -104,22 +106,58 @@ pub(super) async fn spawn_runner(
         });
     }
     let child = command.spawn()?;
+    // Prefer the VM runner as an OOM victim over the host AgentENV server,
+    // matching the Firecracker launch policy. Failure remains best-effort.
+    if let Some(pid) = child.id() {
+        let oom_path = format!("/proc/{pid}/oom_score_adj");
+        if let Err(error) = std::fs::write(&oom_path, b"1000") {
+            tracing::warn!(pid, oom_path, %error, "failed to set oom_score_adj for Dragonball");
+        }
+    }
     Ok(RunnerProcessGuard {
         child: child.into(),
+        logs: None,
         #[cfg(test)]
         fail_blocking_reap: false,
     })
 }
 
+/// Keep the runner's two diagnostic streams in its private runtime directory.
+pub(super) async fn spawn_logged_runner(
+    mut command: tokio::process::Command,
+    namespace: Option<std::fs::File>,
+    work: Arc<tempfile::TempDir>,
+) -> Result<RunnerProcessGuard> {
+    // Open diagnostics before spawning: a file error must not leave a live
+    // child outside RuntimeResources' synchronous reap/lease ownership.
+    let mut logs = RunnerLogs::new(work.path())?;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut guard = spawn_runner(command, namespace).await?;
+    {
+        let mut child = guard.child.0.lock().unwrap();
+        logs.start(child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    }
+    guard.logs = Some(logs);
+    Ok(guard)
+}
+
 pub(super) struct RunnerProcessGuard {
     pub(super) child: OwnedRunnerChild,
+    pub(super) logs: Option<RunnerLogs>,
     #[cfg(test)]
     pub(super) fail_blocking_reap: bool,
 }
 
 impl RunnerProcessGuard {
     pub(super) async fn terminate_and_wait(&mut self, deadline: Duration) -> Result<()> {
-        self.child.terminate_and_wait(deadline).await
+        self.child.terminate_and_wait(deadline).await?;
+        if let Some(logs) = self.logs.as_mut() {
+            logs.finish().await;
+        }
+        self.logs = None;
+        Ok(())
     }
 
     // Drop cannot await; retain all resource leases until this confirms exit.
@@ -129,6 +167,7 @@ impl RunnerProcessGuard {
         let until = std::time::Instant::now() + deadline;
         loop {
             if self.child.terminate_step()? {
+                self.logs = None;
                 return Ok(());
             }
             anyhow::ensure!(
@@ -143,6 +182,73 @@ impl RunnerProcessGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runner_live_logs_are_bounded_and_keep_both_output_tails() {
+        let work = Arc::new(tempfile::tempdir().unwrap());
+        let mut command = tokio::process::Command::new("python3");
+        command.args(["-c", "import os,time; data=bytes(range(256))*4096; os.write(1,data+b'serial-final'); os.write(2,data+b'error-final'); open('ready','w').close(); time.sleep(60)"])
+            .current_dir(work.path());
+        let mut guard = spawn_logged_runner(command, None, work.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !work.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("both runner output streams must drain without blocking the child");
+        let live_lengths = ["serial.log", "runner-error.log"]
+            .map(|name| std::fs::metadata(work.path().join(name)).unwrap().len());
+        guard
+            .terminate_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            live_lengths.into_iter().all(|length| length <= 128 * 1024),
+            "live log sizes: {live_lengths:?}"
+        );
+        for (name, suffix) in [
+            ("serial.log", b"serial-final".as_slice()),
+            ("runner-error.log", b"error-final".as_slice()),
+        ] {
+            let bytes = std::fs::read(work.path().join(name)).unwrap();
+            assert!(
+                bytes.len() <= 128 * 1024,
+                "{name} grew to {} bytes",
+                bytes.len()
+            );
+            assert!(bytes.len() >= 64 * 1024, "{name} lost the retained tail");
+            let mut expected = (0..=255).cycle().take(1024 * 1024).collect::<Vec<u8>>();
+            expected.extend_from_slice(suffix);
+            assert_eq!(
+                bytes,
+                expected[expected.len() - bytes.len()..],
+                "{name} tail order changed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_is_preferred_oom_victim_without_changing_parent() {
+        let parent_before = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("60");
+        let mut guard = spawn_runner(command, None).await.unwrap();
+        let adjustment =
+            std::fs::read_to_string(format!("/proc/{}/oom_score_adj", guard.child.id().unwrap()))
+                .unwrap();
+        guard
+            .terminate_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(adjustment.trim(), "1000");
+        assert_eq!(
+            std::fs::read_to_string("/proc/self/oom_score_adj").unwrap(),
+            parent_before
+        );
+    }
 
     #[tokio::test]
     async fn m2_process_vm_readv_rejects_wrong_process() {
@@ -272,6 +378,7 @@ mod tests {
             .unwrap();
         let mut guard = RunnerProcessGuard {
             child: child.into(),
+            logs: None,
             fail_blocking_reap: false,
         };
         guard

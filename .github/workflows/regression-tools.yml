@@ -1,0 +1,40 @@
+name: Regression tools
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Makefile"
+      - "scripts/tests/*dragonball*"
+      - ".github/workflows/regression-tools.yml"
+  push:
+    paths:
+      - "Makefile"
+      - "scripts/tests/*dragonball*"
+      - ".github/workflows/regression-tools.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-tools-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Check fixture prerequisites
+        run: |
+          test "$(id -u)" != 0
+          for tool in make git cc debugfs ip nsenter unshare bash python3; do
+            command -v "$tool"
+          done
+      - name: Test regression receipts and process cleanup
+        run: |
+          make test-regression-tools test-hypervisor-tools

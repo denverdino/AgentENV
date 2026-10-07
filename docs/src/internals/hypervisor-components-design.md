@@ -1,8 +1,7 @@
 # Selectable hypervisor components
 
-The user-approved goal is to retain Firecracker and Dragonball as optional
-components, with compile-time product selection. This supersedes the earlier
-Dragonball roadmap's M5 removal of Firecracker.
+Firecracker and Dragonball are optional components selected at compile time.
+Both backends remain supported; Firecracker is the default product.
 
 ## Contract
 
@@ -32,5 +31,5 @@ Dragonball roadmap's M5 removal of Firecracker.
 Build and lint each single-backend product and the all-features test build.
 Check the DB-only dependency tree excludes `firecracker_client`. Exercise the
 same template and snapshot publication paths on Linux KVM for both backends,
-including recording ownership and incompatible snapshot rejection. Preserve
-in-progress M2 changes and report aggregate-suite limitations explicitly.
+including recording ownership and incompatible snapshot rejection. Use the
+[development guide](dragonball-regression.md) to select the applicable suites.

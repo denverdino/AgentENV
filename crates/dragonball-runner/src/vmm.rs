@@ -55,7 +55,9 @@ pub(crate) fn block_config(disk: &ProbeBlockDevice) -> BlockDeviceConfigInfo {
         path_on_host: disk.path_on_host.clone(),
         is_read_only: disk.read_only,
         is_root_device: disk.is_root,
-        is_direct: true,
+        // The shared read-only tools root can reuse the host page cache,
+        // matching Firecracker. Keep direct I/O for user disks and volumes.
+        is_direct: !(disk.is_root && disk.read_only),
         use_pci_bus: Some(false),
         use_shared_irq: Some(false),
         use_generic_irq: Some(false),
@@ -537,7 +539,9 @@ impl crate::runtime_service::RuntimeVmm for DragonballVmm {
         generation: u64,
     ) -> anyhow::Result<agentenv_vmm_protocol::runtime_memory::FrozenMemoryMap> {
         use agentenv_vmm_protocol::{runtime::CaptureToken, runtime_memory::*};
-        let data = self.runtime_action(VmmAction::ExportHeldMemoryMap {
+        // Full captures classify zeros while copying RAM; incremental captures
+        // copy every changed range, including pages rewritten to zero.
+        let data = self.runtime_action(VmmAction::ExportHeldMemoryMapWithoutZeroScan {
             generation,
             deadline: self.deadline,
         })?;
@@ -742,7 +746,7 @@ mod tests {
         let worker = thread::spawn(move || {
             while let Ok(request) = requests.recv() {
                 let (reply, stop) = match *request {
-                    VmmAction::ExportHeldMemoryMap { generation: 7, .. } => {
+                    VmmAction::ExportHeldMemoryMapWithoutZeroScan { generation: 7, .. } => {
                         (VmmData::FrozenMemoryMap(map.clone()), false)
                     }
                     VmmAction::ReleaseHeldMemoryMap { generation: 7 } => (VmmData::Empty, false),
@@ -816,6 +820,26 @@ mod tests {
             DragonballVmm::runtime_report(VmmData::CaptureReport(report)).is_err(),
             "adapter must validate generation before dropping CPU ack metadata"
         );
+    }
+
+    #[test]
+    fn tools_reads_are_buffered_without_changing_writable_or_data_drives() {
+        for (is_root, read_only, direct) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (false, false, true),
+        ] {
+            let disk = ProbeBlockDevice {
+                drive_id: "disk".into(),
+                path_on_host: "/disk.ext4".into(),
+                read_only,
+                is_root,
+            };
+            let block = block_config(&disk);
+            assert_eq!(block.is_direct, direct, "root={is_root}, ro={read_only}");
+            assert_eq!(block.is_read_only, read_only);
+        }
     }
 
     #[test]

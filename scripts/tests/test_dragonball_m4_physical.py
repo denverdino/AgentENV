@@ -16,13 +16,33 @@ import dragonball_m4_physical as physical
 
 
 class PhysicalTests(unittest.TestCase):
+    def test_worker_address_config_and_cli_override_are_validated_before_allocation(self):
+        cases = [
+            ({"private_ip": "10.20.0.10"}, [], "absolute ublk_cli"),
+            ({"private_ip": "203.0.113.1"}, ["--private-ip", "10.20.0.11"], "absolute ublk_cli"),
+            ({"private_ip": "10.20.0.10"}, ["--private-ip", "203.0.113.1"], "RFC1918"),
+            ({"private_ip": "203.0.113.1"}, [], "RFC1918"),
+            ({}, [], "private_ip in --inputs or --private-ip is required"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = Path(directory) / "inputs.json"
+            for config, flags, expected in cases:
+                with self.subTest(config=config, flags=flags):
+                    inputs.write_text(json.dumps(config))
+                    result = subprocess.run([
+                        sys.executable, str(Path(physical.__file__)), "--worker",
+                        "--inputs", str(inputs), *flags,
+                    ], capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected, result.stderr)
+
     def test_relative_cleanup_binary_is_rejected_before_lab_allocation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "cli").write_text("placeholder")
             (root / "inputs.json").write_text(json.dumps({"ublk_cli": "cli"}))
             result = subprocess.run([sys.executable, str(Path(physical.__file__)), "--worker",
-                "--inputs", str(root / "inputs.json"), "--private-ip", "172.21.70.157"],
+                "--inputs", str(root / "inputs.json"), "--private-ip", "10.20.0.10"],
                 cwd=root, capture_output=True, text=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("absolute ublk_cli", result.stderr)
@@ -36,7 +56,7 @@ class PhysicalTests(unittest.TestCase):
                  patch.object(physical.subprocess, "Popen", return_value=child), \
                  patch.object(physical, "CLEANUP_TIMEOUT", 0.05), \
                  patch.object(physical, "TERMINATE_TIMEOUT", 0.05):
-                spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "172.21.70.157"}
+                spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "10.20.0.10"}
                 remote = physical.Remote(spec, Path(directory) / "ssh.log")
                 with self.assertRaises(TimeoutError):
                     remote.close()
@@ -58,7 +78,7 @@ class PhysicalTests(unittest.TestCase):
                 def close_fixture():
                     fixture.terminate()
                     fixture.wait(timeout=2)
-                instance = physical.Worker(None, {}, 1, "172.21.70.157")
+                instance = physical.Worker(None, {}, 1, "10.20.0.10")
                 instance.node = SimpleNamespace(close=lambda: None)
                 instance.relays = [relay]
                 instance.services = SimpleNamespace(close=close_fixture)
@@ -83,7 +103,7 @@ class PhysicalTests(unittest.TestCase):
                  patch.object(physical.subprocess, "Popen", return_value=child), \
                  patch.object(physical, "CLEANUP_TIMEOUT", 0.05, create=True), \
                  patch.object(physical, "TERMINATE_TIMEOUT", 0.05, create=True):
-                spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "172.21.70.157"}
+                spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "10.20.0.10"}
                 errors = []
                 def connect():
                     try:
@@ -116,7 +136,7 @@ class PhysicalTests(unittest.TestCase):
         def close_fixture():
             fixture.terminate()
             fixture.wait(timeout=2)
-        instance = physical.Worker(None, {}, 1, "172.21.70.157")
+        instance = physical.Worker(None, {}, 1, "10.20.0.10")
         instance.node = SimpleNamespace(close=failing_node_close)
         instance.relays = [relay]
         instance.services = SimpleNamespace(close=close_fixture)
@@ -168,10 +188,10 @@ class PhysicalTests(unittest.TestCase):
             physical.validate_physical(result)
 
     def test_relay_scope_refuses_public_wildcard_and_loopback(self):
-        for address in ("0.0.0.0", "127.0.0.1", "147.139.168.159", "203.0.113.1", "::1"):
+        for address in ("0.0.0.0", "127.0.0.1", "1.1.1.1", "203.0.113.1", "::1"):
             with self.subTest(address=address), self.assertRaises(ValueError):
                 physical.private_ipv4(address)
-        self.assertEqual(physical.private_ipv4("172.21.70.157"), "172.21.70.157")
+        self.assertEqual(physical.private_ipv4("10.20.0.10"), "10.20.0.10")
 
     def test_failed_ready_closes_real_transport_process(self):
         child = subprocess.Popen([sys.executable, "-c",
@@ -179,7 +199,7 @@ class PhysicalTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             with tempfile.TemporaryDirectory() as directory:
-                spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "172.21.70.157"}
+                spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "10.20.0.10"}
                 with patch.object(physical.subprocess, "Popen", return_value=child):
                     with self.assertRaises(ValueError):
                         physical.Remote(spec, Path(directory) / "ssh.log")
@@ -202,7 +222,7 @@ class PhysicalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             def connect():
                 try:
-                    spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "172.21.70.157"}
+                    spec = {"ssh": "unused", "script": "unused", "inputs": "unused", "private_ip": "10.20.0.10"}
                     with patch.object(physical.subprocess, "Popen", return_value=child), \
                          patch.object(physical, "RESPONSE_TIMEOUT", 0.1, create=True):
                         physical.Remote(spec, Path(directory) / "ssh.log")
@@ -265,7 +285,7 @@ class WorkerCleanupTests(unittest.TestCase):
     def exercise(self, action):
         child = subprocess.Popen([
             sys.executable, str(Path(physical.__file__)), "--worker", "--inputs",
-            os.environ["AENV_PHYSICAL_TEST_INPUTS"], "--private-ip", "172.21.70.157",
+            os.environ["AENV_PHYSICAL_TEST_INPUTS"],
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             ready = json.loads(child.stdout.readline())["ready"]

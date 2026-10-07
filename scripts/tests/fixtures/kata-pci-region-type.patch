@@ -1,0 +1,117 @@
+From b0c936d9a81616432751ce04d2d84e246cc4b059 Mon Sep 17 00:00:00 2001
+From: Li Yi <denverdino@gmail.com>
+Date: Tue, 6 Oct 2026 13:22:39 +0800
+Subject: [PATCH] fix: use tracked guest regions for PCI block dispatch
+
+---
+ .../src/device_manager/blk_dev_mgr.rs         | 57 +++++++++++++++----
+ 1 file changed, 46 insertions(+), 11 deletions(-)
+
+diff --git a/src/dragonball/src/device_manager/blk_dev_mgr.rs b/src/dragonball/src/device_manager/blk_dev_mgr.rs
+index c149e9bda..339fb2341 100644
+--- a/src/dragonball/src/device_manager/blk_dev_mgr.rs
++++ b/src/dragonball/src/device_manager/blk_dev_mgr.rs
+@@ -31,10 +31,10 @@ use dbs_virtio_devices::vhost::vhost_user::block::VhostUserBlock;
+ use serde_derive::{Deserialize, Serialize};
+ #[cfg(feature = "host-device")]
+ use virtio_queue::QueueSync;
+-#[cfg(feature = "host-device")]
+-use vm_memory::GuestRegionMmap;
+ 
+ use crate::address_space_manager::GuestAddressSpaceImpl;
++#[cfg(feature = "host-device")]
++use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
+ #[cfg(target_arch = "x86_64")]
+ use crate::api::v1::ConfidentialVmType;
+ use crate::config_manager::{ConfigItem, DeviceConfigInfo, RateLimiterConfigInfo};
+@@ -1482,9 +1482,9 @@ mod tests {
+             .is_some());
+     }
+ 
+-    #[test]
+-    fn test_update_blk_device_ratelimiters() {
+-        skip_if_kvm_unaccessable!();
++    fn attached_block_device_for_test(
++        use_pci_bus: bool,
++    ) -> (crate::vm::Vm, DeviceOpContext, TempFile) {
+         //Init vm for test.
+         let mut vm = create_vm_for_test();
+         let device_op_ctx = DeviceOpContext::new(
+@@ -1517,7 +1517,7 @@ mod tests {
+             queue_size: 128,
+             use_shared_irq: None,
+             use_generic_irq: None,
+-            use_pci_bus: Some(cfg!(feature = "host-device")),
++            use_pci_bus: Some(use_pci_bus),
+         };
+         let (sender, _receiver) = channel();
+         vm.device_manager_mut()
+@@ -1525,11 +1525,6 @@ mod tests {
+             .insert_device(device_op_ctx, dummy_block_device, sender)
+             .unwrap();
+ 
+-        let cfg = BlockDeviceConfigUpdateInfo {
+-            drive_id: String::from("1"),
+-            rate_limiter: None,
+-        };
+-
+         let mut device_op_ctx = DeviceOpContext::new(
+             Some(vm.epoll_manager().clone()),
+             vm.device_manager(),
+@@ -1546,6 +1541,16 @@ mod tests {
+             .unwrap();
+         assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
+ 
++        (vm, device_op_ctx, dummy_file)
++    }
++
++    fn check_update_blk_device_ratelimiters(use_pci_bus: bool) {
++        let (mut vm, _ctx, _backing) = attached_block_device_for_test(use_pci_bus);
++        let cfg = BlockDeviceConfigUpdateInfo {
++            drive_id: String::from("1"),
++            rate_limiter: None,
++        };
++
+         //Patch while the epoll handler is invalid.
+         let expected_error = "could not send patch message to the block epoll handler".to_string();
+ 
+@@ -1576,6 +1581,36 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_update_blk_device_ratelimiters() {
++        skip_if_kvm_unaccessable!();
++        check_update_blk_device_ratelimiters(false);
++    }
++
++    #[cfg(feature = "host-device")]
++    #[test]
++    fn test_update_pci_blk_device_ratelimiters() {
++        skip_if_kvm_unaccessable!();
++        check_update_blk_device_ratelimiters(true);
++    }
++
++    #[cfg(all(feature = "host-device", feature = "hotplug", feature = "dbs-upcall"))]
++    #[test]
++    fn test_prepare_pci_block_remove_rejects_boot_context() {
++        skip_if_kvm_unaccessable!();
++        let (vm, ctx, _backing) = attached_block_device_for_test(true);
++        let (sender, _receiver) = channel();
++        assert!(matches!(
++            vm.device_manager()
++                .block_manager
++                .prepare_remove_device(&ctx, "1", sender),
++            Err(BlockDeviceError::DeviceManager(
++                DeviceMgrError::InvalidOperation
++            ))
++        ));
++        assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
++    }
++
+     #[test]
+     fn test_add_one_root_block_device() {
+         skip_if_kvm_unaccessable!();
+-- 
+2.54.0 (Apple Git-157)
+

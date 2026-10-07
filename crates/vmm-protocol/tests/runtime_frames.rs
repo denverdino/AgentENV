@@ -13,6 +13,34 @@ fn request() -> RuntimeRequest {
 }
 
 #[test]
+fn runtime_identity_rejects_previous_kata_revision_with_matching_abi() {
+    let mut identity = SnapshotRestoreIdentity {
+        backend: "dragonball".into(),
+        architecture: "x86_64".into(),
+        virtualization_mode: "kvm".into(),
+        runner_build_id: format!("sha256:{}", "a".repeat(64)),
+        dragonball_revision: QUALIFIED_DRAGONBALL_REVISION.into(),
+        snapshot_format_epoch: 2,
+        restore_abi_id: format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}"),
+        cpu_policy_id: "host-default".into(),
+        device_profile_id: RUNTIME_FEATURE_PROFILE.into(),
+        memory_layout_id: "packed-ram-4k-v2".into(),
+        kernel_version: "6.1.175".into(),
+        tools_drive_version: "0.1.0".into(),
+        envd_version: "0.6.0".into(),
+    };
+    identity.validate_profile().unwrap();
+
+    let previous_revision = "c77812d669737c11cb16321827acc1c79bf065f3";
+    identity.dragonball_revision = previous_revision.into();
+    identity.restore_abi_id = format!("dragonball-held-cow-v2@{previous_revision}");
+    assert!(
+        identity.validate_profile().is_err(),
+        "matching legacy revision and ABI must not qualify an old snapshot"
+    );
+}
+
+#[test]
 fn runtime_frames_are_separate_from_probe_frames() {
     let value = request();
     let bytes = encode_runtime_request(&value).unwrap();

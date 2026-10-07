@@ -225,7 +225,7 @@ impl FirecrackerInstance {
             "stopping firecracker process"
         );
 
-        if let Some(mut child) = self.process.take() {
+        if let Some(child) = self.process.as_mut() {
             // First try a graceful stop with SIGTERM
             if let Some(pid) = child.id() {
                 trace!(pid, "sending SIGTERM to firecracker");
@@ -233,11 +233,17 @@ impl FirecrackerInstance {
             }
 
             // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
-            if time::timeout(timeout, child.wait()).await.is_err() {
-                warn!("firecracker stop timed out; sending SIGKILL");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            match time::timeout(timeout, child.wait()).await {
+                Ok(result) => {
+                    result.context("wait for Firecracker exit")?;
+                }
+                Err(_) => {
+                    warn!("firecracker stop timed out; sending SIGKILL");
+                    child.start_kill().context("kill Firecracker")?;
+                    child.wait().await.context("reap Firecracker")?;
+                }
             }
+            self.process = None;
         }
 
         if self.socket_path.exists() {
@@ -567,28 +573,32 @@ impl FirecrackerInstance {
     }
 }
 
-impl Drop for FirecrackerInstance {
-    fn drop(&mut self) {
-        let mut had_child = false;
-        if let Some(mut child) = self.process.take() {
-            had_child = true;
-            if let Err(err) = child.start_kill() {
-                warn!(error = %err, "failed to kill sandbox process on drop");
-            }
-        }
-
-        // Only remove the socket if we actually spawned/owned the process.
-        if had_child {
-            if let Err(err) = fs::remove_file(&self.socket_path) {
-                // Ignore NotFound error as the file might have been removed already
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        path = %self.socket_path.display(),
-                        error = %err,
-                        "failed to remove sandbox socket on drop"
+impl FirecrackerInstance {
+    /// Used before dropping device/network owners. Does not require a Tokio worker.
+    pub(super) fn terminate_blocking(&mut self, timeout: Duration) -> Result<()> {
+        if let Some(child) = self.process.as_mut() {
+            if child.try_wait()?.is_none() {
+                child.start_kill()?;
+                let deadline = std::time::Instant::now() + timeout;
+                while child.try_wait()?.is_none() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "Firecracker exit unconfirmed"
                     );
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             }
+            self.process = None;
+            let _ = fs::remove_file(&self.socket_path);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FirecrackerInstance {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate_blocking(Duration::from_secs(10)) {
+            warn!(%error, "Firecracker process exit unconfirmed on drop");
         }
     }
 }
@@ -630,6 +640,43 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_process_until_reaped() -> Result<()> {
+        let temp = tempdir()?;
+        let ready = temp.path().join("ready");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap '' TERM; touch \"$1\"; while :; do sleep 0.02; done",
+            "test",
+        ]);
+        command.arg(&ready);
+        let mut instance = FirecrackerInstance::new(temp.path().to_owned());
+        instance.process = Some(command.spawn()?);
+        let pid = instance.pid()?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let result = time::timeout(
+            Duration::from_millis(20),
+            instance.stop(Duration::from_secs(10)),
+        )
+        .await;
+        assert!(result.is_err());
+        // Keep a cleanup handle even on the failing baseline.
+        let retained = instance.process.is_some();
+        if retained {
+            instance.stop(Duration::from_millis(10)).await?;
+        } else {
+            let _ = kill(pid, Signal::SIGKILL);
+        }
+        assert!(retained, "cancellation discarded the process owner");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {

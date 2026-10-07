@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const QUALIFIED_DRAGONBALL_REVISION: &str = "c77812d669737c11cb16321827acc1c79bf065f3";
+pub const QUALIFIED_DRAGONBALL_REVISION: &str = "9b0d2852e4a9d4c66a391c32fccb93b65e937f8f";
 pub const RUNTIME_FEATURE_PROFILE: &str = "db-virtio-blk-net-balloon-v2";
 // Kata's internal serializer epoch is independent of the AgentENV envelope ABI.
 pub const UPSTREAM_SNAPSHOT_FORMAT_EPOCH: u16 = 1;
@@ -245,7 +245,7 @@ impl RuntimeSnapshotEnvelope {
                 .find(|disk| disk.drive_id == id)
                 .ok_or("unknown block ID")?;
             let expected = serde_json::json!({"drive_id":disk.drive_id,"device_type":"RawBlock","path_on_host":format!("aenv-block:{}",disk.drive_id),
-                "is_root_device":disk.is_root,"part_uuid":null,"is_read_only":disk.read_only,"is_direct":true,"no_drop":false,"sparse":false,"is_volume_slot":disk.is_volume_slot,"backing_read_only":disk.backing_read_only,
+                "is_root_device":disk.is_root,"part_uuid":null,"is_read_only":disk.read_only,"is_direct":!(disk.is_root && disk.read_only),"no_drop":false,"sparse":false,"is_volume_slot":disk.is_volume_slot,"backing_read_only":disk.backing_read_only,
                 "num_queues":1,"queue_size":256,"rate_limiter":disk.rate_limiter,"use_shared_irq":false,"use_generic_irq":false,"use_pci_bus":false});
             if !ids.insert(id)
                 || saved["config"] != expected

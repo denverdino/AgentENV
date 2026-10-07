@@ -94,3 +94,19 @@ pub fn write_mock_built_artifacts(
 
     Ok((rootfs_lower, memory_lower, manifest))
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "hypervisor-dragonball",
+    not(feature = "hypervisor-firecracker")
+))]
+pub(crate) fn runnable_snapshot(
+    record: SnapshotRecord,
+    manifest: SandboxSnapshotManifest,
+) -> RunnableSnapshot {
+    struct Lease;
+    impl super::types::RuntimeArtifactLease for Lease {}
+    RunnableSnapshot::new(record, manifest, Arc::new(Lease))
+}

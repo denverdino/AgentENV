@@ -10,7 +10,7 @@ use std::mem::size_of;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 use zerocopy::little_endian::{U32, U64};
@@ -1132,10 +1132,15 @@ pub(super) fn append_invalid_index_padding(index_bytes: &mut Vec<u8>, padding_co
     }
 }
 
-fn compact_is_zero_block(_buf: &[u8]) -> bool {
-    // Keep parity with upstream OverlayBD: file.cpp currently short-circuits
-    // `is_zero_block()` to treat compacted data blocks as non-zero.
-    COMPACT_ZERO_DETECTION_ENABLED
+fn compact_is_zero_block(buf: &[u8]) -> bool {
+    // Preserve the cheap rejection for dense pages; slice equality lets the
+    // compiler/library compare zero runs in wider units without unsafe loads.
+    if buf.first().is_some_and(|byte| *byte != 0) {
+        return false;
+    }
+    const ZERO: [u8; 4096] = [0; 4096];
+    buf.chunks(ZERO.len())
+        .all(|chunk| chunk == &ZERO[..chunk.len()])
 }
 
 /// Emit a contiguous run of blocks with the same zero/non-zero properties
@@ -1290,13 +1295,12 @@ async fn compact_copy_chunk(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy per-mapping copy — used only when COMPACT_ZERO_DETECTION_ENABLED
+// Bounded per-mapping copy for opt-in sparse compaction.
 // ---------------------------------------------------------------------------
 
-/// Copy data blocks for a single mapping, with optional zero-block detection.
-///
-/// Kept as a fallback for the zero-detection path which may change the output
-/// size per mapping and therefore cannot be pre-chunked.
+/// Copy a mapping in bounded batches, overlapping the next read with the write.
+/// Zero detection uses 4 KiB groups to keep sub-page patterns from exploding the
+/// index. Mapping tails may still be smaller (the wire format uses 512 B blocks).
 async fn compact_copy_mapping_with_zero_detection(
     src_layers: &[Arc<dyn VirtualFile>],
     writer: &dyn CompactWriter,
@@ -1310,19 +1314,27 @@ async fn compact_copy_mapping_with_zero_detection(
     let mut remaining = mapping.length() as u64 * ALIGNMENT;
     let mut dest_offset = moffset * ALIGNMENT;
     let mut written_bytes = 0u64;
-    let buf_size = writer.buffer_size();
-    ensure!(
-        buf_size.is_multiple_of(ALIGNMENT_USIZE),
-        "CompactWriter buffer size {buf_size} not aligned"
-    );
+    const BATCH_BYTES: usize = 1024 * 1024;
+    const ZERO_GROUP_BYTES: usize = 4096;
+    if remaining == 0 {
+        return Ok((0, Vec::new()));
+    }
 
     let mut index = Vec::new();
     let mut segment = SegmentMapping::new(mapping.offset(), 0, moffset, false, mapping.tag);
-    let mut data = Vec::with_capacity(buf_size);
+    let mut data = Vec::with_capacity(BATCH_BYTES);
+    let started = Instant::now();
+    let mut read_time = std::time::Duration::ZERO;
+    let mut pack_time = std::time::Duration::ZERO;
+    let mut write_time = std::time::Duration::ZERO;
+    let read_started = Instant::now();
+    let mut chunk = src_layers[layer_idx]
+        .read_at(src_offset, min(remaining as usize, BATCH_BYTES))
+        .await?;
+    read_time += read_started.elapsed();
 
     while remaining > 0 {
-        let step = min(remaining as usize, buf_size);
-        let chunk = src_layers[layer_idx].read_at(src_offset, step).await?;
+        let step = min(remaining as usize, BATCH_BYTES);
         ensure!(
             chunk.len() == step,
             "failed to read {} bytes from source layer {} at offset {}, got {}",
@@ -1332,13 +1344,15 @@ async fn compact_copy_mapping_with_zero_detection(
             chunk.len()
         );
 
+        let pack_started = Instant::now();
         data.clear();
         let mut prev_end_blocks = 0usize;
         let mut zero_detected = false;
         let mut have_detection = false;
 
-        for block_begin in (0..step).step_by(ALIGNMENT_USIZE) {
-            let block_end = block_begin + ALIGNMENT_USIZE;
+        for block_begin in (0..step).step_by(ZERO_GROUP_BYTES) {
+            let block_end = min(block_begin + ZERO_GROUP_BYTES, step);
+            let blocks = ((block_end - block_begin) / ALIGNMENT_USIZE) as u32;
             let is_zero = compact_is_zero_block(&chunk[block_begin..block_end]);
             if is_zero {
                 if have_detection && !zero_detected && segment.length() > 0 {
@@ -1351,7 +1365,7 @@ async fn compact_copy_mapping_with_zero_detection(
                         &mut index,
                     );
                 }
-                segment.segment.length += 1;
+                segment.segment.length += blocks;
                 zero_detected = true;
                 have_detection = true;
                 continue;
@@ -1367,7 +1381,7 @@ async fn compact_copy_mapping_with_zero_detection(
                     &mut index,
                 );
             }
-            segment.segment.length += 1;
+            segment.segment.length += blocks;
             zero_detected = false;
             have_detection = true;
         }
@@ -1383,16 +1397,45 @@ async fn compact_copy_mapping_with_zero_detection(
             );
         }
 
-        if !data.is_empty() {
-            writer.write_all_at(&data, dest_offset).await?;
-            dest_offset += data.len() as u64;
-            written_bytes += data.len() as u64;
-        }
-
+        pack_time += pack_started.elapsed();
         src_offset += step as u64;
         remaining -= step as u64;
+        drop(chunk);
+        let read_next = async {
+            if remaining == 0 {
+                Ok(bytes::Bytes::new())
+            } else {
+                let started = Instant::now();
+                let result = src_layers[layer_idx]
+                    .read_at(src_offset, min(remaining as usize, BATCH_BYTES))
+                    .await;
+                read_time += started.elapsed();
+                result
+            }
+        };
+        let write_current = async {
+            if !data.is_empty() {
+                let started = Instant::now();
+                writer.write_all_at(&data, dest_offset).await?;
+                write_time += started.elapsed();
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        (chunk, ()) = tokio::try_join!(read_next, write_current)?;
+        dest_offset += data.len() as u64;
+        written_bytes += data.len() as u64;
     }
 
+    // Read and write waits overlap; their totals must not be added as wall time.
+    tracing::debug!(
+        source_bytes = mapping.length() as u64 * ALIGNMENT,
+        written_bytes,
+        read_us = read_time.as_micros() as u64,
+        pack_us = pack_time.as_micros() as u64,
+        write_us = write_time.as_micros() as u64,
+        wall_us = started.elapsed().as_micros() as u64,
+        "sparse compaction mapping timing"
+    );
     Ok((written_bytes / ALIGNMENT, index))
 }
 
@@ -1433,6 +1476,35 @@ pub async fn compact_to(
     virtual_size: u64,
     commit_args: CommitArgs,
 ) -> Result<()> {
+    compact_to_inner(
+        src_layers,
+        mappings,
+        virtual_size,
+        commit_args,
+        COMPACT_ZERO_DETECTION_ENABLED,
+    )
+    .await
+}
+
+/// Compact with zero detection in a single sequential source pass. MiB-sized
+/// batches overlap one read and one write; zero records explicitly mask lowers.
+/// Ordinary disk compaction keeps its existing parallel/materializing behavior.
+pub async fn compact_to_sparse(
+    src_layers: &[Arc<dyn VirtualFile>],
+    mappings: &[SegmentMapping],
+    virtual_size: u64,
+    commit_args: CommitArgs,
+) -> Result<()> {
+    compact_to_inner(src_layers, mappings, virtual_size, commit_args, true).await
+}
+
+async fn compact_to_inner(
+    src_layers: &[Arc<dyn VirtualFile>],
+    mappings: &[SegmentMapping],
+    virtual_size: u64,
+    commit_args: CommitArgs,
+    detect_zeros: bool,
+) -> Result<()> {
     let mut header = HeaderTrailer::new();
     header.size = U32::new(size_of::<HeaderTrailer>() as u32);
     header.virtual_size = U64::new(virtual_size);
@@ -1457,7 +1529,7 @@ pub async fn compact_to(
     let mut compact_index: Vec<SegmentMapping> = Vec::with_capacity(mappings.len());
     let mut dest_moffset = HEADER_SIZE / ALIGNMENT;
 
-    if COMPACT_ZERO_DETECTION_ENABLED {
+    if detect_zeros {
         // Legacy per-mapping path. Zero detection may change the output size
         // per mapping, so we cannot pre-chunk or pre-compute offsets.
         for m in mappings {
@@ -1645,6 +1717,22 @@ pub async fn compact_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_detection_checks_every_byte_in_unaligned_and_partial_pages() {
+        // Missing a tail or assuming word alignment would silently discard RAM.
+        for offset in 0..8 {
+            for length in [0, 1, 7, 8, 63, 64, 511, 512, 4095, 4096, 4097] {
+                let mut data = vec![0u8; offset + length];
+                assert!(compact_is_zero_block(&data[offset..]));
+                for position in offset..data.len() {
+                    data[position] = 0x80;
+                    assert!(!compact_is_zero_block(&data[offset..]));
+                    data[position] = 0;
+                }
+            }
+        }
+    }
 
     #[test]
     fn detected_zero_does_not_advance_compact_data_cursor() {

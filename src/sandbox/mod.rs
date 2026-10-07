@@ -11,6 +11,7 @@ mod envd;
 mod extra_drive;
 #[cfg(feature = "hypervisor-firecracker")]
 mod firecracker;
+mod guest;
 mod guest_volumes;
 pub(crate) mod logs;
 pub mod selected;
@@ -24,6 +25,7 @@ mod network;
 mod process;
 mod process_vm_reader;
 pub mod restore_identity;
+mod runtime_cleanup;
 mod runtime_versions;
 pub(crate) mod startup_pack;
 pub(crate) mod storage_snapshot;
