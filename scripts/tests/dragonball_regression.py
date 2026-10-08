@@ -9,12 +9,14 @@ import fcntl
 import hashlib
 import json
 import os
+from dragonball_m4_host import lock_fds
 from pathlib import Path
 import platform
 import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -39,7 +41,7 @@ REQUIRED = (
 # Make exports command-line variables; resume is controller state, not guest input.
 # Stage selection and timeout/resource budgets are validated separately.
 INTERNAL_ENV = {"AENV_DRAGONBALL_M0_PARENT_NETNS", "AENV_DRAGONBALL_M0_ISOLATED",
-                "AENV_REGRESSION_ARGS"}
+                "AENV_REGRESSION_ARGS", "AENV_TEST_HOST_LOCK_FD"}
 
 
 def digest(value):
@@ -73,13 +75,68 @@ def verify_environment(expected, env):
 def global_configs(config, config_dir, env):
     def resolve(raw):
         expanded = raw.replace("$AENV_HOME", env["AENV_HOME_PATH"])
-        return (config_dir / expanded).resolve()
+        return Path(os.path.abspath(config_dir / expanded))
     disk = resolve(config.get("ublk", {}).get("overlaybd", {}).get(
         "global_config_path", "$AENV_HOME/overlaybd/overlaybd-global.json"))
     memory = resolve(config.get("memory_snapshot", {}).get(
         "overlaybd_global_config_path", "$AENV_HOME/overlaybd/mem-overlaybd-global.json"))
     return [disk, memory, disk.parent / "resize-overlaybd-global.json",
             disk.parent / "convert-overlaybd-global.json"]
+
+
+def fixture_state_parent(state):
+    """Read-only admission for an exact new state path; permit sticky temp roots."""
+    state = Path(state)
+    if not state.is_absolute() or state == Path(state.anchor) or state != state.resolve():
+        raise ValueError('expected an exact isolated state path')
+    parent = state.parent
+    while not parent.exists():
+        parent = parent.parent
+    info = parent.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
+            or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)
+            or not os.access(parent, os.W_OK | os.X_OK)):
+        raise ValueError('new state requires a trusted writable parent: ' + str(parent))
+    return parent
+
+
+def validate_fixtures(env, *, prepared=True):
+    """Validate isolated writable ownership before provisioning or reading inputs."""
+    import tomllib
+    from dragonball_test_resources import owned_directory
+    state = Path(env['AENV_TEST_STATE_DIR'])
+    if state.exists() or prepared:
+        owned_directory(state)
+    else:
+        fixture_state_parent(state)
+    home = Path(env['AENV_HOME_PATH'])
+    for name in ('AENV_HOME_PATH', 'AENV_RUNTIME_PATH'):
+        path = Path(env[name])
+        if not path.is_absolute() or path != path.resolve() or state not in path.parents:
+            raise ValueError(name + ' must be inside the isolated test state')
+        if path.exists():
+            owned_directory(path)
+    config_path = Path(env['AENV_CONFIG_PATH'])
+    config = tomllib.loads(config_path.read_text())
+    paths = global_configs(config, config_path.parent, env)
+    for path in paths:
+        if path != path.resolve() or home not in path.parents:
+            raise ValueError('generated config must be inside the isolated HOME: ' + str(path))
+        for parent in path.parents:
+            if parent == state:
+                break
+            if parent.exists():
+                owned_directory(parent)
+        if path.exists():
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                raise ValueError('generated config must be an owned regular file: ' + str(path))
+            if prepared and not isinstance(json.loads(path.read_text()), dict):
+                raise ValueError('generated config must contain a JSON object: ' + str(path))
+        elif prepared:
+            raise ValueError('missing generated config: ' + str(path) +
+                             '; run make prepare-dragonball-regression with this AENV_TEST_STATE_DIR and AENV_CONFIG_PATH')
+    return paths
 
 
 def collect_inputs(binary, env, root=ROOT):
@@ -96,7 +153,7 @@ def collect_inputs(binary, env, root=ROOT):
             raise ValueError(f"{name} must be absolute")
         if name not in {"AENV_TEST_STATE_DIR", "AENV_HOME_PATH", "AENV_RUNTIME_PATH", "AENV_DEPS_PATH"}:
             files.add(path)
-    globals_ = global_configs(config, config_path.parent, env)
+    globals_ = validate_fixtures(env)
     for path in globals_:
         file_digest(path)
         json.loads(path.read_text())
@@ -178,6 +235,14 @@ def check_socket_path(runtime):
 def preflight(env, minimum_gib):
     if os.geteuid() == 0 or (platform.system(), platform.machine()) != ("Linux", "x86_64"):
         raise ValueError("requires non-root x86_64 Linux")
+    from dragonball_m4_preflight import check
+    report = check({'mode': 'functional', 'run_user': pwd.getpwuid(os.geteuid()).pw_name,
+                    'disk_path': env['AENV_TEST_STATE_DIR'], 'reserve_bytes': minimum_gib * 1024**3,
+                    'planned_bytes': 0, 'retained_bytes': 0, 'required_env': list(REQUIRED),
+                    'required_tools': ['cc', 'debugfs', 'ip', 'nsenter', 'unshare'],
+                    'socket_paths': [str(Path(env['AENV_RUNTIME_PATH']) / 'db-runtime-XXXXXX/runner.sock')]}, env)
+    if not report['ok']:
+        raise ValueError('shared preflight refused: ' + '; '.join(report['errors']))
     if os.sysconf("SC_PAGE_SIZE") != 4096:
         raise ValueError("requires 4 KiB pages")
     if env.get("AENV_DRAGONBALL_M0_ISOLATED") != "1":
@@ -227,7 +292,7 @@ def save(path, value):
 
 def execute(command, log, timeout, *, grace=30):
     with log.open("xb") as stream:
-        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=lock_fds())
         try:
             return process.wait(timeout=timeout)
         except (KeyboardInterrupt, subprocess.TimeoutExpired):
@@ -352,8 +417,14 @@ def main():
             result = collect_inputs(binary, env)
             result["budgets"] = identity["budgets"]
             return result
-        return run_stages(binary, output, list(dict.fromkeys(args.suite or DEFAULT_SUITES)),
-                          identity, resume=args.resume, check_inputs=current, timeout=args.timeout)
+        from dragonball_test_resources import RunRecord
+        output.mkdir(parents=True, exist_ok=True)
+        with RunRecord(output, 'regression', owned=[Path(env['AENV_TEST_STATE_DIR'])], inputs=identity) as record:
+            code = run_stages(binary, output, list(dict.fromkeys(args.suite or DEFAULT_SUITES)),
+                              identity, resume=args.resume, check_inputs=current, timeout=args.timeout)
+            record.record['exit_code'] = code
+            record.record['cleanup'] = 'namespace exit pending; state retained'
+            return code
 
 
 def interrupt(*_):

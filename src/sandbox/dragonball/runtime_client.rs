@@ -109,6 +109,8 @@ impl RuntimeClient {
                 ),
             "runtime outcome unknown; query, confirm release with the same token, or teardown"
         );
+        let load_held = matches!(&command, RuntimeCommand::LoadHeld(..));
+        let started = std::time::Instant::now();
         let mutating = !matches!(command, RuntimeCommand::Hello | RuntimeCommand::Status);
         let was_unknown = self.outcome_unknown;
         let request = RuntimeRequest {
@@ -124,6 +126,7 @@ impl RuntimeClient {
             .checked_add(1)
             .context("runtime request ID exhausted")?;
         let frame = encode_runtime_request(&request)?;
+        let encoded_us = started.elapsed().as_micros() as u64;
         // Arm before the first await: dropping this future is not remote cancellation.
         if mutating {
             self.outcome_unknown = true;
@@ -140,7 +143,9 @@ impl RuntimeClient {
                     "runtime socket peer PID mismatch"
                 );
             }
+            let connected_us = started.elapsed().as_micros() as u64;
             stream.write_all(&frame).await?;
+            let sent_us = started.elapsed().as_micros() as u64;
             let mut header = [0; 4];
             stream.read_exact(&mut header).await?;
             let size = u32::from_be_bytes(header) as usize;
@@ -151,8 +156,20 @@ impl RuntimeClient {
             let mut bytes = vec![0; 4 + size];
             bytes[..4].copy_from_slice(&header);
             stream.read_exact(&mut bytes[4..]).await?;
+            let received_us = started.elapsed().as_micros() as u64;
             let response = decode_runtime_response(&bytes)?;
             validate_runtime_response(&request, &response)?;
+            if load_held {
+                tracing::debug!(
+                    request_id = request.request_id,
+                    encoded_us,
+                    connected_us,
+                    sent_us,
+                    received_us,
+                    decoded_us = started.elapsed().as_micros() as u64,
+                    "Dragonball LoadHeld IPC timing (cumulative)"
+                );
+            }
             Ok::<_, anyhow::Error>(response)
         })
         .await

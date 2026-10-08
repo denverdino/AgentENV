@@ -11,7 +11,8 @@ release from `config/deps_manifest.toml` when it is missing locally, unless
 
 The build is intentionally self-contained:
 
-1. Clone and compile `envd` from `e2b-dev/infra` at `ENVD_REF`.
+1. Clone `envd` from `e2b-dev/infra` at `ENVD_REF`, apply the checked-in metadata
+   refresh patch, and compile it.
 2. Assemble the guest tools rootfs with BusyBox, `/init`, `/agentenv/pivot-init`,
    and `/agentenv/envd`.
 3. Export the tools rootfs as an OCI image with the
@@ -79,7 +80,19 @@ host instead. The build also prints, for native builds:
 /out/envd -commit
 ```
 
-which identifies the upstream commit baked into the binary.
+which identifies the upstream commit plus the `-aenv-mmds1` patch suffix.
+
+The metadata patch attempts the first MMDS request immediately, then waits 50 ms
+after each failed token or metadata request before retrying. `/init` remains
+asynchronous; identity still comes from MMDS. Both backends use this guest
+behavior. The patch includes virtual-clock tests for initial success, both retry
+paths, and cancellation. Run `go test ./internal/host ./internal/api` as a
+non-root user in the patched upstream `packages/envd` directory.
+
+The 0.1.2 recipe is a new tools artifact. Changing this source does not replace
+already published drives or binaries embedded in existing snapshots; select a
+new, validated tools version when rolling it out. `config/deps_manifest.toml`
+continues to select the existing published release until publication and validation.
 
 ## Configuration
 
@@ -87,7 +100,7 @@ The build accepts these Make variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOOLS_VERSION` | `0.1.1` | Immutable SemVer release of the complete tools drive |
+| `TOOLS_VERSION` | `0.1.2` | Immutable SemVer release of the complete tools drive |
 | `ENVD_REF` | `2026.17` | Tag, branch, or fetchable commit to build from the envd upstream repository |
 | `ENVD_UPSTREAM_REPO` | `https://github.com/e2b-dev/infra.git` | Repository containing `packages/envd` |
 | `ARCH` | host architecture, normalized to `amd64` or `arm64` | Target architecture |
@@ -98,11 +111,11 @@ The build accepts these Make variables:
 Examples:
 
 ```bash
-make TOOLS_VERSION=0.1.1 ENVD_REF=2026.17 ARCH=amd64
+make TOOLS_VERSION=0.1.2 ENVD_REF=2026.17 ARCH=amd64
 
 make \
   ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git \
-  TOOLS_VERSION=0.1.1 \
+  TOOLS_VERSION=0.1.2 \
   ENVD_REF=2026.17 \
   ARCH=amd64
 ```
@@ -117,21 +130,21 @@ tags to prevent concurrent or external publishers from replacing a release.
 
 ```bash
 make publish \
-  TOOLS_VERSION=0.1.1 \
+  TOOLS_VERSION=0.1.2 \
   ENVD_REF=2026.17 \
-  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.1
+  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.2
 
 make publish \
-  TOOLS_VERSION=0.1.1-custom.1 \
+  TOOLS_VERSION=0.1.2-custom.1 \
   ENVD_REF=2026.17 \
-  IMAGE=registry.example.com/custom/agentenv-tools:0.1.1-custom.1
+  IMAGE=registry.example.com/custom/agentenv-tools:0.1.2-custom.1
 ```
 
 The **Publish Tools Image** workflow also publishes a selected version. Its
 `tools_version` default only prefills the publication form; it does not select
 the runtime's default tools version.
 
-After publishing and validating a release (for example `0.1.1`), update
+After publishing and validating a release (for example `0.1.2`), update
 `[tools].version` in `config/deps_manifest.toml` to that version, then build and
 roll out AgentENV through the existing deployment process. The manifest is
 embedded in the binary; `server --setup-only` prepares the default tools release

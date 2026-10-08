@@ -35,9 +35,9 @@ use crate::sandbox::{
     network::metadata::MetadataListener,
     ublk::OverlaybdRuntimeHandle,
     CapturedSandboxSnapshot, Executor, FreshSandboxBuildSpec, NetworkManager, PausedSandboxState,
-    ProcessOpts, RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
-    SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxMetadataDocument, SandboxNetworkPolicy, SandboxRuntimeInfo, UblkDeviceManager,
+    RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
+    SandboxForkResult, SandboxForkSpec, SandboxLaunchConfig, SandboxMetadataDocument,
+    SandboxNetworkPolicy, SandboxRuntimeInfo, UblkDeviceManager,
 };
 
 pub struct DragonballSandbox {
@@ -47,6 +47,7 @@ pub struct DragonballSandbox {
     pub(super) runtime: Option<RuntimeStarted>,
     pub(super) restore: Option<Arc<DragonballPausedState>>,
     pub(super) recording: Option<super::startup_pack::RecordingConfig>,
+    pub(super) require_guest_identity: bool,
 }
 
 pub(super) struct RuntimeStarted {
@@ -146,6 +147,7 @@ impl DragonballSandbox {
             runtime: None,
             restore: None,
             recording: None,
+            require_guest_identity: true,
         })
     }
 
@@ -285,6 +287,7 @@ impl DragonballSandbox {
         }
         let instance = uuid::Uuid::new_v4().to_string();
         let socket = resources.work.path().join("runner.sock");
+        let network_started = std::time::Instant::now();
         resources.slot = Some(NetworkManager::global().allocate_any()?);
         let slot = resources.slot.as_mut().unwrap();
         slot.set_egress_policy(launch.network.as_ref())?;
@@ -305,6 +308,7 @@ impl DragonballSandbox {
             ),
             launch.envd_access_token.clone(),
         );
+        let network_us = network_started.elapsed().as_micros() as u64;
         let mut boot_args = format!(
             "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init {}",
             slot.build_ip_boot_arg()
@@ -350,6 +354,33 @@ impl DragonballSandbox {
                 boot_args.push_str(&args);
             }
         }
+        // Start the owned runner while disk provisioning can make progress.
+        // Configure/LoadHeld still wait for every device; failure below drops
+        // RuntimeResources, which reaps the runner before releasing its leases.
+        let spawn_started = std::time::Instant::now();
+        let mut command = tokio::process::Command::new(&policy.runner);
+        command
+            .arg("--runtime")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--work-dir")
+            .arg(resources.work.path())
+            .arg("--instance-id")
+            .arg(&instance)
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            .current_dir(resources.work.path())
+            .stdin(Stdio::null());
+        resources.process = Some(
+            spawn_logged_runner(
+                command,
+                Some(File::open(namespace)?),
+                resources.work.clone(),
+            )
+            .await?,
+        );
+        let spawn_us = spawn_started.elapsed().as_micros() as u64;
+        let disks_started = std::time::Instant::now();
         let root = UblkDeviceManager::global()
             .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
                 source_image_config: &spec.image_config_path,
@@ -470,28 +501,9 @@ impl DragonballSandbox {
                 rate_limiter: policy.disk_rate.clone(),
             });
         }
-        let mut command = tokio::process::Command::new(&policy.runner);
-        command
-            .arg("--runtime")
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--work-dir")
-            .arg(resources.work.path())
-            .arg("--instance-id")
-            .arg(&instance)
-            .arg("--parent-pid")
-            .arg(std::process::id().to_string())
-            .current_dir(resources.work.path())
-            .stdin(Stdio::null());
+        let disks_us = disks_started.elapsed().as_micros() as u64;
         let provisioned_us = started.elapsed().as_micros() as u64;
-        resources.process = Some(
-            spawn_logged_runner(
-                command,
-                Some(File::open(namespace)?),
-                resources.work.clone(),
-            )
-            .await?,
-        );
+        let runner_started = std::time::Instant::now();
         let until = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if resources
@@ -575,11 +587,15 @@ impl DragonballSandbox {
             )
             .await?;
         let configured_us = started.elapsed().as_micros() as u64;
+        let runner_us = spawn_us + runner_started.elapsed().as_micros() as u64;
         let mut memory_ready_us = configured_us;
+        let mut memory_us = 0;
+        let mut load_us = 0;
         let mut memory_base = None;
         let mut startup_prefetch = None;
         // Metadata listener and configured rate buckets are ready before the first KVM_RUN.
         if let Some(saved) = &restore {
+            let memory_started = std::time::Instant::now();
             let state_path = resources.work.path().join("restore-state.json");
             super::capture::write_new_json(&state_path, &saved.artifacts.envelope)?;
             let memory_path = if let Some(recording) = &recording {
@@ -665,6 +681,8 @@ impl DragonballSandbox {
                 }
             };
             memory_ready_us = started.elapsed().as_micros() as u64;
+            memory_us = memory_started.elapsed().as_micros() as u64;
+            let load_started = std::time::Instant::now();
             client
                 .request(
                     RuntimeCommand::LoadHeld(RuntimeSnapshotInput {
@@ -676,17 +694,29 @@ impl DragonballSandbox {
                     Duration::from_secs(30),
                 )
                 .await?;
+            load_us = load_started.elapsed().as_micros() as u64;
         } else {
             client
                 .request(RuntimeCommand::Start, Duration::from_secs(30))
                 .await?;
         }
+        let post_load_started = std::time::Instant::now();
         let pid = resources
             .process
             .as_ref()
             .and_then(|process| process.child.id())
             .context("runner PID missing")?;
         verify_runner_security(pid)?;
+        if restore.is_some() {
+            tracing::debug!(
+                target: "agentenv::sandbox::startup_timing",
+                backend = "dragonball", sandbox_id = %launch.sandbox_id,
+                network_us, disks_us, runner_us, memory_us, load_us,
+                post_load_us = post_load_started.elapsed().as_micros() as u64,
+                total_us = started.elapsed().as_micros() as u64,
+                "restore preparation phase timing"
+            );
+        }
         tracing::debug!(
             sandbox_id = %launch.sandbox_id,
             restored = restore.is_some(),
@@ -772,6 +802,7 @@ impl DragonballSandbox {
                 .notify_sandbox_ready(&base.artifacts.manifest.memory.image_config_path)
                 .await;
         }
+        let daemon_notified_us = started.elapsed().as_micros() as u64;
         let mut vars = self.spec.context.env_vars.clone();
         if let Some(overrides) = &self.launch.env_vars {
             vars.extend(overrides.clone());
@@ -802,49 +833,45 @@ impl DragonballSandbox {
         .await??;
         let initialized_us = started.elapsed().as_micros() as u64;
         let executor = Executor::new(runtime.envd.clone()).with_root_user();
-        let expected = format!("{}\n{}", self.launch.sandbox_id, self.launch.snapshot_id);
         let mut attempts = 0usize;
-        let mut completed = 0usize;
-        let mut last_stdout = None;
-        let identity_started = tokio::time::Instant::now();
-        tokio::time::timeout(budget, async {
-            loop {
-                attempts += 1;
-                let output = executor
-                    .run_command_with_opts(
-                        "/agentenv/bin/busybox",
-                        &[
-                            "sh",
-                            "-ec",
-                            "printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\"",
-                        ],
-                        &ProcessOpts::default().with_cwd("/"),
-                    )
-                    .await?;
-                completed += 1;
-                last_stdout = Some(output.stdout.chars().take(512).collect::<String>());
-                ensure!(output.exit_code == 0, "guest identity probe failed");
-                if output.stdout == expected {
-                    return Ok::<_, anyhow::Error>(());
+        // New instances must replace the identity captured in guest memory.
+        // `/envs` reads the same defaults map that envd uses for new processes;
+        // spawning a shell adds process setup and page faults to this check.
+        // Same-ID paused restore retains its identity and needs no probe.
+        if self.require_guest_identity {
+            let sandbox_id = self.launch.sandbox_id.to_string();
+            let mut completed = 0usize;
+            let identity_started = tokio::time::Instant::now();
+            tokio::time::timeout(budget, async {
+                loop {
+                    attempts += 1;
+                    let matches = runtime
+                        .envd
+                        .guest_identity_matches(&sandbox_id, &self.launch.snapshot_id)
+                        .await?;
+                    completed += 1;
+                    if matches {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    // envd refreshes metadata asynchronously after /init. Probe
+                    // promptly during that first refresh, then retain the slower
+                    // cadence if metadata stays unavailable. The deadline and
+                    // exact identity check remain unchanged.
+                    let retry_ms = if identity_started.elapsed() < Duration::from_millis(100) {
+                        5
+                    } else {
+                        50
+                    };
+                    tokio::time::sleep(Duration::from_millis(retry_ms)).await;
                 }
-                // envd refreshes metadata asynchronously after /init. Probe
-                // promptly during that first refresh, then retain the slower
-                // cadence if metadata stays unavailable. The deadline and
-                // exact identity check remain unchanged.
-                let retry_ms = if identity_started.elapsed() < Duration::from_millis(100) {
-                    5
-                } else {
-                    50
-                };
-                tokio::time::sleep(Duration::from_millis(retry_ms)).await;
-            }
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "envd did not acquire current runtime identity: attempts={attempts}, completed={completed}, last_stdout={last_stdout:?}"
-            )
-        })??;
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "envd did not acquire current runtime identity: attempts={attempts}, completed={completed}"
+                )
+            })??;
+        }
         let identity_us = started.elapsed().as_micros() as u64;
         for (index, drive) in &runtime.new_volume_mounts {
             crate::sandbox::guest::mount_volume(&executor, *index, drive).await?;
@@ -853,7 +880,9 @@ impl DragonballSandbox {
         runtime.ready.store(true, Ordering::Release);
         tracing::debug!(
             sandbox_id = %self.launch.sandbox_id,
-            resumed_us, envd_us, initialized_us, identity_us, attempts,
+            resumed_us, envd_us, initialized_us,
+            daemon_notified_us, identity_us, attempts,
+            identity_required = self.require_guest_identity,
             ready_us = started.elapsed().as_micros() as u64,
             "Dragonball readiness cumulative timing"
         );

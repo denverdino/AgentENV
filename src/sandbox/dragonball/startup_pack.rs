@@ -116,6 +116,7 @@ async fn boot_and_wait(
     vm.factory.policy.extension = None;
     vm.launch.custom_extension_params = None;
     vm.launch.sandbox_id = crate::types::SandboxId::new();
+    vm.require_guest_identity = true;
     vm.recording = Some(config);
     // Allocation/LoadHeld is owned to completion, not cancelled by the record
     // budget. Otherwise a detached boot could still read a deleted config.

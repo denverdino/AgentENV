@@ -198,6 +198,8 @@ else:
         subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                         "commit", "-qm", "fixture"], cwd=source, check=True)
         env = {key: str(self.root / key.lower()) for key in module.REQUIRED}
+        env['AENV_HOME_PATH'] = str(Path(env['AENV_TEST_STATE_DIR']) / 'home')
+        env['AENV_RUNTIME_PATH'] = str(Path(env['AENV_TEST_STATE_DIR']) / 'run')
         for key in ("AENV_TEST_STATE_DIR", "AENV_HOME_PATH", "AENV_RUNTIME_PATH", "AENV_DEPS_PATH"):
             Path(env[key]).mkdir()
         for key in ("AENV_DRAGONBALL_RUNTIME_RUNNER", "AENV_DRAGONBALL_FAULT_RUNNER", "AENV_UBLK_DAEMON_BINARY_PATH"):
@@ -283,6 +285,36 @@ else:
         self.assertEqual(paths[0], self.root / "overlaybd/overlaybd-global.json")
         with self.assertRaisesRegex(ValueError, "input file"):
             module.file_digest(paths[0])
+
+
+
+class FixtureOwnershipTests(unittest.TestCase):
+    def test_fixture_validation_rejects_missing_escaped_and_symlinked_globals(self):
+        import dragonball_regression as regression
+        self.assertTrue(hasattr(regression, 'validate_fixtures'), 'isolated fixture preflight missing')
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory).resolve()
+            home = state / 'home'
+            home.mkdir()
+            config = state / 'config.toml'
+            config.write_text('')
+            env = {'AENV_CONFIG_PATH': str(config), 'AENV_TEST_STATE_DIR': str(state),
+                   'AENV_HOME_PATH': str(home), 'AENV_RUNTIME_PATH': str(state / 'run')}
+            paths = regression.validate_fixtures(env, prepared=False)
+            with self.assertRaisesRegex(ValueError, 'prepare-dragonball-regression'):
+                regression.validate_fixtures(env)
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('{}')
+                path.chmod(0o600)
+            self.assertEqual(regression.validate_fixtures(env), paths)
+            paths[0].unlink()
+            paths[0].symlink_to(paths[1])
+            with self.assertRaisesRegex(ValueError, 'owned|isolated'):
+                regression.validate_fixtures(env)
+            config.write_text('[ublk.overlaybd]\nglobal_config_path="/var/lib/aenv/global.json"\n')
+            with self.assertRaisesRegex(ValueError, 'isolated'):
+                regression.validate_fixtures(env, prepared=False)
 
 
 if __name__ == "__main__":

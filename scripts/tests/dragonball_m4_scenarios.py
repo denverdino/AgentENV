@@ -59,7 +59,7 @@ def process_output(body):
     return result
 
 
-def guest_command(node, sandbox, script):
+def guest_command(node, sandbox, script, *, timeout=None):
     data = json.dumps({"process": {"cmd": "/bin/sh", "args": ["-ec", script]}, "stdin": False}).encode()
     headers = {"Content-Type": "application/connect+json", "Connect-Protocol-Version": "1",
                "x-agentenv-sandbox-id": sandbox["sandboxID"], "x-agentenv-target-port": "49983"}
@@ -67,7 +67,7 @@ def guest_command(node, sandbox, script):
         headers["X-Access-Token"] = sandbox["envdAccessToken"]
     body, _ = request(f"http://{node.address}:8000/process.Process/Start", "POST",
                       struct.pack(">BI", 0, len(data)) + data, headers=headers,
-                      timeout=getattr(node, "request_timeout_seconds", 180))
+                      timeout=getattr(node, "request_timeout_seconds", 180) if timeout is None else timeout)
     result = process_output(body)
     if result["exit_code"] != 0:
         raise RuntimeError("guest command failed: " + str(result))
@@ -90,12 +90,29 @@ def request(url, method="GET", payload=None, expected=200, headers=None, context
         payload = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=payload, method=method, headers=headers)
+    deadline = time.monotonic() + timeout
     try:
         response = urllib.request.urlopen(req, timeout=timeout, context=context)
     except urllib.error.HTTPError as error:
         response = error
     with response:
-        body = response.read()
+        stream = response.fp if isinstance(response, urllib.error.HTTPError) else response
+        # urllib's timeout is an idle socket timeout. Streaming keepalives must
+        # not extend the response budget; read1 returns after one buffered read.
+        sock = stream.fp.raw._sock
+        chunks = []
+        while not stream.isclosed():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("HTTP response deadline exceeded")
+            sock.settimeout(remaining)
+            chunk = stream.read1(64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise TimeoutError("HTTP response deadline exceeded")
+        body = b"".join(chunks)
         check_status(response.status, expected, body)
         return body, dict(response.headers)
 
@@ -251,6 +268,13 @@ def fixtures(lab, inputs, services):
     return cert, "10.241.0.1:5443/m4/rootfs:native", assets
 
 
+def network_cache_slots(inputs):
+    value = inputs.get("network_cache_slots", 1)
+    if type(value) is not int or value not in (0, 1):
+        raise ValueError("network_cache_slots must be 0 or 1")
+    return value
+
+
 def start_server(node, inputs, cert, assets, backend="dragonball"):
     node.request_timeout_seconds = inputs.get("request_timeout_seconds", 180)
     deps = node.root / "deps"
@@ -274,14 +298,14 @@ binary_path = {json.dumps(assets["runner_path"])}
 version = {json.dumps(kernel_version)}
 image_path = {json.dumps(kernel_path)}
 [tools]
-version = "0.1.0"
+version = {json.dumps(inputs.get("tools_version", "0.1.0"))}
 drive_path = {json.dumps(assets["tools_path"])}
 [ublk]
 daemon_binary_path = {json.dumps(inputs["daemon"])}
 daemon_metrics_listen_addr = ""
 [pool]
 low_watermark = 0
-high_watermark = 1
+high_watermark = {network_cache_slots(inputs)}
 [pool.network]
 enabled = false
 maintenance_enabled = false
@@ -326,12 +350,19 @@ timeout_secs = {inputs.get("oss_timeout_seconds", 30)}
     regctl.write_text(json.dumps({"version": 1, "hosts": {"10.241.0.1:5443": {
         "tls": "enabled", "regCert": cert.read_text()}}}))
     server = inputs["server"] if backend == "dragonball" else inputs["server_fc"]
+    from dragonball_m4_inputs import check as check_inputs
+    report = check_inputs({'toml': [str(config)], 'json': [str(regctl)], 'executables': [server]},
+                          run_user=node.lab.run_user)
+    if not report['ok']:
+        raise ValueError('generated runtime input preflight refused: ' + '; '.join(report['errors']))
     identity = json.loads(node.run([server, "--component-info-json"]).stdout)
     assert identity["backend"] == backend and identity[backend], identity
     assert not identity["firecracker" if backend == "dragonball" else "dragonball"], identity
     identity["runtime_uid"] = int(node.run(["id", "-u"]).stdout)
     assert identity["runtime_uid"] != 0
-    child = node.spawn(["env", "AENV_API_KEY=" + API_KEY, "REGCTL_CONFIG=" + str(regctl),
+    timing_env = (["RUST_LOG=info,agentenv::sandbox::startup_timing=debug,agentenv::sandbox::dragonball::sandbox=debug"]
+                  if inputs.get('phase_timing_versions') else [])
+    child = node.spawn(["env", *timing_env, "AENV_API_KEY=" + API_KEY, "REGCTL_CONFIG=" + str(regctl),
                         "SSL_CERT_FILE=" + str(cert), "API_ADDR=0.0.0.0:8000",
                         server, "--config", str(config)], node.lab.root / (node.name + ".server.log"))
     wait_http(f"http://{node.address}:8000/health", timeout=90)
@@ -415,6 +446,7 @@ def run_restore(lab, inputs):
 
 
 def validate_inputs(inputs, scenario, uid):
+    network_cache_slots(inputs)
     if uid != 0:
         raise ValueError("M4 requires root orchestration; workloads run as aenv")
     for name in ("oss_timeout_seconds", "request_timeout_seconds"):

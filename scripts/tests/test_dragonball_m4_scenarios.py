@@ -2,11 +2,11 @@
 import importlib.util
 import contextlib
 import http.server
-import io
 import json
 import struct
 import tempfile
 import threading
+import time
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
@@ -31,6 +31,7 @@ def bucket_service(responses):
             requests.append((self.path, self.headers.get("Authorization", "")))
             status, body = responses[min(len(requests) - 1, len(responses) - 1)]
             self.send_response(status)
+            self.send_header("Content-Length", str(len(body.encode())))
             self.end_headers()
             self.wfile.write(body.encode())
 
@@ -49,6 +50,52 @@ def bucket_service(responses):
 
 
 class ScenarioTests(unittest.TestCase):
+    def test_request_deadline_includes_a_continuously_active_response_body(self):
+        implementation = module()
+        stopped = threading.Event()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        self.wfile.write(b"1\r\nx\r\n")
+                        self.wfile.flush()
+                        if stopped.wait(0.02):
+                            break
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01))
+        thread.start()
+        try:
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                implementation.request(f"http://127.0.0.1:{server.server_port}/", timeout=0.2)
+            self.assertLess(time.monotonic() - started, 0.6)
+        finally:
+            stopped.set()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+    def test_request_preserves_success_and_error_response_bodies(self):
+        implementation = module()
+        for status in (200, 503):
+            with self.subTest(status=status), bucket_service([(status, "response-body")]) as (endpoint, _):
+                body, _ = implementation.request(endpoint, "PUT", expected=status, timeout=2)
+                self.assertEqual(body, b"response-body")
+                if status != 200:
+                    with self.assertRaisesRegex(RuntimeError, "HTTP 503.*response-body"):
+                        implementation.request(endpoint, "PUT", timeout=2)
+
     def test_scenario_reclaims_each_node_after_close_even_when_an_operation_or_cleanup_fails(self):
         for failure_stage in (None, "operation", "lab close"):
             for cleanup_fails in (False, True):
@@ -124,11 +171,18 @@ class ScenarioTests(unittest.TestCase):
                 node = SimpleNamespace(address="127.0.0.1")
                 if configured is not None:
                     node.request_timeout_seconds = configured
-                response = io.BytesIO(b'{}')
-                response.status, response.headers = 200, {}
-                with patch.object(implementation.urllib.request, "urlopen", return_value=response) as opened:
+                with patch.object(implementation, "request", return_value=(b'{}', {})) as opened:
                     self.assertEqual(implementation.api(node, "/snapshots"), {})
                 self.assertEqual(opened.call_args.kwargs["timeout"], expected)
+
+    def test_network_cache_slots_are_explicit_and_bounded(self):
+        implementation = module()
+        self.assertTrue(hasattr(implementation, "network_cache_slots"))
+        self.assertEqual(implementation.network_cache_slots({}), 1)
+        self.assertEqual(implementation.network_cache_slots({"network_cache_slots": 0}), 0)
+        for value in (-1, 2, True, "0"):
+            with self.assertRaises(ValueError):
+                implementation.network_cache_slots({"network_cache_slots": value})
 
     def test_preflight_validates_explicit_timeout_budgets(self):
         implementation = module()
@@ -156,11 +210,20 @@ class ScenarioTests(unittest.TestCase):
              {"stdout": "", "stderr": "", "exit_code": 0}),
         ):
             with self.subTest(body=body):
-                response = io.BytesIO(body)
-                response.status, response.headers = 200, {}
-                with patch.object(implementation.urllib.request, "urlopen", return_value=response) as opened:
+                with patch.object(implementation, "request", return_value=(body, {})) as opened:
                     self.assertEqual(call(), expected)
                 self.assertEqual(opened.call_args.kwargs["timeout"], 600)
+
+    def test_guest_command_accepts_per_request_remaining_budget(self):
+        import inspect
+        implementation = module()
+        self.assertIn("timeout", inspect.signature(implementation.guest_command).parameters)
+        node = SimpleNamespace(address="127.0.0.1", request_timeout_seconds=600)
+        with patch.object(implementation, "request", return_value=(b"stream", {})) as request, \
+             patch.object(implementation, "process_output", return_value={"exit_code": 0}):
+            implementation.guest_command(node, {"sandboxID": "guest"}, "true", timeout=1.25)
+        self.assertEqual(request.call_args.kwargs["timeout"], 1.25)
+        self.assertEqual(node.request_timeout_seconds, 600)
 
     def test_fixture_budget_is_explicit_and_invalid_budget_allocates_nothing(self):
         with tempfile.TemporaryDirectory() as directory:

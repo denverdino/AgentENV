@@ -89,12 +89,12 @@ build-server-release:
 	$(CARGO) build --release -p agentenv --bin server
 
 .PHONY: build-server-dragonball
-build-server-dragonball:
+build-server-dragonball: check-dragonball-revision
 	$(CARGO) build -p agentenv --bin server --no-default-features --features hypervisor-dragonball
 	$(CARGO) build -p agentenv-dragonball-runner --bin aenv-dragonball --locked
 
 .PHONY: build-server-dragonball-release package-dragonball test-package-dragonball
-build-server-dragonball-release:
+build-server-dragonball-release: check-dragonball-revision
 	$(CARGO) build --release --locked -p agentenv --bin server --no-default-features --features hypervisor-dragonball
 	$(CARGO) build --release --locked -p agentenv-dragonball-runner --bin aenv-dragonball -p uvm-ublk-daemon --bin uvm-ublk-daemon
 
@@ -154,7 +154,7 @@ coverage:
 test: test-agent test-envd test-ublk
 
 .PHONY: test-vmm-unit
-test-vmm-unit:
+test-vmm-unit: check-dragonball-revision
 	$(CARGO) test -p agentenv-vmm-protocol -p agentenv-dragonball-runner --locked
 
 test-unit: test-vmm-unit
@@ -178,7 +178,7 @@ DRAGONBALL_TEST_ENV = PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 DRAGONBALL_TEST_RUNNER = $(subst scripts/run-with-capabilities.sh,scripts/tests/run-dragonball-tests.sh $(1),$(CAPABILITY_RUNNER))
 
 .PHONY: prepare-dragonball-tests test-dragonball-probe test-dragonball-dual-backend test-dragonball-runtime test-dragonball-platform
-prepare-dragonball-tests:
+prepare-dragonball-tests: check-dragonball-revision
 	test "$$(id -u)" != 0
 	test -n "$${AENV_CONFIG_PATH:-}" && test -r "$$AENV_CONFIG_PATH"
 	$(CARGO) build -p agentenv-dragonball-runner --bin aenv-dragonball --example reply-fault --locked
@@ -187,15 +187,17 @@ prepare-dragonball-tests:
 	$(CAPABILITY_TEST_ENV) $(CARGO) run -p agentenv $(DRAGONBALL_TEST_FEATURES) --example dragonball_test_assets -- \
 		"$(DEBUG_PROFILE_DIR)/aenv-dragonball" "$(DRAGONBALL_TEST_ASSETS)"
 
-test-dragonball-probe test-dragonball-dual-backend: DRAGONBALL_TEST_FEATURES = --features hypervisor-dragonball
-test-dragonball-probe: prepare-dragonball-tests test-vmm-unit
+test-dragonball-probe test-dragonball-dual-backend test-dragonball-dual-library: DRAGONBALL_TEST_FEATURES = --features hypervisor-dragonball
+.PHONY: test-dragonball-dual-library
+test-dragonball-dual-library: prepare-dragonball-tests test-vmm-unit
 	$(CARGO) test -p agentenv $(DRAGONBALL_TEST_FEATURES) --lib dragonball:: --locked
+
+test-dragonball-probe: test-dragonball-dual-library
 	$(DRAGONBALL_TEST_ENV) $(call DRAGONBALL_TEST_RUNNER,--probe) \
 	$(CARGO) test -p agentenv $(DRAGONBALL_TEST_FEATURES) --test integration dragonball_probe:: --locked -- --ignored --test-threads=1 --nocapture
 
-test-dragonball-dual-backend: prepare-dragonball-tests test-vmm-unit
+test-dragonball-dual-backend: test-dragonball-dual-library
 	$(CARGO) test -p agentenv-dragonball-runner --lib runtime_adapter_preserves_full_memory_export_budget --locked -- --ignored
-	$(CARGO) test -p agentenv $(DRAGONBALL_TEST_FEATURES) --lib dragonball:: --locked
 	$(DRAGONBALL_TEST_ENV) $(call DRAGONBALL_TEST_RUNNER,--probe) \
 	$(CARGO) test -p agentenv $(DRAGONBALL_TEST_FEATURES) --test integration dragonball_lifecycle:: --locked -- --ignored --test-threads=1 --nocapture
 
@@ -207,10 +209,19 @@ test-dragonball-runtime: prepare-dragonball-tests test-vmm-unit
 
 # Daily development: prepare once, select functional suites, execute without Cargo.
 REGRESSION_PYTHON ?= python3
+# Indirection keeps make -n from executing the Python preparation wrapper.
+REGRESSION_MAKE = $(MAKE)
 AENV_REGRESSION_BINARY ?= $(AENV_TEST_STATE_DIR)/regression-integration
 AENV_REGRESSION_ARGS ?=
 .PHONY: prepare-dragonball-regression test-dragonball-regression test-regression-tools
-prepare-dragonball-regression: prepare-dragonball-tests
+prepare-dragonball-regression:
+	$(CAPABILITY_TEST_ENV) AENV_TEST_STATE_DIR="$(AENV_TEST_STATE_DIR)" \
+	$(REGRESSION_PYTHON) scripts/tests/dragonball_regression_prepare.py $(REGRESSION_MAKE) _prepare-dragonball-regression
+
+.PHONY: _prepare-dragonball-regression
+_prepare-dragonball-regression:
+	$(REGRESSION_PYTHON) scripts/tests/dragonball_regression_prepare.py --assert-locked
+	$(MAKE) prepare-dragonball-tests
 	$(CARGO) test -p agentenv $(DRAGONBALL_TEST_FEATURES) --test integration --locked --no-run --message-format=json > "$(AENV_TEST_STATE_DIR)/regression-build.jsonl"
 	$(REGRESSION_PYTHON) -c 'import json, pathlib, shutil, sys; rows = [json.loads(s) for s in pathlib.Path(sys.argv[1]).read_text().splitlines()]; paths = [r["executable"] for r in rows if r.get("reason") == "compiler-artifact" and r.get("target", {}).get("name") == "integration" and r.get("executable")]; assert len(paths) == 1, paths; shutil.copy2(paths[0], sys.argv[2])' "$(AENV_TEST_STATE_DIR)/regression-build.jsonl" "$(AENV_REGRESSION_BINARY)"
 
@@ -221,7 +232,7 @@ test-dragonball-regression:
 		--binary "$(AENV_REGRESSION_BINARY)" --output "$(AENV_REGRESSION_OUTPUT)" $(AENV_REGRESSION_ARGS)
 
 test-regression-tools:
-	$(REGRESSION_PYTHON) scripts/tests/test_dragonball_regression.py
+	$(REGRESSION_PYTHON) -m unittest discover -s scripts/tests -p 'test_dragonball_regression*.py' -v
 
 # Native S3/registry fixtures are explicitly provisioned, never silently skipped.
 test-dragonball-platform: prepare-dragonball-tests
@@ -242,6 +253,10 @@ test-dragonball-m3: test-dragonball-platform
 # Opt-in: root only orchestrates isolated namespaces; all workloads use aenv.
 # Explicit immutable binaries/assets in JSON; no build or installation here.
 .PHONY: test-dragonball-m4 test-dragonball-m4-unit test-dragonball-m4-physical test-dragonball-m4-performance
+.PHONY: check-dragonball-revision
+check-dragonball-revision:
+	$(REGRESSION_PYTHON) scripts/tests/dragonball_revision.py
+
 test-hypervisor-tools:
 	@test "$$(uname -s)" = Linux || { echo 'hypervisor lab contracts require Linux' >&2; exit 2; }
 	$(REGRESSION_PYTHON) -m unittest discover -s scripts/tests -p 'test_dragonball_m4*.py' -v

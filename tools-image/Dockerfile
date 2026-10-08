@@ -14,7 +14,7 @@
 #
 # Build example:
 #
-#   make -C tools-image TOOLS_VERSION=0.1.1 ENVD_REF=2026.17
+#   make -C tools-image TOOLS_VERSION=0.1.2 ENVD_REF=2026.17
 #
 # Important build args:
 #   TOOLS_VERSION        Immutable AgentENV tools drive release version.
@@ -26,7 +26,7 @@
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl
 ARG DEBIAN_VERSION=bookworm
 ARG GO_VERSION=1.25.9
-ARG TOOLS_VERSION=0.1.1
+ARG TOOLS_VERSION=0.1.2
 
 # ---------------------------------------------------------------------------
 # Stage 1: compile envd from upstream source.
@@ -55,6 +55,10 @@ RUN set -eux; \
 
 WORKDIR /src/infra/packages/envd
 
+COPY patches/envd-immediate-mmds.patch /src/envd-immediate-mmds.patch
+RUN git -C /src/infra apply --check /src/envd-immediate-mmds.patch \
+    && git -C /src/infra apply /src/envd-immediate-mmds.patch
+
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     set -eux; \
@@ -65,7 +69,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     commit_sha="$(git -C /src/infra rev-parse --short HEAD)"; \
     CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" \
       go build \
-        -ldflags "-X=main.commitSHA=${commit_sha} -s -w" \
+        -ldflags "-X=main.commitSHA=${commit_sha}-aenv-mmds1 -s -w" \
         -o /out/envd \
         .; \
     chmod 0755 /out/envd; \

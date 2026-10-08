@@ -13,6 +13,14 @@ class EntryTests(unittest.TestCase):
             text=True, capture_output=True, timeout=10,
         )
 
+    def test_combined_probe_and_dual_backend_runs_shared_library_once(self):
+        result = self.invoke("-n", "test-dragonball-probe", "test-dragonball-dual-backend")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("--lib dragonball:: --locked"), 1)
+        self.assertIn("runtime_adapter_preserves_full_memory_export_budget", result.stdout)
+        self.assertIn("--test integration dragonball_probe::", result.stdout)
+        self.assertIn("--test integration dragonball_lifecycle::", result.stdout)
+
     def test_physical_requires_explicit_host_inputs(self):
         result = self.invoke("test-dragonball-m4-physical", "AENV_M4_HOSTS=", "AENV_M4_OUTPUT=")
         self.assertNotEqual(result.returncode, 0)

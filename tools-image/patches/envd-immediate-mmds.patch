@@ -1,0 +1,145 @@
+--- a/packages/envd/internal/host/mmds.go
++++ b/packages/envd/internal/host/mmds.go
+@@ -139,8 +139,9 @@
+ 	httpClient := &http.Client{}
+ 	defer httpClient.CloseIdleConnections()
+ 
+-	ticker := time.NewTicker(50 * time.Millisecond)
+-	defer ticker.Stop()
++	// Try immediately; only failed requests pay the retry delay.
++	timer := time.NewTimer(0)
++	defer timer.Stop()
+ 
+ 	for {
+ 		select {
+@@ -148,10 +149,14 @@
+ 			fmt.Fprintf(os.Stderr, "context cancelled while waiting for mmds opts")
+ 
+ 			return
+-		case <-ticker.C:
++		case <-timer.C:
++			if ctx.Err() != nil {
++				return
++			}
+ 			token, err := getMMDSToken(ctx, httpClient)
+ 			if err != nil {
+ 				fmt.Fprintf(os.Stderr, "error getting mmds token: %v\n", err)
++				timer.Reset(50 * time.Millisecond)
+ 
+ 				continue
+ 			}
+@@ -159,6 +164,7 @@
+ 			mmdsOpts, err := getMMDSOpts(ctx, httpClient, token)
+ 			if err != nil {
+ 				fmt.Fprintf(os.Stderr, "error getting mmds opts: %v\n", err)
++				timer.Reset(50 * time.Millisecond)
+ 
+ 				continue
+ 			}
+--- /dev/null
++++ b/packages/envd/internal/host/mmds_initial_refresh_test.go
+@@ -0,0 +1,104 @@
++package host
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/envd/internal/utils"
++)
++
++type mmdsRefreshTransport func(*http.Request) (*http.Response, error)
++
++func (f mmdsRefreshTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++
++func TestPollForMMDSOptsInitialRefresh(t *testing.T) {
++	// Serial subtests restore the global default before any parallel host tests run.
++	for _, tc := range []struct {
++		name     string
++		fail     string
++		cancel   bool
++		canceled bool
++	}{
++		{name: "immediate"}, {name: "token_retry", fail: "token"}, {name: "metadata_retry", fail: "metadata"},
++		{name: "cancel_retry", fail: "token", cancel: true}, {name: "already_canceled", canceled: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			synctest.Test(t, func(t *testing.T) {
++				ctx, cancel := context.WithCancel(context.Background())
++				defer cancel()
++				if tc.canceled {
++					cancel()
++				}
++				if tc.cancel {
++					time.AfterFunc(25*time.Millisecond, cancel)
++				}
++				started := time.Now()
++				var times []time.Duration
++				failed := false
++				original := http.DefaultTransport
++				defer func() { http.DefaultTransport = original }()
++				http.DefaultTransport = mmdsRefreshTransport(func(r *http.Request) (*http.Response, error) {
++					times = append(times, time.Since(started))
++					kind := "metadata"
++					body := `{"instanceID":"child","envID":"template"}`
++					if r.Method == http.MethodPut {
++						kind = "token"
++						body = "token"
++					} else if len(r.Header["X-metadata-token"]) != 1 || r.Header["X-metadata-token"][0] != "token" {
++						t.Fatal("missing metadata token")
++					}
++					if kind == tc.fail && !failed {
++						failed = true
++						return nil, errors.New("injected refresh failure")
++					}
++					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
++				})
++				vars := utils.NewMap[string, string]()
++				PollForMMDSOpts(ctx, make(chan *MMDSOpts), vars)
++				elapsed := time.Since(started)
++				if tc.canceled {
++					if len(times) != 0 {
++						t.Fatalf("canceled context made requests: %v", times)
++					}
++					return
++				}
++				if len(times) == 0 || times[0] != 0 {
++					t.Fatalf("first request should be immediate: %v", times)
++				}
++				if tc.cancel {
++					if elapsed != 25*time.Millisecond || len(times) != 1 {
++						t.Fatalf("retry did not stop on cancellation: elapsed=%v requests=%v", elapsed, times)
++					}
++					if _, ok := vars.Load("E2B_SANDBOX_ID"); ok {
++						t.Fatal("failed request published identity")
++					}
++					return
++				}
++				want := time.Duration(0)
++				count := 2
++				if tc.fail != "" {
++					want = 50 * time.Millisecond
++					count = 3
++					if tc.fail == "metadata" {
++						count = 4
++					}
++				}
++				if elapsed != want || len(times) != count {
++					t.Fatalf("unexpected retry cadence: elapsed=%v requests=%v", elapsed, times)
++				}
++				if got, _ := vars.Load("E2B_SANDBOX_ID"); got != "child" {
++					t.Fatalf("wrong sandbox: %q", got)
++				}
++				if got, _ := vars.Load("E2B_TEMPLATE_ID"); got != "template" {
++					t.Fatalf("wrong template: %q", got)
++				}
++			})
++		})
++	}
++}

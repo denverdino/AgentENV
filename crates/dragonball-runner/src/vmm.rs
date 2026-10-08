@@ -608,9 +608,11 @@ impl crate::runtime_service::RuntimeVmm for DragonballVmm {
         input: &agentenv_vmm_protocol::runtime::RuntimeSnapshotInput,
     ) -> anyhow::Result<agentenv_vmm_protocol::runtime::CaptureReport> {
         use std::{
-            io::{Read, Seek, Write},
+            io::{BufWriter, Read, Seek, Write},
             os::unix::fs::OpenOptionsExt,
         };
+        let started = Instant::now();
+        let (mut decoded_us, mut rebound_us, mut checked_us) = (0u64, 0u64, 0u64);
         let files = (|| -> anyhow::Result<dragonball::snapshot::capture::SnapshotFiles> {
             anyhow::ensure!(
                 input.state_path.is_absolute() && input.memory_path.is_absolute(),
@@ -649,9 +651,11 @@ impl crate::runtime_service::RuntimeVmm for DragonballVmm {
                 envelope.identity == input.identity,
                 "snapshot runtime identity mismatch"
             );
+            decoded_us = started.elapsed().as_micros() as u64;
             let bindings = self.runtime_bindings()?;
             let restored =
                 crate::runtime_snapshot::restore_state(&envelope, &bindings, backing.capacity)?;
+            rebound_us = started.elapsed().as_micros() as u64;
             let mut block_bindings = Vec::new();
             for disk in &envelope.machine.block_devices {
                 let current = bindings
@@ -686,6 +690,7 @@ impl crate::runtime_service::RuntimeVmm for DragonballVmm {
                 }
                 file.seek(std::io::SeekFrom::Start(0))?;
             }
+            checked_us = started.elapsed().as_micros() as u64;
             // Rehydrate only into a private, immediately unlinked owned file.
             let local_path = self.work_root.join(format!(".restore-{generation}.json"));
             let mut local_state = OpenOptions::new()
@@ -695,19 +700,32 @@ impl crate::runtime_service::RuntimeVmm for DragonballVmm {
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&local_path)?;
             std::fs::remove_file(&local_path)?;
-            serde_json::to_writer(&mut local_state, &restored)?;
-            local_state.flush()?;
+            {
+                let mut writer = BufWriter::new(&mut local_state);
+                serde_json::to_writer(&mut writer, &restored)?;
+                writer.flush()?;
+            }
             local_state.seek(std::io::SeekFrom::Start(0))?;
             let mut files = dragonball::snapshot::capture::SnapshotFiles::new(local_state, memory);
             files.block_bindings = block_bindings;
             Ok(files)
         })()
         .map_err(|error| anyhow::Error::new(crate::runtime_service::RuntimeKnownError(error)))?;
+        let serialized_us = started.elapsed().as_micros() as u64;
         let data = self.runtime_action(VmmAction::LoadSnapshotHeld {
             generation,
             deadline: self.deadline,
             files,
         })?;
+        tracing::debug!(
+            generation,
+            decoded_us,
+            rebound_us,
+            checked_us,
+            serialized_us,
+            completed_us = started.elapsed().as_micros() as u64,
+            "Dragonball LoadHeld adapter timing (cumulative)"
+        );
         Self::runtime_report(data)
     }
 
