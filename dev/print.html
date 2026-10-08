@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cc57b59d.js";
+            window.path_to_searchindex_js = "searchindex-fcbf58f7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c125be5b.js"></script>
@@ -4055,11 +4055,16 @@ record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.</p>
 <h2 id="snapshotmemory_startup_pack"><a class="header" href="#snapshotmemory_startup_pack"><code>[snapshot.memory_startup_pack]</code></a></h2>
 <p>Optional startup-memory trace recording and best-effort prefetch for both
-<code>oss</code> and <code>posix_fs</code> repositories. It is disabled by default. Publishing never
-waits for recording: a completed trace is encoded as a SHA-256-verified
-manifest and attached to the already committed snapshot. Snapshots without a
+<code>oss</code> and <code>posix_fs</code> repositories. It is disabled by default. Snapshot publication
+does not await recording or manifest publication: a completed trace is encoded as
+a SHA-256-verified manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
 resume through the ordinary on-demand path.</p>
+<p>This applies to launching a new sandbox from a published template or checkpoint.
+Normal same-ID pause/resume does not record a startup manifest or inherit the
+template’s manifest: pause captures a fresh state with no startup-prefetch
+descriptor. Startup access patterns must not be assumed to represent the
+workload at a later pause point.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -4072,11 +4077,27 @@ resume through the ordinary on-demand path.</p>
 <tr><td><code>record_max_window_ms</code></td><td>integer</td><td><code>2000</code></td><td>Hard recorder observation-window cap.</td></tr>
 <tr><td><code>record_budget_secs</code></td><td>integer</td><td><code>10</code></td><td>Best-effort recording budget; it never blocks the snapshot publish.</td></tr>
 <tr><td><code>max_pack_bytes</code></td><td>integer</td><td><code>1073741824</code></td><td>Maximum recorded page-data budget and POSIX logical prefetch budget.</td></tr>
-<tr><td><code>consume_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable resume-time prefetch; leave disabled for rollout and A/B comparisons.</td></tr>
+<tr><td><code>consume_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable prefetch when launching from a template/checkpoint with a startup manifest; normal same-ID pause/resume is excluded.</td></tr>
 <tr><td><code>consume_timeout_secs</code></td><td>integer</td><td><code>30</code></td><td>Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it.</td></tr>
 </tbody>
 </table>
 </div>
+<p>Recording and consumption are independent. A snapshot-producing node can use
+<code>enabled = true, consume_enabled = false</code>; a restore node can use
+<code>enabled = false, consume_enabled = true</code>. Set both to <code>true</code> when one node serves
+both roles. Recording starts a temporary VM and consumes CPU, memory and I/O;
+prefetch can bring reads forward or fetch pages the foreground does not need.
+Keep these costs in the workload’s resource budget.</p>
+<p>A snapshot API response does not mean its startup manifest has been published.
+Immediate restores can therefore use the ordinary demand-read path even with
+consumption enabled. Enabling consumption also does not generate manifests for
+old snapshots. In an A/B test, verify the descriptor is present before either
+variant, use separate producer and consumer OverlayBD caches, and hold the
+recording setting constant. Otherwise the recorder’s cache warming can obscure the effect
+of consumption. Shared host and object-store caches still affect the result.
+Check actual prefetch reads as well as task completion logs.
+See the <a href="#hypervisor-验证摘要与已知限制">hypervisor validation results</a>
+for the measured workload and its limits.</p>
 <p>For POSIX, the resolver hands the normal sandbox start path a <code>LocalPath</code>
 manifest. After acquiring the actual shared memory ublk device, the executor
 reads its logical manifest ranges through a buffered device handle, concurrently
@@ -4734,10 +4755,16 @@ guest 继续使用 envd。SnapshotManager、卷管理、模板和控制面保持
 相同的严格校验。网卡仍接入现有 TAP/namespace，metadata listener 为 guest 提供
 当前 sandbox/template 身份。</p>
 <p>恢复先处于 LoadedHeld，完成身份、设备和限速绑定后再运行 guest。readiness
-初始化最终 USER/WORKDIR/环境变量，内部挂盘和身份探测明确使用 root 与 <code>/</code>。
-准确身份确认和 runner 安全检查完成后才发布 ready，不能用 socket 存在或 envd
-health 成功代替该屏障。生命周期实现见
-<a href="../../src/sandbox/dragonball/sandbox.rs">sandbox.rs</a>。</p>
+等待 envd health 和 <code>/init</code>，初始化最终 USER/WORKDIR/环境变量；内部挂盘明确
+使用 root 与 <code>/</code>，并保留 runner 安全检查。</p>
+<p>新建 sandbox、快照/模板创建、fork 和启动预取记录器会产生新身份，必须确认 guest
+已读取当前 sandbox/template 身份后才发布 ready。身份确认使用带 runtime token 的
+envd <code>/envs</code>，精确核对两个字段；该接口与新命令读取同一份默认环境，避免为校验
+额外启动 shell。<code>/init</code> 的异步 metadata 刷新仍须等到字段匹配，保留原有截止时间。
+同 ID 的 pause/resume（包括服务重启后恢复原暂停实例）跳过内部身份轮询；它仍保留健康检查、初始化和
+必要挂盘。原地释放暂停的运行时沿用已有身份。
+性能评测分别记录 API 返回耗时和准确身份就绪耗时，两后端使用相同的外部身份检查。
+生命周期实现见 <a href="../../src/sandbox/dragonball/sandbox.rs">sandbox.rs</a>。</p>
 <h2 id="捕获内存与存储"><a class="header" href="#捕获内存与存储">捕获、内存与存储</a></h2>
 <p>捕获使用跨 vCPU 和设备 I/O 的 hold/drain 屏障；单独暂停 vCPU 不代表设备写入
 已经停止。磁盘封层、restack、附加盘和卷状态须与所捕获内存保持一致。
@@ -4818,7 +4845,11 @@ make test-dragonball-regression
 make test-dragonball-regression AENV_REGRESSION_ARGS=--resume
 </code></pre>
 <p><code>REGRESSION_PYTHON</code> 可指定 Python 3.11+ 的可执行路径。
-准备阶段保留 <code>state/regression-build.jsonl</code>，从 Cargo 的 compiler-artifact 中
+准备入口在构建和显式 <code>--setup-only</code> 之前取得主机锁并预检。新状态目录在磁盘、
+路径和所有权检查通过后创建；四份 OverlayBD global JSON 必须位于隔离 HOME，
+准备完成后校验并记录摘要。此入口仍可能安装或下载已有 setup 所需的依赖；
+测试执行入口不会隐式调用准备。准备日志保留在 <code>state/prepare-*/build.log</code>。</p>
+<p>准备阶段保留 <code>state/regression-build.jsonl</code>，从 Cargo 的 compiler-artifact 中
 选取 integration harness，复制为 <code>state/regression-integration</code>；测试阶段不构建。
 assets 保存为 <code>state/dragonball-assets.json</code>。
 <code>AENV_REGRESSION_BINARY</code> 可覆盖 harness 路径，提供已有的冻结 DB-only harness。
@@ -4854,6 +4885,90 @@ assets 保存为 <code>state/dragonball-assets.json</code>。
 也不能复用为通过。恢复前仍执行预检：存在 ublk 设备或已知 runner/daemon 进程时
 拒绝运行，要求先审计。工具不负责删除残留设备、历史快照或共享数据。
 不同结果目录共用同一状态目录时也互斥，但不会替其他测试工具加锁。</p>
+<p><code>make prepare-dragonball-regression</code>、功能套件的隔离执行器、
+<code>dragonball_m4_build.py</code> 与 M4 <code>Lab</code> 共用主机锁
+<code>/var/tmp/agentenv-dragonball-test-host.lock</code>，跨 checkout、状态目录和 root/测试账号
+互斥；冲突立即失败。准备、构建、功能进程通过经过校验的文件描述符传递锁，
+递归 Make 与受支持子进程共享租约；控制器退出时，存活子进程仍持锁。
+M4 Lab 的锁由控制器持有，以便审计恢复入口在控制器被杀后取得锁；残留 cgroup
+和 ublk 检查会阻止新测试直接进入。锁文件不删除，不能把锁释放视为清理完成。
+直接调用任意 Cargo、<code>prepare-dragonball-tests</code>、独立 runner CLI 和其他 Make
+入口不在此互斥范围内。</p>
+<p>共享预检支持非 root 构建／功能模式。所有 M4 Lab 入口默认预检，默认磁盘预留
+20 GiB；显式 profile 可指定工作负载预算。<code>resources-*.json</code> 将准备、构建、
+功能和 Lab 的控制器、目录／cgroup 身份、输入与证据摘要、结果和清理状态关联。
+这是证据清单，不授予新删除权限；失败与中断状态保留，SIGKILL 可能留下 <code>running</code>。
+现有 M4 成功 payload GC 仍执行独立归属和引用检查，其他状态不自动删除。</p>
+<h3 id="m4-中断后的审计与恢复"><a class="header" href="#m4-中断后的审计与恢复">M4 中断后的审计与恢复</a></h3>
+<p>功能隔离执行器和 M4 Lab 在取得主机锁后检查残留 <code>db-m4.*</code> cgroup 与 ublk
+设备，发现残留即拒绝启动。M4 Lab 将 root/cgroup 的设备号和 inode、主机 boot ID、
+控制器 PID/启动时间以及已就绪的命名空间写入 root 所有的 <code>lab-manifest.json</code>。
+新入口可审计这份清单，并在控制器已退出且身份匹配时回收该 cgroup 内的进程：</p>
+<pre><code class="language-bash"># 使用日志中明确记录的单个 Lab 路径；默认只读，不回收资源。
+sudo python3 scripts/tests/dragonball_m4_recovery.py --root /var/tmp/db-m4.RUN_ID
+# 明确执行回收，保留状态目录、日志、失败镜像和所有 ublk 设备。
+sudo python3 scripts/tests/dragonball_m4_recovery.py --root /var/tmp/db-m4.RUN_ID --apply
+</code></pre>
+<p>入口与测试共用主机锁，拒绝与正在执行的任务并行。主机重启、root/cgroup 身份不符、
+缺少清单或清单路径不可信时拒绝回收；旧实验目录不能仅凭名字自动接管。
+JSON 的 <code>clean</code> 返回 0；<code>orphaned</code>、<code>active</code>、<code>manual_review</code> 均不是清理成功。
+每次实际恢复尝试独立保存 <code>recovery-*.json</code>，允许在处理阻塞项后重复执行。</p>
+<p>恢复仅针对已确认归属的进程/cgroup。残留 ublk 设备和外部进程的文件、挂载及
+命名空间引用会列入 <code>manual_review</code>；历史日志中的设备编号不能证明当前归属，
+不会据此删除设备。此入口不删除历史数据，也不替代通用 GC 或跨套件续跑。
+真实 SIGKILL 资格测试使用隔离命名空间、非 root 工作负载，不启动 VM：</p>
+<pre><code class="language-bash">sudo env PYTHONDONTWRITEBYTECODE=1 python3 scripts/tests/test_dragonball_m4_recovery_linux.py --linux
+</code></pre>
+<h3 id="m4-准入归档与跨入口续跑"><a class="header" href="#m4-准入归档与跨入口续跑">M4 准入、归档与跨入口续跑</a></h3>
+<p><code>dragonball_m4_preflight.py</code> 提供只读预检：Linux/Python 版本、非 root 工作账号、
+目标账号 KVM 访问、显式工具/环境、socket 路径字节长度、cgroup、残留资源和磁盘预算。
+<code>--required-env</code> 比较编排进程与 <code>runuser</code> 后的值摘要，不输出值；这不代替其他权限
+包装器的环境验证。Docker 仅在指定 <code>--docker</code> 时检查。各预算用
+<code>--disk-path</code>、<code>--reserve-bytes</code>、<code>--planned-bytes</code>、<code>--retained-bytes</code> 显式传入。
+<code>Lab(..., preflight_profile=...)</code> 在持有主机锁、创建 cgroup 前执行该检查；未传 profile
+的调用使用默认 Lab 预检和磁盘预算。磁盘准入不是预留空间或文件系统强制配额。</p>
+<p><code>input_files</code> profile（CLI 为 <code>--input-files</code> JSON）可指定绝对路径列表：<code>files</code>
+检查读取、<code>executables</code> 另检查执行权限、<code>json</code>/<code>toml</code> 检查解析、<code>assets</code> 检查
+冻结资产清单及其 runner/kernel/tools/rootfs lower，<code>modules</code> 在新解释器中导入
+可信测试模块。所有检查以工作账号执行，不输出文件内容或模块的 stdout/stderr；
+模块必须是导入时不启动任务的库文件。它不执行二进制，也不验证 TOML 的业务语义。
+临时驱动应在 profile 中列出自身模块和生成配置，不能只复用磁盘/KVM 预检。
+性能入口已自动接入直接使用的二进制、资产和驱动模块检查；生成的 server TOML、
+regctl JSON 在启动 server 前另以工作账号检查。路径来自当前机器的冻结清单。</p>
+<p>成功的 M4 性能 cell 可使用 <code>dragonball_m4_retention.py</code> 归档及回收：</p>
+<pre><code class="language-bash">sudo python3 scripts/tests/dragonball_m4_retention.py archive --root /var/tmp/db-m4.RUN_ID
+# 先将返回的 archive_sha256 保存到 Lab 外的任务证据目录。
+sudo python3 scripts/tests/dragonball_m4_retention.py audit --root /var/tmp/db-m4.RUN_ID --archive-sha256 RECORDED_SHA256
+sudo python3 scripts/tests/dragonball_m4_retention.py apply --root /var/tmp/db-m4.RUN_ID --archive-sha256 RECORDED_SHA256
+</code></pre>
+<p>只接管同一次主机启动内、可信清单及输入核验通过的成功性能结果。归档保存结果、
+配置和日志；删除前重新检查引用、身份及归档摘要。失败、未完成、pin、符号链接、
+未知布局和身份变化均拒绝。<code>a/run</code>、<code>b/run</code> 连同 socket 始终保留，回执中的
+<code>retained_bytes</code> 只统计这些运行目录，不是整个 Lab 的剩余大小。该入口判定的是
+可回收数据的资格，不证明保留目录中所有 UNIX socket 都已失活，也不删除 ublk 设备。
+中断或部分删除记录失败及剩余/未知字节数；SIGKILL 无法保证写回执，歧义现场须人工审计。</p>
+<p><code>dragonball_m4_campaign.py</code> 可按显式 JSON 计划串行调用已有测试入口：</p>
+<pre><code class="language-bash">python3 scripts/tests/dragonball_m4_campaign.py plan --plan PLAN.json --output OUTPUT
+python3 scripts/tests/dragonball_m4_campaign.py run --plan PLAN.json --output OUTPUT
+python3 scripts/tests/dragonball_m4_campaign.py run --plan PLAN.json --output OUTPUT --resume
+</code></pre>
+<p>计划指定 <code>source</code>、<code>cwd</code>、<code>inputs</code> 文件列表、<code>environment</code> 变量名及 <code>steps</code>；每步
+包含唯一 <code>name</code>、<code>argv</code>、<code>timeout_seconds</code>、<code>artifacts</code>。必须显式列出相关源码、
+二进制及配置，目录不会自动递归绑定。成功步骤仅在输入、环境、日志及产物摘要均
+一致时复用；失效步骤及后续依赖重跑，失败尝试保留。计划绑定变化需要新输出目录。
+回执记录每次执行/复用原因、阶段耗时、失败类别、磁盘/inode 及未执行步骤；子入口
+仍负责验证真实用例数量、VM/设备清理和结果语义，命令退出 0 不自动等于生产资格。</p>
+<p>M4 节点就绪改用独立管道、总截止时间及严格 PID/namespace 校验，<code>ready</code> 文件只是
+原子写入的证据。未就绪、提前退出、畸形或超长消息会失败，退出和回收仍归 Lab。
+同时调用 probe 与 dual-backend 时，共享库测试只执行一次；两种 VM 过滤条件和
+独立的内存导出预算测试保留，不按名称相似合并不同后端/权限覆盖。</p>
+<p>覆盖盘点还需区分：<code>test-unit</code> 包含有权限要求的 ublk 测试；<code>test</code> 与
+<code>test-integration</code> 的 envd/ublk 公共前置目标可在同一次 Make 调用中去重，但后者
+额外的 snapshot OSS E2E 仍需保留。DB-only 与双后端 feature、ignored 与普通运行、
+同机 namespace 与物理跨机、三种 E2E 部署模式不能互相替代。<code>dragonball_apf::</code>
+虽在相应平台/feature 下编译，却不属于默认四个 DB 功能套件；需要时显式选择。
+<code>services</code> 的聚合 test 只选择 gateway/scheduler，shared/API 的完整模块检查仍使用
+该目录下的 <code>go test ./...</code>。</p>
 <h2 id="回归范围建议"><a class="header" href="#回归范围建议">回归范围建议</a></h2>
 <div class="table-wrapper">
 <table>
@@ -4906,8 +5021,12 @@ root 编排权限的进程显式运行：</p>
 先在外部构建 harness，再进入隔离环境执行，避免在隔离网络内解析 Cargo 依赖。</p>
 <p>性能对照核对实际打开的资产 inode/标志、CPU/NUMA 和缓存条件，不能只比较配置
 文本。构建与采样分时；小样本用于定位，完整资格另行运行。失败记录、数据校验和
-清理检查始终保留；跨入口进度汇总与主机互斥仍待实现。</p>
+清理检查始终保留；跨入口进度汇总、构建与测试之间的统一互斥仍待实现。</p>
 <h2 id="性能候选的构建来源与共享预检"><a class="header" href="#性能候选的构建来源与共享预检">性能候选的构建来源与共享预检</a></h2>
+<p><code>make check-dragonball-revision</code> 是无需 Cargo/网络/KVM 的轻量检查（Python 3.11+）。
+它核对 runner manifest、Cargo.lock 的 Kata 来源、qualified reader、probe client
+和当前版本的 CLI/打包正例；历史拒绝用例保留旧 revision。DB 构建、准备及 VMM
+单元测试入口先执行此检查；Rust CI 的编译任务依赖对应检查任务。</p>
 <p>性能矩阵现在要求 <code>server_receipt</code> 和 <code>server_fc_receipt</code> 两个绝对路径，分别
 绑定 <code>server</code>（DB）与 <code>server_fc</code>（FC）。功能场景及开发回归使用各自的输入格式。
 旧性能二进制不能补签回执；通过下列入口重新构建并冻结，Cargo 可复用已有缓存。
@@ -4933,8 +5052,77 @@ python3 scripts/tests/dragonball_m4_build.py --source "$PWD" \
 开发记录仍不产生性能资格结论。</p>
 <p>该回执用于受控测试主机上的过期输入检查，不是签名或可复现构建证明：依赖缓存、
 外部工具及构建脚本的任意外部输入尚未逐项封存。构建期间仍须避免其他任务改写
-共享 Cargo 输出；跨入口主机锁、M4 续跑和构建缓存自动命中策略未在本次实现。
+共享 Cargo 输出；M4 续跑和构建缓存自动命中策略尚未实现。
 此入口仅为 server 生成回执，runner、daemon、guest 资产仍由既有 M4 输入摘要记录。</p>
+<p>性能 cell 在启动前及结束后重新校验两份构建回执，并核对 runner、daemon、guest
+内核/tools/rootfs lower、夹具、依赖及编排脚本的内容和权限。输入变化或丢失会使
+该 cell 失败；已有操作失败信息和清理结果保留，原始样本仍可诊断但不能作为有效
+对照。汇总比较还要求各 cell 的输入摘要与矩阵开始时一致，拒绝 cell 之间的输入变化。
+结果中的 <code>input_identity</code> 和 <code>inputs_verified</code> 记录这项检查。它用于发现
+意外输入变化，不是隔离其他进程写入或可复现构建的证明。</p>
+<p>自定义 guest tools 时，在 inputs 中显式设置 <code>tools_version</code>（省略仍为 <code>0.1.0</code>），
+与资产内 <code>/agentenv/tools-drive-version</code> 一致；两个后端共用这个版本和同一份
+<code>tools_path</code> 内容。比较 guest 补丁须分别冻结前后资产及编译输入，不能把某一后端
+升级后的 tools 与另一后端的旧 tools 比较。旧快照内的 envd 不随主机配置自动升级。</p>
+<p>M4 HTTP 响应按剩余请求预算逐段读取；流中的持续数据不能重置正文读取的总预算。
+性能比较应对齐 API 发起至相同 guest 命令确认准确身份的终点、端到端时限和失败
+计数；API 返回时间另列，不把后端各自的就绪功能契约当作相同的性能终点。
+通用性能入口的 cold/restore/fork/resume 已采用相同 sandbox/template 身份检查，
+每次 API 请求及后续探测共用一个 <code>request_timeout_seconds</code> 预算；并发请求各自
+传入剩余预算，不修改共享 node 配置。结果声明
+<code>readiness_contract=exact_sandbox_and_template_identity_v1</code>，相应操作名使用
+<code>*_api_to_identity_ready</code>。不能与旧 <code>*_api_to_envd_ready</code> 样本合并计算分位数。
+样本另存 <code>api_seconds</code>、<code>identity_seconds</code> 和 <code>identity_attempts</code>；API 成功后身份
+确认失败也保留分段及错误。fork 的所有子实例共用原请求截止时间。
+DB 新实例保持内部身份确认，同 ID resume 跳过重复探测；不能只比较 API 返回时间
+就声称两后端具有相同身份就绪保证。</p>
+<h3 id="可选阶段计时分析"><a class="header" href="#可选阶段计时分析">可选阶段计时分析</a></h3>
+<p>在性能输入中设置 <code>"phase_timing_versions": {"dragonball": "db-overlap-v1", "firecracker": "fc-v1"}</code>，可为 cold/restore/resume 保存 <code>phase-timings.json</code>。
+这会启用相关 debug 日志；诊断组两端均需启用，不能与未启用的样本直接合并。
+版本必须对应冻结实现：<code>db-serial-v1</code> 用于 runner 与磁盘串行准备的旧候选，
+<code>db-overlap-v1</code> 用于 <code>7e8bc3a</code> 后 runner 提前启动的候选；<code>fc-v1</code> 对应当前 FC
+阶段边界。标签由实验输入显式声明，工具不会从二进制自动推断其计时语义。</p>
+<p>采集器在每批请求前记录日志位置，在请求结束后按 sandbox ID 匹配该窗口中的
+计时；操作 ID 包含 run、repeat、操作名和请求序号。同 ID 多次 resume 不依赖
+全局日志顺序。保留日志区间和摘要；缺失、重复、日志截断/替换、后端矛盾及
+非单调边界都会使取证失败，已执行的请求耗时仍保留。fork/capture 暂无此阶段分析。</p>
+<pre><code class="language-bash">python3 scripts/tests/dragonball_m4_phases.py /path/to/phase-timings.json --output /path/to/phase-summary.json
+</code></pre>
+<p>分析器对照 <code>expected_operations</code> 检查完整性，输出微秒均值/中位数；同一后端的
+不同计时版本需分别分析。DB runner 重叠版本记录 spawn 加剩余等待，FC preparation
+total 已包含 release；使用明确总边界，不将准备子阶段相加。CLI 不替代完整 cell
+的输入冻结、操作成功和清理验收，也不产生生产 SLO 资格。</p>
+<p>可选实验观察通过 <code>run_cell(..., observe_batch=...)</code> 接入；采样准备与取证在 API
+计时外执行。取证失败保留已执行时间和原 guest 错误，另记 <code>proof_error</code>，该 cell
+不可作为有效性能对照。<code>dragonball_m4_observe.py</code> 提供主机接收时间的 guest 心跳
+间断、S3 夹具 TCP 9000 端口的 IP 字节计数和操作期间内存采样。心跳间断包含调度与
+网络因素，不是精确 VMM 暂停；链路计数包含协议头和重传，不是对象净载荷；采样
+内存峰值只是实际峰值的下界。具体实验需保留探针原始数据及这些观测边界。
+心跳链路必须先在真实 guest 中验证；默认出站策略拒绝私网目标，不能假定 guest
+可向 Lab 桥地址发包。本轮接收器绑定源 VMM 网络命名空间的 tap 网关，不更改产品
+防火墙；capture 后先停止源探针并关闭接收器，再执行 restore/fork，每次 capture
+使用新 token。恢复快照会包含探针进程，其开销仍属于恢复后观测的一部分。</p>
+<p><code>network_cache_slots</code> 可显式取 0/1，默认 1 兼容旧实验。<code>pool.network.enabled=false</code>
+只关闭后台维护，不能据此宣称回收的网络资源不会复用；0 才禁止该回收缓存。
+不同缓存策略的样本必须分别统计。</p>
+<h2 id="证据归档与取回"><a class="header" href="#证据归档与取回">证据归档与取回</a></h2>
+<p>先用现有 retention 入口归档并核验成功 cell；它仍独占 payload 回收职责。
+<code>dragonball_m4_evidence.py</code> 只打包明确列出的普通证据文件和当前结果摘要，不扫描或
+删除 VM 数据。<code>--files</code> 是相对 <code>--root</code> 的 JSON 路径列表，<code>--summary</code> 应由本轮
+已验证回执生成；工具保证摘要字节可追溯，不替调用方判断任务是否完成。</p>
+<pre><code class="language-bash">python3 scripts/tests/dragonball_m4_evidence.py pack --root /var/tmp/run \
+  --files /var/tmp/run-files.json --summary /var/tmp/completion.json --output /var/tmp/run-bundle
+python3 scripts/tests/dragonball_m4_evidence.py fetch --host root@TEST_HOST \
+  --remote /var/tmp/run-bundle --output /tmp/run-evidence
+# 需要原始日志时，再向同一输出目录取回完整包。
+python3 scripts/tests/dragonball_m4_evidence.py fetch --host root@TEST_HOST \
+  --remote /var/tmp/run-bundle --output /tmp/run-evidence --full
+</code></pre>
+<p>默认只取回 <code>receipt.json</code> 和已核验的 <code>summary.json</code>；完整包只有在整体摘要和
+所有成员摘要通过后，才从 <code>.partial</code> 改为正式文件。无自动解压；链接、重复或
+未知成员被拒绝，源普通硬链接保存为独立文件成员。SSH 使用既有认证，单次传输
+总超时为 600 秒。中断/损坏文件保留为 <code>.partial</code>，重试使用新目录；既有输出
+绑定原回执，不自动追踪远端新一轮结果。完整包和小摘要的校验状态分别报告。</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="selectable-hypervisor-components"><a class="header" href="#selectable-hypervisor-components">Selectable hypervisor components</a></h1>
 <p>Firecracker and Dragonball are optional components selected at compile time.
@@ -5044,8 +5232,11 @@ ublk-daemon，准备资产并串行执行真实 OSS、扩展、私有 registry �
 YAML 本身不会创建审批规则。PR 事件不会触发该特权 job。</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="hypervisor-验证摘要与已知限制"><a class="header" href="#hypervisor-验证摘要与已知限制">Hypervisor 验证摘要与已知限制</a></h1>
-<p>最后核对：2026-10-07。运行时变更基线为 <code>a99fd09</code>，测试结构整理基线为 <code>ab3db37</code>。
-以下是这些候选的已有证据，不代表后续修改自动通过，也不代表生产 SLO 验收。
+<p>最后核对：2026-10-08。本轮候选基于 <code>84e21d5</code>，增加 DB 默认环境身份读取和
+guest 首次 MMDS 立即刷新；冻结补丁、二进制及验证边界见下方“身份刷新优化”。
+仅同 ID 暂停恢复跳过内部身份轮询，新实例仍确认准确身份。较早的完整矩阵使用
+<code>be6b051</code>，后续阶段观测使用 <code>1a8fce1</code>；各轮输入与结果分别保留。
+以下证据只适用于对应输入，不代表后续修改自动通过，也不代表生产 SLO 验收。
 日常执行方式见<a href="#dragonball-开发与功能回归">功能回归</a>。</p>
 <h2 id="已验证范围"><a class="header" href="#已验证范围">已验证范围</a></h2>
 <div class="table-wrapper">
@@ -5057,31 +5248,719 @@ YAML 本身不会创建审批规则。PR 事件不会触发该特权 job。</p>
 <tr><td><code>a99fd09</code> 启动/tools 策略</td><td>runner/protocol 76 通过、11 ignored；envd 15、DB 单元 60 通过；11 项生命周期及 1 项真实 probe 保存/恢复通过</td><td>覆盖初始化上下文、鉴权/网络、held 身份、暂停恢复、发布/卷、回滚及重启；未重跑全量阶段/应用矩阵</td></tr>
 <tr><td><code>ab3db37</code> 测试结构</td><td>编译后 78 个集成用例逐项保留；工具测试 79 通过、9 项需显式 namespace/controller/physical 输入而跳过；4 项真实冒烟通过</td><td>默认 60 个独立用例；原重复选择消除，旧 revision 身份专项保留为 opt-in</td></tr>
 <tr><td>两个候选</td><td>workspace 全目标/全 feature 严格 Clippy、fmt、独立评审及测试资源清理通过</td><td>GitHub 托管 CI 需在实际推送后确认</td></tr>
+<tr><td><code>be6b051</code> 冻结运行时，本次 Linux x86_64/KVM 实跑</td><td>DB 默认功能回归 60/60、平台测试 6/6 通过；功能回归无跳过项</td><td>功能入口源码为 <code>3f1a844</code>；后续仅改测试工具和文档，未改 Rust/Go 运行时或配置</td></tr>
+<tr><td><code>1d23f66</code> 测试工具</td><td>Linux regression 工具 20/20；M4 工具 79 项中 70 通过、9 显式跳过</td><td>另行实跑 Lab 4/4、控制器 SIGTERM 清理 2/2、部分创建成功后失败的资源回收；physical 专项未执行</td></tr>
+<tr><td><code>5eb08f4</code> 测试工程加固</td><td>Linux regression 工具 20/20；M4 工具 91 项中 81 通过、10 显式跳过；另行实跑 SIGKILL 恢复 1/1、既有 Lab 隔离/清理 4/4</td><td>真实外部命名空间 FD、绑定挂载和根目录 FD 会阻止误报 <code>clean</code>；未重跑 VM、OSS30 或性能矩阵，运行时未改</td></tr>
+<tr><td><code>b813d45</code> 性能口径统一</td><td>Linux regression 工具 20/20；M4 工具 94 项中 84 通过、10 显式跳过；创建诊断 120/120</td><td>两端共用准确身份终点与剩余总预算；取证失败保留已执行样本的实验编排注入检查通过；运行时未改</td></tr>
+<tr><td><code>1fe9c99</code> 工程保障与观测工具</td><td>最终 Linux UID 999：M4 工具 165 项中 152 通过、13 显式跳过，regression 工具 20/20；另行 Lab 7/7 真实测试</td><td>包含有界 pipe、显式预检、归档回收、输入绑定续跑及观测；网络复用对照 40/40，修正后的生命周期矩阵 880/880；Rust/Go 运行时及配置仍与 <code>be6b051</code> 相同</td></tr>
+<tr><td><code>b9848bc</code> 同 ID 恢复优化</td><td>全工作区 fmt/clippy、DB 单元 61/61；第二台真实生命周期 11/11、启动记录器 1/1，第一台同 ID 恢复回归 1/1</td><td>新身份与原身份两方向故障注入；保留快照/fork 的即时身份断言；未重跑完整功能/平台矩阵、OSS30、640 MiB 或生产容量</td></tr>
+<tr><td><code>13b6f7a</code> 分段性能工具</td><td>Linux regression 20/20；M4 167 项中 154 通过、13 显式跳过</td><td>API 与客户端身份确认分开计时，失败保留原错误；双方补充恢复准备阶段日志</td></tr>
 </tbody>
 </table>
 </div>
+<p>本次验证了功能隔离入口与 M4 Lab 的跨账号主机互斥、cell 前后及跨 cell 输入
+一致性检查，以及 HTTP 连续分块响应的总读取预算。后续增加 M4 归属清单和独立恢复
+入口；锁本身不执行资源回收。最新 P1 将互斥扩展到显式 regression 准备与 M4 build，
+任意直接 Cargo 和其他 Make 入口仍未覆盖。详见<a href="#dragonball-开发与功能回归">开发回归</a>。</p>
 <h2 id="性能结论"><a class="header" href="#性能结论">性能结论</a></h2>
-<p><code>a99fd09</code> 的同机诊断共 64 个有效样本，固定 1 vCPU/1 GiB guest、并发 1、相同
-内核/tools/rootfs 及 CPU/NUMA 策略。API / 从 API 发起至额外命令确认准确身份的
-中位数如下，单位 ms；每组合常规/清缓存各 6 个样本，压力条件 4 个样本。</p>
+<p>2026-10-08 同机创建诊断固定 1 vCPU/1 GiB guest、并发 1、相同内核/tools/rootfs、
+CPU 0–7、NUMA bind 0 和 node 4 CPU 配额。node 内存硬上限 32 GiB，夹具独立预算
+16 GiB。两端统一从 API 发起计时，直到相同 guest 命令返回准确 sandbox/template
+身份；采用相同 5 ms 轮询和 180 秒总预算。API 耗时另列，不当作相同的就绪终点。
+两批各 15 次，第二批反转后端顺序；每个后端、缓存条件共 30 次。所有 120 次均成功，
+无失败、未执行或 OOM；8 个 cell 的输入核验、缓存/实际 tools inode 与打开标志、
+CPU/NUMA 取证及清理通过。测试前约 64 GiB 可用，满足 40 GiB 整轮准入，未追加删除；
+测试后约 57.2 GiB 可用，临时权限已恢复，测试进程、设备与 cgroup 无残留。</p>
+<p>下表单位 ms，p50/p95 使用 nearest-rank；全部样本包含每个新服务进程的首个 guest。
+“后续 p95”仅作首个样本敏感性分析，每端/条件 28 次，不替代全样本结果。</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>条件</th><th style="text-align: right">FC</th><th style="text-align: right">DB 候选</th></tr>
+<tr><th>条件</th><th style="text-align: right">FC 身份就绪 p50 / p95</th><th style="text-align: right">DB 身份就绪 p50 / p95</th><th style="text-align: right">FC / DB 后续 p95</th></tr>
 </thead>
 <tbody>
-<tr><td>tools 预热</td><td style="text-align: right">672.5 / 721.0</td><td style="text-align: right">709.1 / 714.1</td></tr>
-<tr><td>tools 文件缓存清空</td><td style="text-align: right">680.3 / 726.8</td><td style="text-align: right">732.6 / 736.4</td></tr>
-<tr><td>768 MiB memory.high、512 MiB 辅助驻留负载</td><td style="text-align: right">722.2 / 768.4</td><td style="text-align: right">788.7 / 795.2</td></tr>
+<tr><td>tools 全部驻留</td><td style="text-align: right">710.4 / 993.4</td><td style="text-align: right">712.9 / 984.5</td><td style="text-align: right">723.9 / 726.1</td></tr>
+<tr><td>tools 文件缓存清空</td><td style="text-align: right">730.7 / 995.0</td><td style="text-align: right">737.0 / 987.4</td><td style="text-align: right">747.9 / 750.5</td></tr>
 </tbody>
 </table>
 </div>
-<p>FC API 返回与 DB 身份屏障口径不同，不能仅按 API 数字比较 guest 身份就绪。
-这些小样本不提供 p95/p99、完整存储冷缓存、应用吞吐或容量资格。更低的 640 MiB
-回收阈值曾令旧 DB 严重停顿并 readiness 超时，失败未并入有效样本。</p>
+<p>本轮 DB p50 分别高 2.5 ms（0.36%）和 6.3 ms（0.86%），不据此宣称普遍性能优势
+或回退。两批方向一致：暖缓存 FC/DB p50 为 711.6/713.1、710.4/712.6；清空缓存为
+731.6/737.3、730.7/737.0。每端/条件的两个首个样本都位于各自最慢两次，主导本轮
+p95；FC 首个样本 993.4–1023.6 ms，DB 为 984.5–1040.1 ms。样本量只支持诊断，
+不提供 p99、完整存储冷缓存、应用吞吐、生产容量或 SLO 资格。</p>
+<p>暖/清空缓存的 API p50：FC 666.5/684.5 ms，DB 707.1/733.3 ms。FC 在 API 返回后
+身份确认耗时 p50 为 45.3/45.6 ms，DB 为 5.7/3.6 ms；DB 60 次外部探测均一次正确。
+DB 原始分段日志显示，Status RPC 完成至 envd HTTP health 就绪的中位数为 546.9/570.1 ms，初始化后
+到身份确认约 46.6/43.7 ms。前一阶段值得进一步区分 guest 启动与探测等待；当前
+日志尚不能证明具体瓶颈或优化收益。各阶段中位数不应相加当作总体分位数。</p>
+<p>后续 <code>1fe9c99</code> 工具的网络复用专项对照共 8 组、40 次创建，全部通过；两批反转
+后端顺序，每个后端/配置包含 2 个首个 guest 和 8 个后续 guest。固定 tools 驻留，
+其余资源与身份终点沿用上述配置。<code>pool.network.enabled=false</code> 只关闭维护，
+<code>high_watermark=1</code> 仍缓存已释放的网络 slot：日志逐组确认复用 4 次、归还 5 次；
+水位设为 0 后两者均为 0。旧表的缓存配置应按此解释。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>后续 guest 的平均身份就绪耗时（ms）</th><th style="text-align: right">FC</th><th style="text-align: right">DB</th></tr>
+</thead>
+<tbody>
+<tr><td>保留 1 个已释放网络 slot</td><td style="text-align: right">715.6</td><td style="text-align: right">725.0</td></tr>
+<tr><td>不保留网络 slot</td><td style="text-align: right">743.1</td><td style="text-align: right">746.3</td></tr>
+</tbody>
+</table>
+</div>
+<p>DB 的后续 pre-runner provisioning 均值从 52.5 ms 增至 82.0 ms；首个 guest
+分别为 202.9/204.3 ms。关闭复用后，首次创建的额外耗时仍约 250 ms，说明网络
+复用只解释其中一部分。小样本用于诊断，不与上一轮 120 次结果混算，不据此承诺优化收益。</p>
+<p>新增 trace 在全部 20 次 DB 启动中观察到：health 等待开始至首次失败完成平均
+313.0 ms，首次至第二次失败完成平均 214.1 ms，后续失败间隔平均 4.3 ms；没有
+触发 1 秒探测超时。这两个长区间在网络复用开关、首个及后续 guest 中均存在。
+第二段包含重试 sleep，日志未记录每次请求开始，不能当作精确请求耗时。guest 启动
+与探测重叠，现有证据仍不能把约 527 ms 全部归因于可消除的网络等待；优化前需关联
+ARP/TCP、serial 和 envd 开始监听的时间，当前未修改运行时参数。</p>
+<h3 id="生命周期与资源观测"><a class="header" href="#生命周期与资源观测">生命周期与资源观测</a></h3>
+<p>后续生命周期矩阵固定 1 vCPU/1 GiB、并发 1，guest 驻留 512 MiB；低/高脏页
+每轮分别写约 10.24/512 MiB，轮间休眠 200 ms，实际写速率受执行时间约束。
+沿用相同内核/tools/rootfs、CPU/NUMA 和 node/夹具预算；tools 每次创建前验证全驻留，
+网络释放缓存设为 0，其余缓存自然演进。两批反转后端顺序，每个后端/脏页条件
+20 轮，包含两个服务首个 guest。8 个分组、880 条操作及内存校验全部通过，
+无未执行项、node/夹具 OOM 或输入变化。下表单位 ms，nearest-rank p50/p95；
+样本量用于诊断，不提供 p99 或生产 SLO 资格。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>脏页</th><th>操作</th><th style="text-align: right">FC p50 / p95</th><th style="text-align: right">DB p50 / p95</th></tr>
+</thead>
+<tbody>
+<tr><td>低</td><td>capture API</td><td style="text-align: right">8496.4 / 11007.7</td><td style="text-align: right">8627.3 / 10746.2</td></tr>
+<tr><td>低</td><td>restore 至身份就绪</td><td style="text-align: right">513.2 / 568.6</td><td style="text-align: right">591.7 / 699.2</td></tr>
+<tr><td>低</td><td>fork 1 至身份就绪</td><td style="text-align: right">3080.8 / 3619.0</td><td style="text-align: right">3341.3 / 4121.8</td></tr>
+<tr><td>低</td><td>pause API</td><td style="text-align: right">3037.8 / 3081.9</td><td style="text-align: right">3187.4 / 3210.0</td></tr>
+<tr><td>低</td><td>resume 至身份就绪</td><td style="text-align: right">240.9 / 255.6</td><td style="text-align: right">304.7 / 333.0</td></tr>
+<tr><td>高</td><td>capture API</td><td style="text-align: right">8487.1 / 10420.2</td><td style="text-align: right">8608.4 / 9739.7</td></tr>
+<tr><td>高</td><td>restore 至身份就绪</td><td style="text-align: right">540.5 / 565.6</td><td style="text-align: right">605.9 / 725.7</td></tr>
+<tr><td>高</td><td>fork 1 至身份就绪</td><td style="text-align: right">3088.8 / 3764.4</td><td style="text-align: right">3340.0 / 3369.5</td></tr>
+<tr><td>高</td><td>pause API</td><td style="text-align: right">3036.6 / 3099.5</td><td style="text-align: right">3184.8 / 3218.5</td></tr>
+<tr><td>高</td><td>resume 至身份就绪</td><td style="text-align: right">245.7 / 286.2</td><td style="text-align: right">310.0 / 343.1</td></tr>
+</tbody>
+</table>
+</div>
+<p>本轮 DB 的 capture p50 高约 1.4%–1.5%，fork 高约 8%，pause 高约 5%；restore
+多 65–79 ms，resume 多约 64 ms。两批 capture 中位数方向一致；部分 p95 DB 较低，
+但不足以认定尾延迟普遍更优。结合前述创建结果，当前证据不支持 DB 整体更快。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>脏页 / 后端</th><th style="text-align: right">capture 心跳最大间隔 p50 / p95（ms）</th><th style="text-align: right">capture 成功逻辑上传 p50（MiB）</th><th style="text-align: right">node 采样内存最大值（GiB）</th></tr>
+</thead>
+<tbody>
+<tr><td>低 / FC</td><td style="text-align: right">2826.1 / 5349.3</td><td style="text-align: right">610.7</td><td style="text-align: right">9.22</td></tr>
+<tr><td>低 / DB</td><td style="text-align: right">3059.6 / 5182.6</td><td style="text-align: right">596.8</td><td style="text-align: right">8.47</td></tr>
+<tr><td>高 / FC</td><td style="text-align: right">2803.8 / 4763.9</td><td style="text-align: right">609.3</td><td style="text-align: right">9.62</td></tr>
+<tr><td>高 / DB</td><td style="text-align: right">3035.5 / 3064.5</td><td style="text-align: right">597.1</td><td style="text-align: right">8.95</td></tr>
+</tbody>
+</table>
+</div>
+<p>心跳使用主机接收时间，包含 guest/host 调度及网络，不是纯 VMM 暂停；所有 capture
+均满足前后包络和序号连续。恢复的快照包含探针进程，不能声称完全无探针开销。
+内存按 10 ms 采样，是整个 node（含服务、VMM、页缓存等）的观测下界，不是单个
+VMM 的 RSS；对应累计 cgroup 峰值低/高为 FC 9.22/9.65、DB 8.47/8.95 GiB。
+上传字段来自成功 repository 上传计数，不包含所有重试及元数据路径。
+restore 至完整内存校验结束的 S3 下载 IP 字节 p50，低/高分别为 FC 611.8/610.6、
+DB 597.8/598.4 MiB；包含 TCP/IP 头、重传及两次操作观测间的下载，不是对象净载荷。
+原始两个观测窗口和间隙分别保留，不能只相加独立窗口而漏掉后台下载。</p>
+<p>最初驱动将心跳发送到 Lab 私网桥地址，命中默认 <code>10.0.0.0/8</code> 出站拒绝规则。
+原矩阵首个生命周期分组及独立复现均在 capture 前准备失败，旧记录和现场保留。
+接收器改为源 VMM namespace 的 tap 网关后，独立 FC 捕获校验通过，再以新协议执行
+上述完整矩阵；未修改产品防火墙，旧失败不混入新协议的成功样本。</p>
+<p>执行前归档并回收上一轮 8 个成功分组约 6.36 GiB；本生命周期矩阵按组累计回收
+101.18 GiB 可再生成数据，保留运行目录及证据。结束后约 61.6 GiB 可用，临时权限、
+配置和模块恢复，进程、设备、cgroup 及任务挂载引用检查通过。执行器记录矩阵阶段
+约 4290.6 秒（不含外层准备/校验）；
+随后 8 步全部通过摘要核验复用，原尝试/日志未变，没有重新运行 VM。</p>
+<p>历史 <code>1d23f66</code> 的 768 MiB memory.high 诊断每端 4/4 成功，FC/DB 身份就绪中位数
+为 842.9/777.0 ms；压力 node 上限 4 GiB，另有 512 MiB 驻留辅助负载。本轮没有
+重跑压力条件，也未把旧样本并入上述分位数。最初把两端首条命令立即正确作为通过
+条件的实验，因口径不一致且驱动存在流式读取预算缺陷，仍整体排除于性能比较。</p>
+<p>640 MiB memory.high 场景两端各计划 4 次、实际各执行 2 次：各 1 次成功、1 次
+失败、2 次未执行。DB 在创建阶段身份就绪超时（69.14 秒），FC 在随后身份命令
+阶段返回 HTTP 504（37.71 秒）；均未观察到 OOM。这些是失败诊断，不能只取成功
+样本比较性能，也不能据此认定内存分配失败。按当前任务范围搁置快速失败和超时
+调整，保留原始失败证据；未宣称该压力条件通过或根因已修复。</p>
+<p>OSS 30 秒配置下，1 GiB/high dirty/并发 10、node 32 GiB、夹具 16 GiB、16 CPU，
+固定两批重复中 FC/DB 各完成 20 次捕获及恢复，每端 120/120 条操作与数据校验
+记录通过，输入核验、资源清理通过，无 OOM。此前另有一批每端 60/60 的基线记录。
+OSS30 按本轮通过结果完成验收，不再安排追加复测。历史分片超时未在本次复现，
+此次验收不代表已证明历史根因；原始结果及 RAM 写入/上传日志继续保留。</p>
+<h3 id="恢复与继续运行差异复核"><a class="header" href="#恢复与继续运行差异复核">恢复与继续运行差异复核</a></h3>
+<p>对上述矩阵的 160 条 restore/resume 样本及 8 份服务日志进行离线复核：两端均由
+<code>parallel_actions</code> 在 API 请求前开始计时，随后调用同一个 <code>wait_guest_identity</code>，
+准确匹配 sandbox/template 身份才结束；外层总预算 180 秒、身份不匹配后间隔 5 ms。
+内层 envd 健康探测均为 60 秒预算、3 ms 重试；网络释放缓存为 0，VMM 池关闭。
+因此本批结果没有沿用只验证 API 返回或 <code>true</code> 命令的旧终点。</p>
+<p>以下是 DB 减 FC 的<strong>阶段均值</strong>，低/高脏页各 20 次/后端；不能用于直接分解前文
+中位数之差。阶段按同一服务日志的时间戳相减，外层余额为单调时钟总耗时扣除
+服务开始至 launch completed 的耗时，包含进入该服务前和完成日志后的工作。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>阶段</th><th>restore 低 / 高（ms）</th><th>resume 低 / 高（ms）</th></tr>
+</thead>
+<tbody>
+<tr><td>服务开始至 envd 健康探测开始</td><td>+25.6 / +36.8</td><td>+53.5 / +56.0</td></tr>
+<tr><td>envd 健康探测等待</td><td>+58.0 / +38.7</td><td>+0.8 / +1.5</td></tr>
+<tr><td>健康成功至 init 完成</td><td>+1.9 / +2.2</td><td>+1.2 / +0.5</td></tr>
+<tr><td>init 完成至 launch completed</td><td>+67.6 / +77.7</td><td>+22.6 / +22.4</td></tr>
+<tr><td>外层余额</td><td>−55.3 / −69.6</td><td>−12.2 / −14.1</td></tr>
+<tr><td>总耗时均值差</td><td>+97.8 / +85.8</td><td>+66.0 / +66.3</td></tr>
+</tbody>
+</table>
+</div>
+<p>历史候选 <code>be6b051</code> 的 DB 在 <code>/init</code> 后、API 返回前执行内部身份命令；FC 没有这一步，但外层测试仍需
+等待准确身份。DB restore 内部身份检查均为 2–5 次，阶段均值低/高为 67.2/77.3 ms；
+resume 全部 40 次均一次成功，均值 20.8/20.6 ms。FC 的外层余额更大，故不能将
+DB 内部身份检查的整段耗时视作两端额外差值，也不能把它从 DB 总耗时直接扣除
+来预测优化收益。DB 内部确认后，测试仍发一次外部身份命令；该指标代表请求到
+客户端确认可用，包含这一串行交互，不是纯 VMM 恢复耗时。</p>
+<p>resume 差距主要已出现在 envd 探测之前，健康等待几乎相同。DB 此路径中，runner
+启动/Hello 约 6 ms、Configure 约 2 ms、内存 backing 准备约 49–50 ms、LoadHeld
+及随后安全核验约 48–49 ms（均值）；这些是 DB 自身阶段耗时，不是相对 FC 的净
+开销。FC 缺少相同粒度的现有计时，尚不能将准备阶段差距归于某一个 RPC、内存
+映射或设备恢复步骤。restore 另有健康等待差距，但日志未区分页故障、guest 调度
+与网络重连。下一步应对两端补同边界分段计时，再做最小对照；不得通过移除身份
+正确性检查或只改变一端测试终点获得提速结论。</p>
+<p>上述离线复核未修改运行时或重跑 VM。原始证据仍为 <code>dbp12/evidence.tar.xz</code>，派生分析在
+Mac <code>/tmp/agentenv-remaining-20261008/{analyze-ready-stages.py,ready-stage-analysis.json}</code>，
+包含逐样本分段及原始日志摘要；该派生文件不在此前冻结的证据包内。</p>
+<h3 id="同-id-resume-跳过重复检查"><a class="header" href="#同-id-resume-跳过重复检查">同 ID resume 跳过重复检查</a></h3>
+<p>最终运行时 <code>b9848bc</code> 仅跳过同 ID <code>build_paused</code> 的 guest 身份 shell 轮询；新建、
+快照/模板创建、fork 和启动预取记录器保留准确身份确认。原地 resume 本来就没有
+这层轮询。第二台 <code>147.139.165.124</code> 完成 11 项生命周期和 1 项记录器测试；第一台
+<code>147.139.168.159</code> 完成同 ID 回归及以下性能对照，跨主机耗时不混合。</p>
+<p>同机比较 <code>13b6f7a</code> 的 FC/旧 DB 与 <code>b9848bc</code> 新 DB，两批正反顺序、每组 3 次，
+每端每操作 n=6；1 vCPU/1 GiB、并发 1、512 MiB resident/低脏页、tools 暖缓存、
+网络缓存槽 0、CPU 0–7/NUMA 0、node 4 CPU/32 GiB。三组均执行相同 cold、capture、
+restore、pause/resume；本轮共同省略 fork，不能与前文含 fork 的矩阵作配对比较。
+162/162 条操作/内容校验通过，输入及清理核验通过、无 OOM。下表为中位数，单位 ms：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标</th><th style="text-align: right">FC</th><th style="text-align: right">旧 DB</th><th style="text-align: right">新 DB</th></tr>
+</thead>
+<tbody>
+<tr><td>冷启动至客户端身份确认</td><td style="text-align: right">740.7</td><td style="text-align: right">751.2</td><td style="text-align: right">740.3</td></tr>
+<tr><td>从快照创建至客户端身份确认</td><td style="text-align: right">500.2</td><td style="text-align: right">617.5</td><td style="text-align: right">548.2</td></tr>
+<tr><td>resume API 返回</td><td style="text-align: right">225.0</td><td style="text-align: right">299.4</td><td style="text-align: right">283.9</td></tr>
+<tr><td>resume 至客户端身份确认</td><td style="text-align: right">252.5</td><td style="text-align: right">305.9</td><td style="text-align: right">305.0</td></tr>
+<tr><td>resume API 后身份确认阶段</td><td style="text-align: right">21.1</td><td style="text-align: right">7.1</td><td style="text-align: right">19.7</td></tr>
+</tbody>
+</table>
+</div>
+<p>API 返回减少约 15.5 ms，但端到端中位数只减少约 0.9 ms；不能宣称恢复显著加速。
+两个 block 的 API 中位数均降低，端到端变化却分别为 −6.4/+4.0 ms。旧 DB 的内部
+resume 身份阶段均值 20.8 ms，新 DB 六次均为 0 次探测；外部首次命令耗时上升，
+因此不能把内部检查整段直接当作端到端收益。各阶段中位数不能相加。</p>
+<p>从快照创建时的检查没有移除，新 DB 仍平均耗时 64.5 ms、每次 2–4 次探测。其合并
+中位数下降不构成优化证据：旧/新 DB 两批中位数分别为 548.5/550.4 和 686.5/523.0 ms，
+变化方向不同；旧 DB 第二批波动主要位于健康等待和身份阶段，不能归于本次 resume
+分支修改。n=6 仅支持诊断，不报告 p95/p99 或 SLO。</p>
+<p>新 DB 的 resume 仍比 FC 慢约 52.5 ms（端到端中位数）。对齐释放 guest 的边界后，
+准备阶段均值 DB/FC 为 190.0/126.6 ms；其中 LoadHeld/FC snapshot-load 调用阶段为
+47.9/9.0 ms，runner 准备为 8.4/0.5 ms，磁盘为 50.9/44.7 ms，内存 backing 准备为
+51.6/45.8 ms。剩余差距主要在释放前准备路径，不能继续归咎于已跳过的身份轮询。
+这些是调用方墙钟跨度，尚未细分 LoadHeld 内的 VMM 工作、调度和 IPC；FC 进程启动
+与内存准备有重叠，不能把 runner 数值解释为纯进程启动成本。</p>
+<p>DB preparation 原始 total 止于 held，分析加上 readiness 的 <code>resumed_us</code>，才与 FC
+含 release 的 total 对齐。readiness 字段是累计值，健康/初始化/身份阶段按相邻值
+相减；初始化阶段还含 daemon ready 通知，内部两段之和也不覆盖完整 API 路径。
+原始样本保留首个/后续 guest 标签，分析记录逐 block 汇总及 54 条 readiness 分段。</p>
+<p>测试前确认上一轮 8 份成功产物回收回执仍有效、可用磁盘约 59 GiB；本轮逐 cell
+回收 26.22 GiB，失败现场保留。两台测试机最终无测试账号进程、ublk 设备、Lab
+cgroup 或临时命名空间残留，临时权限配置及模块已恢复。功能用例首轮曾因隔离 HOME
+缺少 OverlayBD 生成配置而失败，修正夹具后才取得有效 RED/GREEN，未当作产品故障。</p>
+<h2 id="恢复状态-io-缓冲优化2026-10-08"><a class="header" href="#恢复状态-io-缓冲优化2026-10-08">恢复状态 I/O 缓冲优化（2026-10-08）</a></h2>
+<p>运行时代码 <code>5b81aea</code>，Dragonball 依赖 <code>73178f7c7d4904f546901f4260e8ae5a43d9af05</code>。
+runner 使用 <code>BufWriter</code> 写私有、立即 unlink 的临时状态文件，显式检查 flush 后才
+rewind 并交给 VMM；VMM 使用 <code>BufReader</code> 解析 JSON。持久化 JSON 格式、16 MiB
+入口限制、逻辑设备绑定、身份/版本检查、LoadedHeld 的 CPU/设备静止证明及 guest
+内存的按需映射均保留。缓冲只作用于 VM 状态 JSON，不预读整个 guest RAM。</p>
+<p>真实文件回归在旧实现上读取 65,538 字节触发 65,543 次 read，改后为 14 次；
+输入缺失合法快照头仍被拒绝。计数包含该线程读取 <code>/proc/thread-self/io</code> 的小量开销。
+这证明逐字节文件读取已消除；真实 LoadHeld 收益由下面的配对实验确认。</p>
+<p>最终候选在第二台通过 22 项底层 capture 测试、11 项 sandbox 生命周期及 1 项记录器
+回归。第一台完成 workspace fmt/clippy，runner 51 通过/11 显式 ignored，protocol
+26 通过，AgentENV DB library 61 通过及打包契约检查。ignored 项未计为通过；真实
+生命周期回归另列。新身份确认、同 ID resume、RAM 一致性、held 未释放不运行、
+卷/工作目录、fork 隔离、元数据拒绝与失败回滚均覆盖。</p>
+<p>首次候选 <code>c36eb48</code> 漏同步 qualified reader revision，功能预检在 VM 创建前拒绝
+runner；修正全部生产、CLI 和打包版本引用后重新冻结、构建和测试。该失败与旧候选
+制品保留，未纳入性能样本。两机最终 runner SHA-256 为
+<code>1c84e9e7971d2840981125e19e2519f0220ea976778bc0699637c70a4ec3b173</code>，
+integration binary 为 <code>76a29bf9b54399511341995d7d855b2ac7678170127fcd30f7b8158224699170</code>。</p>
+<p>同一台 A 主机、1 vCPU/1 GiB、单并发、512 MiB 低脏页工作集、tools 暖缓存、
+网络缓存 0、VMM pool 关闭；CPU 0–7/NUMA 0、node 4 CPU/32 GiB、fixture 16 GiB。
+FC <code>13b6f7a</code>、旧 DB <code>b9848bc</code>、新 DB <code>5b81aea</code> 各两批，每批 3 次，第二批反转顺序；
+各自使用匹配的 runner 捕获/恢复，无旧快照跨版本放行。共同终点仍为客户端确认
+准确 sandbox/template 身份，API 与客户端确认分开计时；没有重跑 OSS30 或 640 MiB。
+162/162 条记录通过，54 条内部 readiness 分段通过核验，未发生 OOM。</p>
+<p>下表单位 ms，阶段为均值，端到端及 API 为中位数（每项 n=6）：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标</th><th style="text-align: right">旧 DB</th><th style="text-align: right">新 DB</th><th style="text-align: right">FC</th></tr>
+</thead>
+<tbody>
+<tr><td>resume LoadHeld / snapshot-load 阶段均值</td><td style="text-align: right">48.3</td><td style="text-align: right">20.4</td><td style="text-align: right">9.5</td></tr>
+<tr><td>resume 准备至释放 guest 阶段均值</td><td style="text-align: right">186.4</td><td style="text-align: right">157.9</td><td style="text-align: right">131.9</td></tr>
+<tr><td>resume API</td><td style="text-align: right">277.5</td><td style="text-align: right">248.5</td><td style="text-align: right">231.5</td></tr>
+<tr><td>resume 至客户端身份确认</td><td style="text-align: right">294.6</td><td style="text-align: right">269.4</td><td style="text-align: right">262.5</td></tr>
+<tr><td>快照创建 load 阶段均值</td><td style="text-align: right">48.6</td><td style="text-align: right">15.4</td><td style="text-align: right">21.4</td></tr>
+<tr><td>快照创建准备至释放 guest 阶段均值</td><td style="text-align: right">226.8</td><td style="text-align: right">192.7</td><td style="text-align: right">184.8</td></tr>
+<tr><td>快照创建至客户端身份确认</td><td style="text-align: right">554.0</td><td style="text-align: right">551.3</td><td style="text-align: right">513.9</td></tr>
+<tr><td>冷创建至客户端身份确认</td><td style="text-align: right">753.9</td><td style="text-align: right">751.4</td><td style="text-align: right">741.2</td></tr>
+<tr><td>capture API</td><td style="text-align: right">8624.7</td><td style="text-align: right">8615.1</td><td style="text-align: right">8495.3</td></tr>
+<tr><td>pause API</td><td style="text-align: right">3192.0</td><td style="text-align: right">3199.6</td><td style="text-align: right">2994.8</td></tr>
+</tbody>
+</table>
+</div>
+<p>resume 的 load 阶段减少 27.9 ms（57.7%），准备阶段减少 28.5 ms，端到端中位数
+减少 25.2 ms（8.6%）；两批旧/新 DB 中位数分别为 301.0/268.2 和 288.2/270.3 ms，
+改善方向一致。本轮相对 FC 的合并中位数差距为 6.9 ms，但 FC 两批为 277.8/238.8 ms，
+小样本不能据此宣称稳定持平或生产 SLO 达标。</p>
+<p>快照创建的 load 同样减少 33.2 ms（68.3%），准备阶段减少 34.1 ms，端到端收益
+却未稳定体现：两批旧/新 DB 中位数为 553.4/649.6 和 554.6/507.9 ms。新 DB 的
+健康等待均值增加 38.6 ms、初始化跨度增加 14.3 ms；第一批前两次健康等待为
+375.5/328.8 ms。这里只能确认等待波动抵消了加载收益，尚不能确定波动的更底层原因。
+内部新身份确认仍保留（新 DB 均值 71.4 ms，3–5 次探测），同 ID resume 仍为 0 次。
+初始化跨度含 daemon ready 通知，不能全部归为 guest 初始化；未更改测试就绪口径。</p>
+<p>恢复进程在客户端身份确认后读取的累计 <code>/proc/PID/io</code> 进一步支持归因：resume 的
+read 调用均值由 34,982 降至 625，write 由 28,309 降至 327；读取/写入字符量仍约
+266 KiB/40 KiB。该计数包括进程启动至观察点的全部 I/O，并非 LoadHeld 独占计数；
+两项缓冲一起启用，未独立分摊读和写各自的延迟收益。结合原生 RED/GREEN 与配对
+阶段下降，可确认此前差距中相当部分来自未缓冲的 JSON 文件 I/O。</p>
+<p>剩余 resume load 均值仍比 FC 多约 11.0 ms，runner/内存准备等也存在差项；当前
+数据仍不能将这些调用方跨度全部视作纯 VMM 执行成本。内存状态对象直传、消除
+重复 JSON 转换和 runner/内存准备并行化留待后续按收益验证，不在本轮实现中。</p>
+<p>测试前核验旧成功 payload 已回收，A/B 分别约 59/250 GiB 可用；本轮成功性能
+payload 共回收 26.21 GiB。两机临时权限和模块恢复，无测试进程、ublk、Lab cgroup
+或临时命名空间残留。最终 A 可用约 56.7 GiB，B 约 248.9 GiB；失败现场及证据保留。</p>
+<p>依赖提交尚未推送，当前通过本地 Git bundle 分发并按 commit 固定；普通远程 Cargo
+构建需先使该精确提交可获取。此限制不代表已发布版本。当前无未处理的生产代码阻断项；
+保留一项低优先级测试加固：读取次数回归可进一步匹配明确的缺失 header epoch 错误，
+避免未来更早的文件错误也满足 <code>is_err()</code> 和次数上限。</p>
+<h2 id="p1-诊断与测试工程收口2026-10-08"><a class="header" href="#p1-诊断与测试工程收口2026-10-08">P1 诊断与测试工程收口（2026-10-08）</a></h2>
+<p>运行时 <code>1a8fce1</code>、Dragonball <code>9e41795fea9109bc1acf7b1f6d6b878cfff7b72e</code> 只增加
+观测，不改变恢复顺序、身份判定、截止时间、held 屏障或快照格式。计时区分节点
+IPC、runner 状态处理、VMM worker，以及 health 请求和 daemon ready 通知。
+runner 的日志初始化只在二进制入口，写 stderr；版本 JSON 提前返回。</p>
+<p>两批反转 FC/DB 顺序，每批三次，继续使用上轮 1 vCPU/1 GiB、单并发、512 MiB
+低脏页工作集和共同客户端准确身份终点。FC 冻结为 <code>13b6f7a</code>，DB 为 <code>1a8fce1</code>。
+108/108 条记录通过，36 条 readiness 分段通过核验，无 OOM；构建全部结束后才运行。
+每个后端/操作 n=6，保留首个 guest；debug 与包头摘要采集使本轮属于诊断实验。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标（ms）</th><th style="text-align: right">DB</th><th style="text-align: right">FC</th></tr>
+</thead>
+<tbody>
+<tr><td>resume load 均值</td><td style="text-align: right">20.66</td><td style="text-align: right">9.57</td></tr>
+<tr><td>resume 准备至释放均值</td><td style="text-align: right">160.73</td><td style="text-align: right">134.15</td></tr>
+<tr><td>resume 至客户端身份确认中位数</td><td style="text-align: right">267.58</td><td style="text-align: right">248.12</td></tr>
+<tr><td>快照创建 load 均值</td><td style="text-align: right">16.72</td><td style="text-align: right">20.35</td></tr>
+<tr><td>快照创建至客户端身份确认中位数</td><td style="text-align: right">530.37</td><td style="text-align: right">511.94</td></tr>
+</tbody>
+</table>
+</div>
+<p>DB LoadHeld 内部按相邻累计值相减，单位 ms、均值：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>部分</th><th style="text-align: right">快照创建</th><th style="text-align: right">resume</th></tr>
+</thead>
+<tbody>
+<tr><td>runner 解码、重绑定、FD 检查及写回</td><td style="text-align: right">2.20</td><td style="text-align: right">2.13</td></tr>
+<tr><td>worker 输入校验及状态解析</td><td style="text-align: right">1.14</td><td style="text-align: right">1.11</td></tr>
+<tr><td>worker 内存映射及 vCPU manager</td><td style="text-align: right">0.18</td><td style="text-align: right">0.16</td></tr>
+<tr><td>VM／设备／vCPU 创建</td><td style="text-align: right">1.64</td><td style="text-align: right">13.42</td></tr>
+<tr><td>VM／vCPU／virtio 保存状态应用</td><td style="text-align: right">10.81</td><td style="text-align: right">3.20</td></tr>
+<tr><td>事件、CPU 线程启动、held 确认及报告</td><td style="text-align: right">0.49</td><td style="text-align: right">0.46</td></tr>
+<tr><td>VMM action 往返扣除 worker 区间</td><td style="text-align: right">0.054</td><td style="text-align: right">0.037</td></tr>
+</tbody>
+</table>
+</div>
+<p>节点编码、连接、发送、接收后解码合计约 0.05–0.08 ms。剩余约 11 ms 的 resume
+load 差距主要在 worker 恢复路径，不能归为 IPC 或身份轮询；表中 worker 是墙钟
+跨度，仍包含内核调用、缺页与调度，并非纯 CPU 执行时间。快照创建和同 ID resume
+的慢段不同，不能把两个入口合并后指定同一个优化点。对象直传、进一步拆分 KVM
+与设备恢复、准备并行化属于后续优化，本轮未改变这些实现。</p>
+<p>此前 329–375 ms 的 health 慢样本是第一次成功请求，本轮再次观察到约 329 ms。
+24 个恢复/resume 健康连接均只有一次 SYN 和一次请求负载，没有 SYN 重传或重试
+轮询造成的延迟。只采集 TCP 包头摘要，不采集请求正文或认证信息。均值如下：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>health 请求部分（ms）</th><th style="text-align: right">DB 快照创建</th><th style="text-align: right">FC 快照创建</th><th style="text-align: right">DB resume</th><th style="text-align: right">FC resume</th></tr>
+</thead>
+<tbody>
+<tr><td>SYN 到 SYN-ACK</td><td style="text-align: right">135.27</td><td style="text-align: right">135.12</td><td style="text-align: right">36.34</td><td style="text-align: right">39.06</td></tr>
+<tr><td>发出请求到收到首个响应数据</td><td style="text-align: right">116.38</td><td style="text-align: right">98.57</td><td style="text-align: right">36.91</td><td style="text-align: right">37.83</td></tr>
+<tr><td>响应到客户端成功日志</td><td style="text-align: right">0.16</td><td style="text-align: right">0.13</td><td style="text-align: right">0.13</td><td style="text-align: right">0.09</td></tr>
+</tbody>
+</table>
+</div>
+<p>因此长等待发生在 guest 恢复运行后的网络响应路径，两端均存在；现有证据不支持
+测试轮询口径或客户端处理是主要原因。DB daemon ready 通知只占快照创建约
+0.45 ms、resume 约 0.27 ms；对应 init RPC 约 20.19/8.09 ms，不能再把两者混算。</p>
+<p>独立补充组每端两次，以 5 ms 间隔采样恢复进程各线程，36/36 条记录通过；
+不与上表样本混合。快照 health 区间 FC 188–211 ms、DB 229–233 ms，均出现
+19–20 次 major fault；FC 线程 CPU 总量约 51–60 ms、排队 2.5–2.9 ms，DB 约
+78–92 ms、排队 5.9–7.9 ms。采样边界误差均小于 10 ms。缺页活动与较小的
+运行队列等待支持按需恢复的缺页／I/O 路径是后续调查重点；尚未测得每次缺页或
+块 I/O 的独占延迟，不能把剩余墙钟全部归给某个 I/O 调用。未取消新身份检查来
+缩短数字，同 ID resume 仍为零次内部身份命令。</p>
+<p>工程候选 <code>9f3f24c</code>、<code>bbe7034</code> 将显式准备、M4 build、功能执行纳入真实 FD
+主机互斥，M4 Lab 默认预检，并增加共同资源/证据回执。新隔离目录、四份生成配置
+的归属和摘要在准备入口验证；直接执行缺失配置时拒绝。M4 控制器死亡后的独立
+审计恢复仍可取得锁，残留资源阻止新测试进入；未新增通用删除权限。
+证据写入失败的清理、新状态创建、递归 Make 锁传递和 <code>make -n</code> 无副作用均覆盖。</p>
+<p>Linux 验证：M4 工具 163 通过/17 显式跳过，regression 30/30；另行实跑 Lab
+9/9、控制器死亡恢复 1/1、跨账号/实际 capability 包装器 FD 传递 2/2。剩余跳过
+项需要显式 worker/controller 输入；不能计为通过。运行时 fmt、workspace 全目标/
+全 feature clippy、runner 51 通过/11 ignored、protocol 26、DB library 61、envd 15、打包
+契约，以及第二台 22 项 capture、11 项生命周期、1 项 recorder 回归通过。
+完整依赖安装/下载未重跑；这不等于覆盖任意 Cargo、其他 Make 入口或生产容量。</p>
+<p>六个成功分组均在归档证据后按原有归属审计回收 payload；失败与功能测试状态保留。
+两机最终无测试账号进程、ublk 设备、Lab cgroup 或临时命名空间残留，临时权限及
+新加载模块已恢复；A/B 可用空间约 55.0/248.3 GiB。新增依赖提交仍未发布，需通过
+保留的 Git bundle 获取，不能把本地通过视作远程构建或 CI 已验证。</p>
+<h2 id="p2-恢复准备优化2026-10-08"><a class="header" href="#p2-恢复准备优化2026-10-08">P2 恢复准备优化（2026-10-08）</a></h2>
+<p>本轮按用户要求搁置 MSR 专项，先处理设备创建和准备串行等待。<code>dbp17</code> 的完整
+worker 系统调用跟踪将 resume 慢点定位到返回 FD 64 的 <code>eventfd2</code>；<code>dbp18</code> 独立
+内核栈采样确认 <code>expand_files → synchronize_rcu</code>，当时 <code>FDSize=64</code>。此前过滤
+调用后的约 12 ms 空白不是已证实的设备计算成本。第二台机器的 20 对独立子进程
+实验中，提前扩容后该分配的中位数从 7.506 ms 降到 0.00118 ms，预留本身约
+0.00952 ms；这些诊断值不混入 VM 性能样本。</p>
+<p><code>68ee8d2</code> 在 runner 创建线程前预留 128 项 FD 表容量，立即关闭临时描述符。
+这不是进程 FD 上限；低 <code>RLIMIT_NOFILE</code> 下预留失败仍沿用原来的分配行为。
+<code>7e8bc3a</code> 进一步在网络与扩展钩子准备后启动 runner，让其与磁盘准备重叠；
+Configure/LoadHeld 仍等待所有设备就绪，<code>RuntimeResources</code> 从启动起拥有进程，
+失败时先确认退出再释放资源。runner 阶段计时包含 spawn 与磁盘准备后的剩余等待，
+准备总时长仍覆盖整个区间。快照格式、身份要求、held 屏障、按需 COW 内存及
+Firecracker 实现均未改变。</p>
+<p>FD 单项实验 <code>dbp19</code> 固定 DB node <code>1a8fce1</code>，仅替换 runner，FC 固定
+<code>13b6f7a</code>；两个分组反转顺序，每端/操作 n=6。162/162 条操作和校验记录通过，
+54 段 readiness 核验通过。resume 设备创建均值由 15.06 降至 1.59 ms，load 由
+22.30 降至 8.71 ms，客户端准确身份就绪中位数由 272.80 降至 257.48 ms；
+本轮 FC 为 246.17 ms。冷启动中位数由 752.47 降至 733.43 ms，FC 为 735.32 ms。
+快照创建准备至释放均值由 187.87 降至 179.68 ms，但 health 均值由 227.89
+升至 289.25 ms，端到端中位数由 519.65 升至 571.41 ms；FC 为 513.76 ms。
+因此本组不能宣称快照端到端提速，慢健康响应样本全部保留。</p>
+<p>最终重叠实验 <code>dbp20</code> 使用同一份 FD 预留 runner，比较 node <code>1a8fce1</code> 与
+<code>7e8bc3a</code>，同时运行 FC；两个分组反转顺序，每端/操作 n=4，108/108 条记录和
+36 段 readiness 核验通过。两轮均为 1 vCPU/1 GiB、单并发、512 MiB 低脏页
+工作集、tools 暖缓存、关闭网络/VMM 池，性能机上构建完成后才开始测量。下表均为
+客户端准确身份就绪的中位数，单位 ms；两轮样本分别统计，不跨轮相加推算收益。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>操作</th><th style="text-align: right">DB 仅 FD 预留</th><th style="text-align: right">DB 最终候选</th><th style="text-align: right">FC</th></tr>
+</thead>
+<tbody>
+<tr><td>冷启动</td><td style="text-align: right">858.85</td><td style="text-align: right">849.99</td><td style="text-align: right">872.97</td></tr>
+<tr><td>从快照创建</td><td style="text-align: right">552.24</td><td style="text-align: right">560.68</td><td style="text-align: right">528.68</td></tr>
+<tr><td>同 ID resume</td><td style="text-align: right">265.83</td><td style="text-align: right">265.82</td><td style="text-align: right">246.96</td></tr>
+</tbody>
+</table>
+</div>
+<p>重叠后 runner 阶段均值在快照创建/resume 分别由 14.54/8.45 降至 10.32/5.31 ms，
+准备至释放由 199.78/152.45 降至 189.91/147.88 ms；FC 为 177.04/137.43 ms。
+这证明剩余等待缩短，但本组没有进一步的 resume 端到端收益，也没有稳定的快照
+端到端提速。最终候选比本轮 FC 的快照创建/resume 中位数仍多 32.00/18.86 ms。
+首次 guest 响应及初始化/身份阶段仍有波动；小样本诊断不是容量或生产 SLO 验收。</p>
+<p>两项新增回归均执行了有效 RED/GREEN：真实 runner 的 FD 容量预留，以及磁盘
+配置错误时提前启动进程的回收。低 FD 上限、临时 FD 释放和 seccomp 保留由
+5 项 runtime CLI 测试覆盖；最终节点的 61 项 DB 单元测试、workspace fmt/
+全目标全 feature clippy 通过。第二台机器最终 16 项生命周期/记录器回归通过，
+包含新身份、同 ID resume、held、fork、磁盘失败、扩展失败和 API 分阶段失败清理。
+新增用例在第一台的首次执行曾因驱动路径、生成配置和资产清单权限不匹配未到达
+目标断言；这些记录作为环境失败保留，只有修正预检后触及目标断言的运行计入 RED。
+独立代码审阅未发现实质问题。最终源码、runner、集成测试二进制摘要与冻结记录
+匹配；Git 检查发现的唯一额外文件是测试导入生成的 Python 字节码，记录清单后
+已清理。两轮十二个成功性能分组归档后精确回收约 45.35 GiB；失败与功能现场保留。
+两机结束时无测试进程、ublk、Lab cgroup 或临时命名空间残留，临时权限和模块
+已恢复，可用空间约 51.8/247.8 GiB。提交仍在本地分支，未推送或合并。</p>
+<p>原始证据：A 机 <code>/var/tmp/dbp17/evidence</code> 的 worker 跟踪、<code>dbp18/evidence</code> 的
+内核栈；两轮 <code>/var/tmp/dbp19</code>、<code>dbp20</code> 下的 <code>protocol.json</code>、<code>frozen.json</code>、
+<code>analysis.json</code>、<code>worker-analysis.json</code>、<code>results/</code> 与构建回执。B 机 <code>dbp16</code> 的
+独立 FD 实验、<code>dbp19</code>/<code>dbp20</code> 的功能回执和 <code>host-restored.json</code> 分别保留。
+完整 A 机归档 <code>/var/tmp/dbp20/host-a-evidence.tar.gz</code> 在两台服务器各保留一份，
+归档摘要及 1,235 个成员文件均已校验；B 机归档的 402 个成员文件已在本地校验。
+结果摘要与校验回执另存本地 <code>/tmp/agentenv-p2-20261008/completion-summary.json</code>。</p>
+<h2 id="retro-工程遗留收口2026-10-08"><a class="header" href="#retro-工程遗留收口2026-10-08">Retro 工程遗留收口（2026-10-08）</a></h2>
+<p>阶段工具 <code>b4fed02</code> 已补真实 VM 验证：A 机复用冻结 DB node <code>7e8bc3a</code>、runner
+<code>68ee8d2</code> 和 FC <code>13b6f7a</code>，1 vCPU/1 GiB、单并发各一轮。两端 cold、capture、
+restore、pause/resume 共 18 条操作及校验记录通过，6 段请求窗口计时解析与汇总通过。
+快照恢复的新 ID 与源不同，同 ID resume 与源一致；输入前后摘要一致。此轮用于
+验证采集器、身份关联和清理，不是新的性能对照或 SLO 验收。</p>
+<p>预检在 VM 启动前拒绝了旧清单的 root-only 读取权限；为本轮复制可读清单后通过，
+原文件和失败回执保留。两组成功现场由既有 retention 入口归档并回收约 4.03 GiB；
+A 机临时权限/模块已恢复，无自有进程、ublk、Lab cgroup 或命名空间残留。</p>
+<p>本轮增加离线 revision 一致性检查并接入 DB Make 构建及 CI 编译前置任务；故障注入
+确认 pin 不一致时不会调用 Cargo。证据工具默认取回摘要，完整包经整体和逐成员校验
+后才使用正式文件名；中断/损坏、非法成员及普通硬链接均有回归覆盖。
+B 机非 root 检查：M4 工具 205 项中 188 通过、17 显式跳过，regression 30/30。
+独立审阅发现的硬链接打包问题已按 RED/GREEN 修复；运行时 Rust/Go 未修改，
+GitHub 工作流已接线但未远端执行。工程指南只保留当前覆盖与证据入口，历史记录从 Git 查阅。</p>
+<p>VM 证据在 A 机 <code>/var/tmp/dbp21</code>，工程证据在 B 机
+<code>/var/tmp/retro-closeout-1008/evidence</code>。A 机 bundle 的摘要优先取回及完整包取回均已
+实测，66 个成员校验通过；B 机完整包的 11 个成员也已校验。B 首次打包因本轮输出
+父目录归属不匹配而失败，修正归属后以新下载目录完成，原失败回执及 <code>.partial</code> 保留。
+本地统一交接目录为
+<code>/tmp/agentenv-retro-closeout-20261008</code>，当前状态由其中 <code>completion.json</code> 指向已验证回执。</p>
+<h2 id="身份刷新优化2026-10-08"><a class="header" href="#身份刷新优化2026-10-08">身份刷新优化（2026-10-08）</a></h2>
+<p>本轮修复两个具体问题：DB 新身份校验改为带 runtime token 的 <code>GET /envs</code>，
+精确读取命令共用的默认环境，避免额外创建校验 shell；guest envd 的 MMDS
+轮询首次请求从固定等待 50 ms 改为立即尝试，失败后仍等待 50 ms，取消与原有
+截止时间保留。<code>/init</code> 仍异步，身份仍来自 MMDS，不通过主机注入身份绕过确认。
+同 ID resume 继续跳过内部身份校验，快照/模板创建和 fork 仍等待新身份正确。</p>
+<p>先单独验证 GET 改动：6 组、108 条操作及校验记录、36 段计时全部通过；
+每种配置每个操作 n=4，第二批反转顺序。旧/新 DB 的冷启动、快照恢复、resume
+就绪 p50 分别为 843.3/848.2、536.6/536.4、248.5/251.3 ms，<strong>没有端到端收益</strong>。
+首条外部命令耗时增加，与开销后移相符，但尚未证明具体缺页归因；不能把内部
+阶段缩短当作性能改善。
+该改动的确定收益是去掉身份确认对 BusyBox 的依赖，保留准确身份契约。</p>
+<p>随后用同一 envd 上游提交 <code>9c3b7c5dbd181ba819084276b8228f70936e911e</code>、
+Go 1.25.9、相同编译参数构建 timer 补丁前后版本。两份 tools 都从冻结旧盘复制，
+仅替换 envd 和版本标记；同一版本的 DB/FC 使用完全相同的 tools 字节。
+DB 两组均使用上述 GET 候选，FC node 固定为 <code>13b6f7a</code>；runner 为 <code>68ee8d2</code>，
+Kata 为 <code>9e41795</code>。因此本轮只比较 guest timer 改动，
+不与前一轮混算。版本分别为 <code>0.1.2-mmds-before.1</code>、<code>0.1.2-mmds.1</code>。</p>
+<p>A 机固定 1 vCPU/1 GiB、并发 1、512 MiB 低脏页负载，tools 每次创建前全驻留，
+CPU 0–7、NUMA 0、node 4 CPU/32 GiB、夹具 16 GiB、网络缓存与 VMM 池关闭。
+两批反转四组顺序，每组每操作 n=4；保留服务首个 guest 和全部慢样本。
+144 条操作及内存/身份校验、48 段计时全部通过，无输入变化。
+两端统一从 API 发起至真实 guest 命令返回准确 sandbox/template ID，API 单独计时。
+下表单位 ms；p50 为中位数，偶数样本取中间两值均值，不提供 p95/p99 或容量资格。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>API 至准确身份就绪 p50</th><th style="text-align: right">DB 补丁前</th><th style="text-align: right">DB 补丁后</th><th style="text-align: right">FC 补丁前</th><th style="text-align: right">FC 补丁后</th></tr>
+</thead>
+<tbody>
+<tr><td>冷启动</td><td style="text-align: right">851.9</td><td style="text-align: right">833.8</td><td style="text-align: right">875.8</td><td style="text-align: right">859.9</td></tr>
+<tr><td>快照创建新实例</td><td style="text-align: right">520.8</td><td style="text-align: right">544.7</td><td style="text-align: right">529.0</td><td style="text-align: right">502.7</td></tr>
+<tr><td>同 ID resume</td><td style="text-align: right">267.3</td><td style="text-align: right">253.6</td><td style="text-align: right">239.7</td><td style="text-align: right">236.2</td></tr>
+</tbody>
+</table>
+</div>
+<p>DB 冷启动内部身份等待均值 35.6→1.1 ms，快照恢复 55.9→12.0 ms。
+冷启动端到端中位数减少 18.1 ms，FC 减少 15.9 ms；收益小于移除的固定等待。
+<strong>DB 快照恢复未确认端到端改善</strong>：均值 561.2→560.4 ms，范围分别为
+495.6–707.5、428.9–723.5 ms，中位数反而增加 23.9 ms。同期 health 均值
+272.4→302.3 ms、init RPC 25.5→33.2 ms、外部首条命令 11.3→25.9 ms，
+抵消了身份阶段节省，不能将该小样本波动解释为已证实的产品回退或提速。
+FC 快照恢复均值 521.0→496.3 ms，主要减少 API 后的身份等待。
+同 ID resume 的内部身份轮询次数始终为零，其分位数变化不能归功于删除身份检查；
+FC resume 的慢样本 331.7 ms 保留，均值实际为 238.4→258.9 ms。
+DB 所有外部身份探测均首次正确；FC 补丁后恢复仍有 3/4 需要第二次探测，
+不能把 FC API 返回视为身份立即就绪。</p>
+<p>独立的线程阻塞诊断在双方均观察到文件缺页等待与块层 tag 等待；该轮只有每端
+一次，且带 2 ms 采样，不混入性能统计。它没有证明 DB 独有网络瓶颈，也不足以
+支持扩大内存预读。恢复 health/按需读页窗口仍是剩余诊断方向，未承诺尾延迟已消除。</p>
+<p>验证与交付边界：</p>
+<ul>
+<li>Rust fmt、workspace 全目标/全 feature Clippy、envd 单元 18/18、DB 单元 61/61 通过。
+B 机同一组 12 项真实 VM 功能分别在旧 tools、新 envd tools、当前启动脚本组合上通过；
+包括禁用 BusyBox 后 fork/快照第一条命令身份、同 ID resume、挂盘/USER/WORKDIR、
+鉴权/网络、held 状态、回滚和记录器。旧实现的身份 shell 失败保留为 RED 证据。</li>
+<li>guest <code>go test ./internal/host ./internal/api</code> 通过；虚拟时钟测试覆盖首次立即成功、
+token/metadata 两种失败的 50 ms 重试、等待中取消与预取消。原实现 RED 保留。
+Linux M4 工具 205 项中 188 通过、17 项需专项输入而显式跳过。</li>
+<li>当前仓库 <code>init</code>、<code>pivot-init</code> 与新 envd 另组装 <code>0.1.2-current.1</code> ext4，
+核对 BusyBox 1.37.0 及四个必需 applet；上述 DB 12 项与额外 FC 创建/命令冒烟（node <code>4b1e400</code>）通过。
+FC guest 内回读 envd/pivot-init SHA 与 tools 版本一致。该组合不并入 A 机性能样本。</li>
+<li>Docker 补丁白名单、版本接线、对原始源码的 <code>git apply --check</code> 已核验。
+后续在 B 机以非 root 账号完成 <code>33453da</code> 的实际 Docker/Buildx amd64 构建，
+候选版本 <code>0.1.2-p4.1</code>。FC 通过临时本地 registry 获取该 OCI，执行运行时
+OCI→OverlayBD 转换并真实启动；guest 内 envd、pivot-init、BusyBox 摘要和
+tools 版本均与构建产物一致。DB 使用该 OCI 原始 rootfs 生成的 ext4，
+同一组 12 项功能全部通过。它验证了交付链路，不并入 A 机性能样本。
+构建与导出进程临时获得 Docker socket 所需补充组，未修改账号永久权限。
+默认构建版本为 0.1.2，运行时 manifest 仍为已发布 0.1.1；没有对外发布、
+部署或升级旧模板。旧快照中的 envd 不会自动替换；ARM64 未验证。</li>
+</ul>
+<p>冻结 DB server SHA-256 为 <code>52ad8dfa9456c911296581826891230072a835e7ea15b3abb8bf6a393e34498e</code>，
+基于 <code>84e21d5</code> 的运行时三文件 diff 为
+<code>80a65a02439b8c8559a032253d88851751af37f4549662837092e86fde153b00</code>。
+guest 补丁为 <code>6288076dca8ca7ad9407bc8426169eb03bf073fa890bae2f3b4fcb56c8a74334</code>，
+新 envd 为 <code>9a41d756ea49aa1f603a5d9dd9708d60f301597d71283ca480f3e177434696aa</code>。
+应用补丁后的 guest 源文件、被测 Rust 文件和测试脚本均与本地交付逐字核验一致。</p>
+<p>A 机诊断、GET 对照、guest 构建和 timer 对照分别位于 <code>/var/tmp/dbp22</code> 至 <code>dbp25</code>；
+B 机对应旧/新 tools 功能在 <code>dbp22</code>、<code>dbp25</code>，当前启动脚本组合在 <code>dbp26</code>、<code>dbp27</code>。
+测试前检查空间，成功现场归档后依次回收约 4.06、19.16、25.66 GiB；失败及功能
+现场保留。两机临时配置/模块已恢复，无自有 VM、ublk、Lab cgroup 或命名空间残留；
+A 机收尾可用约 49.7 GiB。证据及整体/逐成员校验回执集中在 Mac
+<code>/tmp/agentenv-p3-20261008</code>，正式包摘要另见其中的交接回执。</p>
+<h2 id="恢复读页窗口与-tools-交付补验"><a class="header" href="#恢复读页窗口与-tools-交付补验">恢复读页窗口与 tools 交付补验</a></h2>
+<p>对上述 timer 对照的 32 次 restore/resume 离线匹配健康检查 TCP 流，全部得到唯一
+匹配。进入 health 阶段至发出 SYN 约 0.1–0.2 ms，响应到达至就绪日志约
+0.1–0.2 ms；主要等待位于 SYN→SYN-ACK，以及观测到请求包至响应包之间。
+DB 补丁后 restore 的这两段均值约 134 ms、168 ms；FC 分别约
+147 ms、79 ms。双方使用同一健康探测实现，现有证据不支持继续减少探测轮询
+间隔。结合此前双方都有的缺页/块层等待，转而验证已有启动页预取能否缩短该窗口；
+不能仅凭 TCP 时间把全部等待归为缺页，也未证明 DB 独有网络问题。</p>
+<p>已有启动页预取的对照验证了一个有效的配置优化，未修改运行时或默认开关。
+本节的恢复指从已发布模板/checkpoint 创建新 sandbox，不包括同 ID pause/resume。
+范围检查确认：正常暂停时 DB 重建不带预取描述符的 manifest，FC 显式将
+<code>memory_startup_pack</code> 置空，两者均不启动记录器，也不继承原模板清单。
+因此下面的性能结论不能用于声明休眠后继续运行更快。
+A 机 <code>/var/tmp/dbp29</code> 使用同一冻结运行时、内核和 <code>0.1.2-mmds.1</code> tools，
+1 vCPU/1 GiB guest、512 MiB 低脏页工作集、单并发，OSS 路径接本地 S3 夹具。
+发布节点统一开启记录，恢复节点使用独立 OverlayBD 缓存，仅切换
+<code>consume_enabled</code>。两组均等待清单发布，完成源工作集校验并删除源 VM、确认
+记录器退出后才测恢复；tools 文件预热并以 mincore 核验，宿主机和 S3 页缓存
+未清空。两节点各限 4 CPU/32 GiB，绑定相同 CPU 0–7/NUMA 0。
+这些数据不能与前述同节点恢复样本混算。</p>
+<p>8 个独立 cell 按两个相反顺序运行，每 cell 含首次、后续各一次恢复；每个
+backend/开关组合共 4 次，但仅有 2 个独立 cell。正式 80 条操作记录、16 次
+恢复全部通过，另有 4 次预实验未并入统计。计时终点仍为 API 发起至第一条
+返回准确 Sandbox ID 和 template ID 的 guest 命令。下表为<strong>均值，毫秒</strong>；
+每格 n=2，保留全部首次与慢样本，不据此推断 p95 或生产 SLO。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>后端及节点阶段</th><th style="text-align: right">预取关闭</th><th style="text-align: right">预取开启</th></tr>
+</thead>
+<tbody>
+<tr><td>DB 首次恢复</td><td style="text-align: right">721.1</td><td style="text-align: right">497.3</td></tr>
+<tr><td>DB 后续恢复</td><td style="text-align: right">528.0</td><td style="text-align: right">281.4</td></tr>
+<tr><td>FC 首次恢复</td><td style="text-align: right">770.7</td><td style="text-align: right">509.2</td></tr>
+<tr><td>FC 后续恢复</td><td style="text-align: right">515.8</td><td style="text-align: right">323.8</td></tr>
+</tbody>
+</table>
+</div>
+<p>合并两阶段仅作等比例诊断汇总：DB 中位数 628.8→379.4 ms、均值
+624.5→389.4 ms；FC 中位数 623.3→413.5 ms、均值 643.3→416.5 ms。
+health 均值分别为 DB 287.1→72.5 ms、FC 290.2→86.5 ms，是主要改善项。
+DB 外部命令等待均值 64.1→46.7 ms，FC 80.1→67.4 ms，因此不是把相同等待
+移到 API 返回后。DB 8 次恢复外部身份首次正确；FC 关闭组 4/4、开启组 3/4
+需要第二次探测。8 次开启组均核验实际预取数据读取，未仅凭任务完成日志判定。</p>
+<p>收益有资源代价。DB 首次恢复窗口的 S3 下载 IP 字节均值约 168.4→221.9 MiB，
+节点 <code>memory.current</code> 的 10 ms 采样峰值约 635.0→770.8 MiB；后续分别为
+147.3→215.4 MiB、1311.3→1482.1 MiB。节点值包含保留缓存，采样峰值是实际
+峰值的下界，并非 guest 或 VMM 专属内存。连续覆盖恢复与完整工作集校验的
+下载总量基本不变：DB 约 597 MiB、FC 约 610–611 MiB。该流量包含协议头、
+重传和后台读取，不是逻辑页大小，也不能外推所有业务都没有读放大。
+工作集校验使用 1 秒轮询，约 5–6 秒的校验耗时不用于判断应用吞吐改善。</p>
+<p>当前可用方案是对有预先生成清单、资源预算允许的快照启用消费；默认仍关闭。
+立即恢复及没有清单的旧快照、低内存、高并发、真实远端 OSS 和 POSIX 的收益
+不在本轮结论内。记录端会启动临时 VM，其成本没有通过“记录关闭”对照量化。
+配置及异步发布边界见<a href="#snapshotmemory_startup_pack">配置参考</a>。
+A 机预实验与正式成功现场归档后回收，配置/模块恢复，无自有运行资源残留，
+剩余约 49.7 GiB。原始驱动、输入、逐样本结果及清理回执保存在
+<code>/var/tmp/dbp29/bundle</code>，证据包 SHA-256 为
+<code>aa1b14a2801ef34813a15ff5070f610b2e89b4b6e0a46d8663b169b8b13c28ef</code>。
+Mac <code>/tmp/agentenv-p4-20261008/host-a/verified</code> 已完整下载并校验 513 个成员，
+正式驱动、协议及配置恢复脚本与本地逐字一致。</p>
+<p>tools 补验使用的完整 OCI archive SHA-256 为
+<code>7e81acbe9f769e82b8eabccadc10ee2e91db91e1085f0144a08e42b852035560</code>，
+FC 转换所得 OverlayBD 层为
+<code>cdf92c857e0b8641c49c25900ebd17f8c91efffe7f271f6eca2b6cdd004d431b</code>，
+DB 同源 ext4 为 <code>49ebed000c745938983f3e319591ceac4cd48525f673a950a459cc3ca38778c7</code>。
+实际 Docker 构建的 envd 为 <code>9be13d070884160d4b13913acbb56eb29d76113ac79cc271de00c8fe9b2de756</code>，
+与先前定向替换 envd 的性能镜像不是同一制品，不能互换其性能结论。
+B 机证据 <code>/var/tmp/dbp28</code> 已归档并下载到 Mac
+<code>/tmp/agentenv-p4-20261008/tools/evidence-verified</code>，135 个成员逐一校验通过，
+证据包 SHA-256 为 <code>0930f782b987c1f4bd3522d1952d4d627287365cfe2136e504daa60391672bdc</code>。
+功能现场与候选保留，临时主机配置和模块已恢复，无自有运行资源残留。</p>
+<h2 id="完整-tools-候选性能复测"><a class="header" href="#完整-tools-候选性能复测">完整 tools 候选性能复测</a></h2>
+<p>后续复测固定使用上述 Docker/OCI 候选 <code>0.1.2-p4.1</code>。DB 使用同源 ext4，
+FC 使用实际运行时转换得到的 OverlayBD tools 层；7 个传输文件逐一验证摘要，
+guest 内另核验 envd、pivot-init、BusyBox 的摘要和 tools 版本。两种后端的
+guest 内容相同，原生存储表示不同，因此结果包含各自 tools 路径的成本。
+制品下载和转换在测量前完成，tools 文件页预热并通过 mincore 核验；这不表示
+FC 的 ublk 设备页缓存全暖，也不计入首次部署下载/转换耗时。</p>
+<p>运行时、内核和工作负载沿用冻结输入，源码相对 <code>33453da</code> 没有运行时或
+tools 变更。A 机串行执行默认生命周期与独立缓存的预取对照，两组均反转顺序，
+1 vCPU/1 GiB guest、512 MiB 低脏页工作集，节点 4 CPU/32 GiB，
+CPU 0–7/NUMA 0、本地 S3 夹具、单并发。API 到准确 Sandbox ID/template ID
+的首条 guest 命令仍是统一终点，制品摘要核验在就绪计时及该操作的资源采样
+窗口外执行。
+本轮和前述定向替换 envd 镜像的样本分别统计，不据跨轮差值认定优化收益。</p>
+<p>默认生命周期（<code>/var/tmp/dbp31</code>）关闭记录和消费，使用同节点恢复、源 VM 保持
+运行的既有协议。4 个 cell、72 条操作全部通过，24 次就绪后的实际 guest
+制品核验通过；每后端每操作 n=4，来自两个 cell 的第 1/2 轮各一次。
+表中单位为毫秒，保留全部样本，不能用于 p95/SLO 验收。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>操作</th><th style="text-align: right">DB 均值 / 中位数</th><th style="text-align: right">FC 均值 / 中位数</th></tr>
+</thead>
+<tbody>
+<tr><td>冷启动</td><td style="text-align: right">828.6 / 830.3</td><td style="text-align: right">871.9 / 874.9</td></tr>
+<tr><td>checkpoint 创建新实例</td><td style="text-align: right">574.6 / 568.7</td><td style="text-align: right">490.7 / 482.0</td></tr>
+<tr><td>同 ID resume（已暂停）</td><td style="text-align: right">284.4 / 285.7</td><td style="text-align: right">271.8 / 261.7</td></tr>
+</tbody>
+</table>
+</div>
+<p>冷启动第 1/2 轮均值为 DB 969.3/687.8 ms、FC 1044.3/699.5 ms；
+checkpoint 为 DB 637.8/511.4 ms、FC 499.3/482.0 ms；
+resume 为 DB 319.1/249.8 ms、FC 302.4/241.3 ms。各子组 n=2，
+新节点缓存与后续轮次的差异不能隐藏在单个中位数里。
+DB checkpoint 范围 460.4–700.5 ms，FC 469.4–529.3 ms；该小样本下
+DB 默认 checkpoint 仍较慢，health 均值为 332.2/245.4 ms，准备至释放阶段
+为 174.7/179.8 ms。DB 外部身份首次均正确，FC 的 4 次 checkpoint 均需
+第二次探测；已将这段等待计入表中。双方 resume 均保持 ID，DB 内部身份
+检查阶段近零（0–1 µs）。resume 数值不含 pause API 耗时。
+恢复后的完整工作集校验通过，未放宽正确性终点。</p>
+<p>checkpoint 预取对照（<code>/var/tmp/dbp32</code>）统一开启发布端记录，等待清单发布后
+删除源 VM 并确认记录器退出，使用独立恢复节点缓存，仅切换消费开关。
+宿主机和 S3 页缓存未清空。8 个 cell、80 条操作、16 次恢复与 32 次 guest
+制品核验全部通过；8 次开启组均确认实际数据预取。该组与默认生命周期的
+源 VM/缓存条件不同，不能用两表差值计算预取收益。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>checkpoint 新实例</th><th style="text-align: right">关闭预取均值 / 中位数</th><th style="text-align: right">开启预取均值 / 中位数</th></tr>
+</thead>
+<tbody>
+<tr><td>DB</td><td style="text-align: right">684.3 / 708.8 ms</td><td style="text-align: right">395.2 / 374.2 ms</td></tr>
+<tr><td>FC</td><td style="text-align: right">610.5 / 610.3 ms</td><td style="text-align: right">457.6 / 447.8 ms</td></tr>
+</tbody>
+</table>
+</div>
+<p>每个组合 n=4，仅有两个独立 cell。首次/后续子组各 n=2：DB 均值分别
+825.6→489.2 ms、542.9→301.2 ms；FC 为 728.6→583.9 ms、492.3→331.3 ms。
+DB health 均值 321.1→70.7 ms，
+FC 242.9→115.8 ms，是主要改善阶段。DB 外部身份等待 70.4→50.4 ms，
+FC 59.0→63.3 ms；上述端到端结果已包含外部等待，不能只按 API 返回计时。</p>
+<p>预取将更多读取提前到恢复窗口。DB 恢复窗口 S3 下载 IP 字节均值
+162.5→229.0 MiB，FC 181.0→208.2 MiB；节点 <code>memory.current</code> 的
+10 ms 采样峰值均值分别为 1069.4→1251.4 MiB、1010.7→1074.9 MiB。
+该内存指标包含节点保留缓存，是实际峰值的采样下界，不是 guest 专属内存。
+连续覆盖恢复、制品摘要与完整 512 MiB 工作集校验的下载量，DB 为
+597.2→597.7 MiB，FC 611.3→609.2 MiB；这是含协议头、重传和后台读取的
+IP 流量，不是对象净字节，也不能证明其他负载没有读放大。工作集校验采用
+1 秒轮询，其耗时不作为应用吞吐指标。</p>
+<p>本轮确认完整候选在上述条件下仍有预取收益，默认消费仍关闭；同 ID
+pause/resume 不使用该清单。立即恢复、低内存、高并发和真实远端 OSS 的
+收益未覆盖，记录端额外 VM 的成本也未通过记录开关对照量化。</p>
+<p>测试前完成磁盘及旧成功归档检查；本轮 12 个成功现场归档后回收 payload，
+失败和功能证据保留。结束时 A 机剩余约 49.5 GiB，临时配置、模块、进程、
+ublk 设备、命名空间和 cgroup 均恢复；B 机临时制品传输服务已停止。
+一次准备失败来自生成的资产清单权限，修正为测试账号可读后通过预检，
+发生在 VM 测量前；原始失败与修正回执保留，没有删除慢样本或重跑筛选。</p>
+<p>原始协议、驱动、逐条结果、分析及恢复回执位于 A 机 <code>/var/tmp/dbp31</code>、
+<code>/var/tmp/dbp32</code>；完整证据包 <code>/var/tmp/dbp32/bundle/evidence.tar.gz</code> 的
+SHA-256 为 <code>28dce918f93452ca6ffe17fa5d2e881a183a5ec606176df69802d4aa7f2b6d25</code>。
+Mac <code>/tmp/agentenv-p5-20261008/host-a/verified</code> 已下载并逐一核验 607 个成员；
+47 个公共脚本、10 个实验驱动/协议文件及候选适配器与本地一致。
+两组总计 152 条操作及 56 次实际 guest 制品核验通过；该结果完成候选性能
+复测，不代表生产容量、发布或云端 CI 验收。</p>
 <h2 id="尚未关闭的限制"><a class="header" href="#尚未关闭的限制">尚未关闭的限制</a></h2>
 <ul>
-<li>历史 OSS30 并发上传超时及 readiness/尾延迟问题仍需独立复现、修复和资格验证。</li>
+<li>640 MiB 压力失败及 readiness 尾延迟保留为已知限制，快速失败/超时调整已搁置。</li>
 <li>生产并发、容量与 SLO 应按实际部署目标验证；开发候选通过不等于所有负载通过。</li>
 <li>DB 仅声明已验证的 Linux x86_64/KVM 配置；跨 FC/DB 内存恢复不在支持范围内。</li>
 <li>日常迭代保留兼容性拒绝契约；旧版本升级集成测试仅在格式/兼容规则变化或发布时专项运行。</li>
@@ -5095,6 +5974,48 @@ git show ab3db37:docs/src/internals/test-cleanup-2026-10-07/validation.json
 </code></pre>
 <p>新实验的原始日志、输入回执与大体积制品保存在测试输出或 CI artifacts；更新本页
 时只收敛结论、候选身份、证据位置和未覆盖范围，不新增逐轮过程文档。</p>
+<p>本次证据位于测试主机 <code>iZk1afrni8l1k5rt5thkwdZ</code>：</p>
+<ul>
+<li><code>/var/tmp/dbc7/{db-baseline,fc-baseline}/receipt.json</code>：运行时构建回执。</li>
+<li><code>/var/tmp/dbc7/regression-final/results.json</code>、<code>logs/platform-final.log</code>：功能/平台结果。</li>
+<li><code>/var/tmp/db-m4-performance.5_0v3ihi/result.json</code>：OSS30 最终重复批次，工具版本 <code>50a5e21</code>。</li>
+<li><code>/var/tmp/dbp8/results/{result.json,paired.jsonl,samples.jsonl}</code>、<code>protocol.json</code>：<code>b813d45</code> 的 120 次创建诊断、原始计时与冻结协议。</li>
+<li><code>/var/tmp/dbp8/{analysis.json,stages.json}</code>：输入/缓存/运行时逐样本复核、分批统计和 DB 分段分析；<code>evidence/host-restored.json</code> 为清理回执。</li>
+<li><code>/var/tmp/dbp8/evidence.tar.gz</code>：118 个证据文件，SHA-256 <code>127ff1efdc27d66677826cf524cf3acfa32c3ccd8d81368698b94a6d3601433a</code>；Mac 下载后逐文件摘要核验通过。</li>
+<li><code>/var/tmp/dbc7/readiness-aligned/result.json</code>、<code>benchmark-protocol.json</code>：统一口径矩阵及协议，工具版本 <code>1d23f66</code>。</li>
+<li><code>/var/tmp/dbc7/evidence/analysis.json</code>：输入摘要复核及逐 cell 分析。</li>
+<li><code>/var/tmp/dbc7/evidence/{cleanup,host-restored}.json</code>：测试前清理 84.25 GiB 的回执及结束后的权限/资源恢复核验；结束时无自有进程、ublk 设备、Lab cgroup 或挂载引用，失败现场文件保留。</li>
+<li><code>/var/tmp/dbeg7/logs/{tools-final,recovery-final,lab-final}.log</code>：<code>5eb08f4</code> 的工具、真实 SIGKILL/引用审计及 Lab 回归结果；候选源码保留在 <code>/var/tmp/dbeg7/finalsrc</code>。</li>
+<li><code>/var/tmp/dbp9/{results,pool-stages.json,campaign}</code>：网络复用对照、原始失败分组及执行回执；<code>evidence/preclean.json</code> 为前置清理回执。</li>
+<li><code>/var/tmp/dbp10/evidence/heartbeat-failure.json</code>、<code>/var/tmp/dbp11/evidence/heartbeat-network.json</code>：心跳失败复现与实际出站规则；修正后的独立捕获检查位于 <code>dbp11/results</code>。</li>
+<li><code>/var/tmp/dbp12/{protocol.json,cell.py,frozen.json,results,analysis.json,startup-followup.json}</code>：最终生命周期协议、外部驱动、输入绑定、逐样本数据及分析。协议 SHA-256 为 <code>77026a6e8cd66f5791985910256e61b60a4e9da4dd5a670ad0ffd638c062ae6e</code>；驱动为 <code>e0402277ea1fd16db3819d8bfd7ee29a783bc735441d45f0c9272a601d4bea3f</code>。</li>
+<li><code>/var/tmp/dbp12/evidence/{campaign-executed,resume-verified,host-restored,final-host-check}.json</code>：原始执行、8 步复用、主机恢复及最终资源检查；<code>logs/tools-nonroot.log</code> 记录 UID 999 的最终工具测试。</li>
+<li><code>/var/tmp/dbp12/evidence.tar.xz</code>：1265 个证据文件，SHA-256 <code>3ab1b6ba3e195b310f9526747aa871740a41ca025c158825d0a949695deb3a38</code>，包含失败诊断及修正后的原始样本；不包含已回收的成功 VM payload。由同内容的 gzip 包转换，转换回执为 <code>archive-verification-xz.json</code>。Mac 下载后逐文件摘要核验通过，36 个被测源码文件及协议、驱动与本地一致。</li>
+</ul>
+<p>本轮新增证据：</p>
+<ul>
+<li>第一台 <code>/var/tmp/dbp13/{db-before,fc-before,db-final}/receipt.json</code>、<code>protocol.json</code>、<code>results</code>、<code>analysis.json</code>：冻结构建、162 条样本及分段分析；<code>final-src</code> 固定为 <code>b9848bc</code>。</li>
+<li>第一台 <code>/var/tmp/dbp13/evidence.tar.gz</code>：357 个文件，SHA-256 <code>21e3943baf10900425382f9b8175306955dabef81b7589ff88141ab2e1a530c7</code>。</li>
+<li>第二台 <code>/var/tmp/dbp13/evidence.tar.gz</code>：292 个文件，SHA-256 <code>af9c2ce1bcdc71d8969120e70929feb7687b935dff18af8e836d5ace6d7d180b</code>，最终功能结果为 <code>evidence/functional-final.json</code> 与 <code>evidence/final-recorder.json</code>。</li>
+<li>Mac <code>/tmp/agentenv-ready-diagnosis-20261008/host-{a,b}-evidence.tar.gz</code>：下载副本；两包逐文件摘要及最终 9 个源码/测试文件与本地核验一致。两机的 <code>evidence/host-restored.json</code> 记录最终清理状态。</li>
+</ul>
+<p>Mac 与 Linux 的被测脚本及协议摘要一致，运行时二进制重新核验匹配构建输入；
+本页后续文字修订不改变被测工具及运行时。候选保留在本地开发分支，未推送、
+发布或核验云端 CI。</p>
+<p>状态 I/O 缓冲轮次（<code>dbp14</code>）：</p>
+<ul>
+<li>第一台 <code>/var/tmp/dbp14/{candidate-src,db-candidate/receipt.json,protocol.json,frozen.json,results,analysis.json,io-analysis.json}</code>：<code>5b81aea</code> 冻结源码/构建、162 条样本、阶段及进程 I/O 分析；<code>evidence/final-source.json</code> 将 9 个 AgentENV 文件和 Kata capture 文件与本地逐一比对。</li>
+<li>第一台 <code>/var/tmp/dbp14/evidence.tar.gz</code>：325 个文件，SHA-256 <code>1755b3887ee1787554c65de21515aa1164987e537e01228fc1233b782048be17</code>，含依赖 Git bundles、首次失败、最终构建/测试日志与原始性能证据。</li>
+<li>第二台 <code>/var/tmp/dbp14/evidence.tar.gz</code>：181 个文件，SHA-256 <code>369a137795d92b17fe7f65526629263ac721f14bfee641ecea53f2cfad2a24b4</code>；<code>evidence/functional-qualified.json</code>、<code>evidence/qualified-recorder.json</code> 和 <code>logs/kata-final-capture.log</code> 为最终功能结果。</li>
+<li>Mac <code>/tmp/agentenv-restore-io-20261008/host-{a,b}-evidence.tar.gz</code> 为下载副本；<code>kata-buffered-state-io.bundle</code> 携带 <code>9b0d285</code> 之后的依赖提交，基础 commit 为 bundle 前置要求。两机 <code>evidence/host-restored.json</code> 记录最终资源和权限核验。</li>
+</ul>
+<p>P1 收口轮次（<code>dbp15</code>）：</p>
+<ul>
+<li>第一台 <code>/var/tmp/dbp15/{src,db/receipt.json,protocol.json,frozen.json,results,analysis.json,phases-analysis.json,ipc-analysis.json,network-analysis.json}</code>：冻结运行时、108 条常规诊断及分段/包头证据；<code>faults/</code> 为独立 36 条缺页诊断。<code>evidence/runtime-source-verified.json</code> 核验 14 个运行时/依赖文件。</li>
+<li>第一台 <code>evidence.tar.gz</code>：515 个文件，SHA-256 <code>1ea92b5e58bea6e5d275320c50a7de7c52708695e0d4e900322c095c4693a8ec</code>。归档后的补充定向检查为 <code>logs/envd-unit.log</code>（15/15）。</li>
+<li>第二台 <code>/var/tmp/dbp15/evidence.tar.gz</code>：184 个文件，SHA-256 <code>7379f49bbe3ecc8441be6ef7823345dad5ea23869c7f3b18a7748d0a52722f7e</code>，含功能、capture 和工程检查；<code>engineering/source-verification-final.json</code> 对应 <code>bbe7034</code> 的 16 个工程文件，规范化清单摘要为 <code>860d180a5c20410b0c234b35696e9cb05108ce3749854e8b5e748477b0b3d083</code>。</li>
+<li>Mac <code>/tmp/agentenv-p1-20261008/</code> 保存计划、分析、Git bundles 和 <code>host-{a,b}-evidence.tar.gz</code> 副本。两机 <code>evidence/host-restored.json</code> 记录运行资源恢复；运行时代码独立评审与工程清理边界复核无未处理阻断项。</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
 <p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>

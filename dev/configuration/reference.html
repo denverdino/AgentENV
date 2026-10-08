@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-cc57b59d.js";
+            window.path_to_searchindex_js = "../searchindex-fcbf58f7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-c125be5b.js"></script>
@@ -759,11 +759,16 @@ record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.</p>
 <h2 id="snapshotmemory_startup_pack"><a class="header" href="#snapshotmemory_startup_pack"><code>[snapshot.memory_startup_pack]</code></a></h2>
 <p>Optional startup-memory trace recording and best-effort prefetch for both
-<code>oss</code> and <code>posix_fs</code> repositories. It is disabled by default. Publishing never
-waits for recording: a completed trace is encoded as a SHA-256-verified
-manifest and attached to the already committed snapshot. Snapshots without a
+<code>oss</code> and <code>posix_fs</code> repositories. It is disabled by default. Snapshot publication
+does not await recording or manifest publication: a completed trace is encoded as
+a SHA-256-verified manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
 resume through the ordinary on-demand path.</p>
+<p>This applies to launching a new sandbox from a published template or checkpoint.
+Normal same-ID pause/resume does not record a startup manifest or inherit the
+template’s manifest: pause captures a fresh state with no startup-prefetch
+descriptor. Startup access patterns must not be assumed to represent the
+workload at a later pause point.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -776,11 +781,27 @@ resume through the ordinary on-demand path.</p>
 <tr><td><code>record_max_window_ms</code></td><td>integer</td><td><code>2000</code></td><td>Hard recorder observation-window cap.</td></tr>
 <tr><td><code>record_budget_secs</code></td><td>integer</td><td><code>10</code></td><td>Best-effort recording budget; it never blocks the snapshot publish.</td></tr>
 <tr><td><code>max_pack_bytes</code></td><td>integer</td><td><code>1073741824</code></td><td>Maximum recorded page-data budget and POSIX logical prefetch budget.</td></tr>
-<tr><td><code>consume_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable resume-time prefetch; leave disabled for rollout and A/B comparisons.</td></tr>
+<tr><td><code>consume_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable prefetch when launching from a template/checkpoint with a startup manifest; normal same-ID pause/resume is excluded.</td></tr>
 <tr><td><code>consume_timeout_secs</code></td><td>integer</td><td><code>30</code></td><td>Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it.</td></tr>
 </tbody>
 </table>
 </div>
+<p>Recording and consumption are independent. A snapshot-producing node can use
+<code>enabled = true, consume_enabled = false</code>; a restore node can use
+<code>enabled = false, consume_enabled = true</code>. Set both to <code>true</code> when one node serves
+both roles. Recording starts a temporary VM and consumes CPU, memory and I/O;
+prefetch can bring reads forward or fetch pages the foreground does not need.
+Keep these costs in the workload’s resource budget.</p>
+<p>A snapshot API response does not mean its startup manifest has been published.
+Immediate restores can therefore use the ordinary demand-read path even with
+consumption enabled. Enabling consumption also does not generate manifests for
+old snapshots. In an A/B test, verify the descriptor is present before either
+variant, use separate producer and consumer OverlayBD caches, and hold the
+recording setting constant. Otherwise the recorder’s cache warming can obscure the effect
+of consumption. Shared host and object-store caches still affect the result.
+Check actual prefetch reads as well as task completion logs.
+See the <a href="../internals/hypervisor-validation.html">hypervisor validation results</a>
+for the measured workload and its limits.</p>
 <p>For POSIX, the resolver hands the normal sandbox start path a <code>LocalPath</code>
 manifest. After acquiring the actual shared memory ublk device, the executor
 reads its logical manifest ranges through a buffered device handle, concurrently

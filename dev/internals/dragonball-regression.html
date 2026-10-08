@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-cc57b59d.js";
+            window.path_to_searchindex_js = "../searchindex-fcbf58f7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-c125be5b.js"></script>
@@ -234,7 +234,11 @@ make test-dragonball-regression
 make test-dragonball-regression AENV_REGRESSION_ARGS=--resume
 </code></pre>
 <p><code>REGRESSION_PYTHON</code> 可指定 Python 3.11+ 的可执行路径。
-准备阶段保留 <code>state/regression-build.jsonl</code>，从 Cargo 的 compiler-artifact 中
+准备入口在构建和显式 <code>--setup-only</code> 之前取得主机锁并预检。新状态目录在磁盘、
+路径和所有权检查通过后创建；四份 OverlayBD global JSON 必须位于隔离 HOME，
+准备完成后校验并记录摘要。此入口仍可能安装或下载已有 setup 所需的依赖；
+测试执行入口不会隐式调用准备。准备日志保留在 <code>state/prepare-*/build.log</code>。</p>
+<p>准备阶段保留 <code>state/regression-build.jsonl</code>，从 Cargo 的 compiler-artifact 中
 选取 integration harness，复制为 <code>state/regression-integration</code>；测试阶段不构建。
 assets 保存为 <code>state/dragonball-assets.json</code>。
 <code>AENV_REGRESSION_BINARY</code> 可覆盖 harness 路径，提供已有的冻结 DB-only harness。
@@ -270,6 +274,90 @@ assets 保存为 <code>state/dragonball-assets.json</code>。
 也不能复用为通过。恢复前仍执行预检：存在 ublk 设备或已知 runner/daemon 进程时
 拒绝运行，要求先审计。工具不负责删除残留设备、历史快照或共享数据。
 不同结果目录共用同一状态目录时也互斥，但不会替其他测试工具加锁。</p>
+<p><code>make prepare-dragonball-regression</code>、功能套件的隔离执行器、
+<code>dragonball_m4_build.py</code> 与 M4 <code>Lab</code> 共用主机锁
+<code>/var/tmp/agentenv-dragonball-test-host.lock</code>，跨 checkout、状态目录和 root/测试账号
+互斥；冲突立即失败。准备、构建、功能进程通过经过校验的文件描述符传递锁，
+递归 Make 与受支持子进程共享租约；控制器退出时，存活子进程仍持锁。
+M4 Lab 的锁由控制器持有，以便审计恢复入口在控制器被杀后取得锁；残留 cgroup
+和 ublk 检查会阻止新测试直接进入。锁文件不删除，不能把锁释放视为清理完成。
+直接调用任意 Cargo、<code>prepare-dragonball-tests</code>、独立 runner CLI 和其他 Make
+入口不在此互斥范围内。</p>
+<p>共享预检支持非 root 构建／功能模式。所有 M4 Lab 入口默认预检，默认磁盘预留
+20 GiB；显式 profile 可指定工作负载预算。<code>resources-*.json</code> 将准备、构建、
+功能和 Lab 的控制器、目录／cgroup 身份、输入与证据摘要、结果和清理状态关联。
+这是证据清单，不授予新删除权限；失败与中断状态保留，SIGKILL 可能留下 <code>running</code>。
+现有 M4 成功 payload GC 仍执行独立归属和引用检查，其他状态不自动删除。</p>
+<h3 id="m4-中断后的审计与恢复"><a class="header" href="#m4-中断后的审计与恢复">M4 中断后的审计与恢复</a></h3>
+<p>功能隔离执行器和 M4 Lab 在取得主机锁后检查残留 <code>db-m4.*</code> cgroup 与 ublk
+设备，发现残留即拒绝启动。M4 Lab 将 root/cgroup 的设备号和 inode、主机 boot ID、
+控制器 PID/启动时间以及已就绪的命名空间写入 root 所有的 <code>lab-manifest.json</code>。
+新入口可审计这份清单，并在控制器已退出且身份匹配时回收该 cgroup 内的进程：</p>
+<pre><code class="language-bash"># 使用日志中明确记录的单个 Lab 路径；默认只读，不回收资源。
+sudo python3 scripts/tests/dragonball_m4_recovery.py --root /var/tmp/db-m4.RUN_ID
+# 明确执行回收，保留状态目录、日志、失败镜像和所有 ublk 设备。
+sudo python3 scripts/tests/dragonball_m4_recovery.py --root /var/tmp/db-m4.RUN_ID --apply
+</code></pre>
+<p>入口与测试共用主机锁，拒绝与正在执行的任务并行。主机重启、root/cgroup 身份不符、
+缺少清单或清单路径不可信时拒绝回收；旧实验目录不能仅凭名字自动接管。
+JSON 的 <code>clean</code> 返回 0；<code>orphaned</code>、<code>active</code>、<code>manual_review</code> 均不是清理成功。
+每次实际恢复尝试独立保存 <code>recovery-*.json</code>，允许在处理阻塞项后重复执行。</p>
+<p>恢复仅针对已确认归属的进程/cgroup。残留 ublk 设备和外部进程的文件、挂载及
+命名空间引用会列入 <code>manual_review</code>；历史日志中的设备编号不能证明当前归属，
+不会据此删除设备。此入口不删除历史数据，也不替代通用 GC 或跨套件续跑。
+真实 SIGKILL 资格测试使用隔离命名空间、非 root 工作负载，不启动 VM：</p>
+<pre><code class="language-bash">sudo env PYTHONDONTWRITEBYTECODE=1 python3 scripts/tests/test_dragonball_m4_recovery_linux.py --linux
+</code></pre>
+<h3 id="m4-准入归档与跨入口续跑"><a class="header" href="#m4-准入归档与跨入口续跑">M4 准入、归档与跨入口续跑</a></h3>
+<p><code>dragonball_m4_preflight.py</code> 提供只读预检：Linux/Python 版本、非 root 工作账号、
+目标账号 KVM 访问、显式工具/环境、socket 路径字节长度、cgroup、残留资源和磁盘预算。
+<code>--required-env</code> 比较编排进程与 <code>runuser</code> 后的值摘要，不输出值；这不代替其他权限
+包装器的环境验证。Docker 仅在指定 <code>--docker</code> 时检查。各预算用
+<code>--disk-path</code>、<code>--reserve-bytes</code>、<code>--planned-bytes</code>、<code>--retained-bytes</code> 显式传入。
+<code>Lab(..., preflight_profile=...)</code> 在持有主机锁、创建 cgroup 前执行该检查；未传 profile
+的调用使用默认 Lab 预检和磁盘预算。磁盘准入不是预留空间或文件系统强制配额。</p>
+<p><code>input_files</code> profile（CLI 为 <code>--input-files</code> JSON）可指定绝对路径列表：<code>files</code>
+检查读取、<code>executables</code> 另检查执行权限、<code>json</code>/<code>toml</code> 检查解析、<code>assets</code> 检查
+冻结资产清单及其 runner/kernel/tools/rootfs lower，<code>modules</code> 在新解释器中导入
+可信测试模块。所有检查以工作账号执行，不输出文件内容或模块的 stdout/stderr；
+模块必须是导入时不启动任务的库文件。它不执行二进制，也不验证 TOML 的业务语义。
+临时驱动应在 profile 中列出自身模块和生成配置，不能只复用磁盘/KVM 预检。
+性能入口已自动接入直接使用的二进制、资产和驱动模块检查；生成的 server TOML、
+regctl JSON 在启动 server 前另以工作账号检查。路径来自当前机器的冻结清单。</p>
+<p>成功的 M4 性能 cell 可使用 <code>dragonball_m4_retention.py</code> 归档及回收：</p>
+<pre><code class="language-bash">sudo python3 scripts/tests/dragonball_m4_retention.py archive --root /var/tmp/db-m4.RUN_ID
+# 先将返回的 archive_sha256 保存到 Lab 外的任务证据目录。
+sudo python3 scripts/tests/dragonball_m4_retention.py audit --root /var/tmp/db-m4.RUN_ID --archive-sha256 RECORDED_SHA256
+sudo python3 scripts/tests/dragonball_m4_retention.py apply --root /var/tmp/db-m4.RUN_ID --archive-sha256 RECORDED_SHA256
+</code></pre>
+<p>只接管同一次主机启动内、可信清单及输入核验通过的成功性能结果。归档保存结果、
+配置和日志；删除前重新检查引用、身份及归档摘要。失败、未完成、pin、符号链接、
+未知布局和身份变化均拒绝。<code>a/run</code>、<code>b/run</code> 连同 socket 始终保留，回执中的
+<code>retained_bytes</code> 只统计这些运行目录，不是整个 Lab 的剩余大小。该入口判定的是
+可回收数据的资格，不证明保留目录中所有 UNIX socket 都已失活，也不删除 ublk 设备。
+中断或部分删除记录失败及剩余/未知字节数；SIGKILL 无法保证写回执，歧义现场须人工审计。</p>
+<p><code>dragonball_m4_campaign.py</code> 可按显式 JSON 计划串行调用已有测试入口：</p>
+<pre><code class="language-bash">python3 scripts/tests/dragonball_m4_campaign.py plan --plan PLAN.json --output OUTPUT
+python3 scripts/tests/dragonball_m4_campaign.py run --plan PLAN.json --output OUTPUT
+python3 scripts/tests/dragonball_m4_campaign.py run --plan PLAN.json --output OUTPUT --resume
+</code></pre>
+<p>计划指定 <code>source</code>、<code>cwd</code>、<code>inputs</code> 文件列表、<code>environment</code> 变量名及 <code>steps</code>；每步
+包含唯一 <code>name</code>、<code>argv</code>、<code>timeout_seconds</code>、<code>artifacts</code>。必须显式列出相关源码、
+二进制及配置，目录不会自动递归绑定。成功步骤仅在输入、环境、日志及产物摘要均
+一致时复用；失效步骤及后续依赖重跑，失败尝试保留。计划绑定变化需要新输出目录。
+回执记录每次执行/复用原因、阶段耗时、失败类别、磁盘/inode 及未执行步骤；子入口
+仍负责验证真实用例数量、VM/设备清理和结果语义，命令退出 0 不自动等于生产资格。</p>
+<p>M4 节点就绪改用独立管道、总截止时间及严格 PID/namespace 校验，<code>ready</code> 文件只是
+原子写入的证据。未就绪、提前退出、畸形或超长消息会失败，退出和回收仍归 Lab。
+同时调用 probe 与 dual-backend 时，共享库测试只执行一次；两种 VM 过滤条件和
+独立的内存导出预算测试保留，不按名称相似合并不同后端/权限覆盖。</p>
+<p>覆盖盘点还需区分：<code>test-unit</code> 包含有权限要求的 ublk 测试；<code>test</code> 与
+<code>test-integration</code> 的 envd/ublk 公共前置目标可在同一次 Make 调用中去重，但后者
+额外的 snapshot OSS E2E 仍需保留。DB-only 与双后端 feature、ignored 与普通运行、
+同机 namespace 与物理跨机、三种 E2E 部署模式不能互相替代。<code>dragonball_apf::</code>
+虽在相应平台/feature 下编译，却不属于默认四个 DB 功能套件；需要时显式选择。
+<code>services</code> 的聚合 test 只选择 gateway/scheduler，shared/API 的完整模块检查仍使用
+该目录下的 <code>go test ./...</code>。</p>
 <h2 id="回归范围建议"><a class="header" href="#回归范围建议">回归范围建议</a></h2>
 <div class="table-wrapper">
 <table>
@@ -322,8 +410,12 @@ root 编排权限的进程显式运行：</p>
 先在外部构建 harness，再进入隔离环境执行，避免在隔离网络内解析 Cargo 依赖。</p>
 <p>性能对照核对实际打开的资产 inode/标志、CPU/NUMA 和缓存条件，不能只比较配置
 文本。构建与采样分时；小样本用于定位，完整资格另行运行。失败记录、数据校验和
-清理检查始终保留；跨入口进度汇总与主机互斥仍待实现。</p>
+清理检查始终保留；跨入口进度汇总、构建与测试之间的统一互斥仍待实现。</p>
 <h2 id="性能候选的构建来源与共享预检"><a class="header" href="#性能候选的构建来源与共享预检">性能候选的构建来源与共享预检</a></h2>
+<p><code>make check-dragonball-revision</code> 是无需 Cargo/网络/KVM 的轻量检查（Python 3.11+）。
+它核对 runner manifest、Cargo.lock 的 Kata 来源、qualified reader、probe client
+和当前版本的 CLI/打包正例；历史拒绝用例保留旧 revision。DB 构建、准备及 VMM
+单元测试入口先执行此检查；Rust CI 的编译任务依赖对应检查任务。</p>
 <p>性能矩阵现在要求 <code>server_receipt</code> 和 <code>server_fc_receipt</code> 两个绝对路径，分别
 绑定 <code>server</code>（DB）与 <code>server_fc</code>（FC）。功能场景及开发回归使用各自的输入格式。
 旧性能二进制不能补签回执；通过下列入口重新构建并冻结，Cargo 可复用已有缓存。
@@ -349,8 +441,77 @@ python3 scripts/tests/dragonball_m4_build.py --source "$PWD" \
 开发记录仍不产生性能资格结论。</p>
 <p>该回执用于受控测试主机上的过期输入检查，不是签名或可复现构建证明：依赖缓存、
 外部工具及构建脚本的任意外部输入尚未逐项封存。构建期间仍须避免其他任务改写
-共享 Cargo 输出；跨入口主机锁、M4 续跑和构建缓存自动命中策略未在本次实现。
+共享 Cargo 输出；M4 续跑和构建缓存自动命中策略尚未实现。
 此入口仅为 server 生成回执，runner、daemon、guest 资产仍由既有 M4 输入摘要记录。</p>
+<p>性能 cell 在启动前及结束后重新校验两份构建回执，并核对 runner、daemon、guest
+内核/tools/rootfs lower、夹具、依赖及编排脚本的内容和权限。输入变化或丢失会使
+该 cell 失败；已有操作失败信息和清理结果保留，原始样本仍可诊断但不能作为有效
+对照。汇总比较还要求各 cell 的输入摘要与矩阵开始时一致，拒绝 cell 之间的输入变化。
+结果中的 <code>input_identity</code> 和 <code>inputs_verified</code> 记录这项检查。它用于发现
+意外输入变化，不是隔离其他进程写入或可复现构建的证明。</p>
+<p>自定义 guest tools 时，在 inputs 中显式设置 <code>tools_version</code>（省略仍为 <code>0.1.0</code>），
+与资产内 <code>/agentenv/tools-drive-version</code> 一致；两个后端共用这个版本和同一份
+<code>tools_path</code> 内容。比较 guest 补丁须分别冻结前后资产及编译输入，不能把某一后端
+升级后的 tools 与另一后端的旧 tools 比较。旧快照内的 envd 不随主机配置自动升级。</p>
+<p>M4 HTTP 响应按剩余请求预算逐段读取；流中的持续数据不能重置正文读取的总预算。
+性能比较应对齐 API 发起至相同 guest 命令确认准确身份的终点、端到端时限和失败
+计数；API 返回时间另列，不把后端各自的就绪功能契约当作相同的性能终点。
+通用性能入口的 cold/restore/fork/resume 已采用相同 sandbox/template 身份检查，
+每次 API 请求及后续探测共用一个 <code>request_timeout_seconds</code> 预算；并发请求各自
+传入剩余预算，不修改共享 node 配置。结果声明
+<code>readiness_contract=exact_sandbox_and_template_identity_v1</code>，相应操作名使用
+<code>*_api_to_identity_ready</code>。不能与旧 <code>*_api_to_envd_ready</code> 样本合并计算分位数。
+样本另存 <code>api_seconds</code>、<code>identity_seconds</code> 和 <code>identity_attempts</code>；API 成功后身份
+确认失败也保留分段及错误。fork 的所有子实例共用原请求截止时间。
+DB 新实例保持内部身份确认，同 ID resume 跳过重复探测；不能只比较 API 返回时间
+就声称两后端具有相同身份就绪保证。</p>
+<h3 id="可选阶段计时分析"><a class="header" href="#可选阶段计时分析">可选阶段计时分析</a></h3>
+<p>在性能输入中设置 <code>"phase_timing_versions": {"dragonball": "db-overlap-v1", "firecracker": "fc-v1"}</code>，可为 cold/restore/resume 保存 <code>phase-timings.json</code>。
+这会启用相关 debug 日志；诊断组两端均需启用，不能与未启用的样本直接合并。
+版本必须对应冻结实现：<code>db-serial-v1</code> 用于 runner 与磁盘串行准备的旧候选，
+<code>db-overlap-v1</code> 用于 <code>7e8bc3a</code> 后 runner 提前启动的候选；<code>fc-v1</code> 对应当前 FC
+阶段边界。标签由实验输入显式声明，工具不会从二进制自动推断其计时语义。</p>
+<p>采集器在每批请求前记录日志位置，在请求结束后按 sandbox ID 匹配该窗口中的
+计时；操作 ID 包含 run、repeat、操作名和请求序号。同 ID 多次 resume 不依赖
+全局日志顺序。保留日志区间和摘要；缺失、重复、日志截断/替换、后端矛盾及
+非单调边界都会使取证失败，已执行的请求耗时仍保留。fork/capture 暂无此阶段分析。</p>
+<pre><code class="language-bash">python3 scripts/tests/dragonball_m4_phases.py /path/to/phase-timings.json --output /path/to/phase-summary.json
+</code></pre>
+<p>分析器对照 <code>expected_operations</code> 检查完整性，输出微秒均值/中位数；同一后端的
+不同计时版本需分别分析。DB runner 重叠版本记录 spawn 加剩余等待，FC preparation
+total 已包含 release；使用明确总边界，不将准备子阶段相加。CLI 不替代完整 cell
+的输入冻结、操作成功和清理验收，也不产生生产 SLO 资格。</p>
+<p>可选实验观察通过 <code>run_cell(..., observe_batch=...)</code> 接入；采样准备与取证在 API
+计时外执行。取证失败保留已执行时间和原 guest 错误，另记 <code>proof_error</code>，该 cell
+不可作为有效性能对照。<code>dragonball_m4_observe.py</code> 提供主机接收时间的 guest 心跳
+间断、S3 夹具 TCP 9000 端口的 IP 字节计数和操作期间内存采样。心跳间断包含调度与
+网络因素，不是精确 VMM 暂停；链路计数包含协议头和重传，不是对象净载荷；采样
+内存峰值只是实际峰值的下界。具体实验需保留探针原始数据及这些观测边界。
+心跳链路必须先在真实 guest 中验证；默认出站策略拒绝私网目标，不能假定 guest
+可向 Lab 桥地址发包。本轮接收器绑定源 VMM 网络命名空间的 tap 网关，不更改产品
+防火墙；capture 后先停止源探针并关闭接收器，再执行 restore/fork，每次 capture
+使用新 token。恢复快照会包含探针进程，其开销仍属于恢复后观测的一部分。</p>
+<p><code>network_cache_slots</code> 可显式取 0/1，默认 1 兼容旧实验。<code>pool.network.enabled=false</code>
+只关闭后台维护，不能据此宣称回收的网络资源不会复用；0 才禁止该回收缓存。
+不同缓存策略的样本必须分别统计。</p>
+<h2 id="证据归档与取回"><a class="header" href="#证据归档与取回">证据归档与取回</a></h2>
+<p>先用现有 retention 入口归档并核验成功 cell；它仍独占 payload 回收职责。
+<code>dragonball_m4_evidence.py</code> 只打包明确列出的普通证据文件和当前结果摘要，不扫描或
+删除 VM 数据。<code>--files</code> 是相对 <code>--root</code> 的 JSON 路径列表，<code>--summary</code> 应由本轮
+已验证回执生成；工具保证摘要字节可追溯，不替调用方判断任务是否完成。</p>
+<pre><code class="language-bash">python3 scripts/tests/dragonball_m4_evidence.py pack --root /var/tmp/run \
+  --files /var/tmp/run-files.json --summary /var/tmp/completion.json --output /var/tmp/run-bundle
+python3 scripts/tests/dragonball_m4_evidence.py fetch --host root@TEST_HOST \
+  --remote /var/tmp/run-bundle --output /tmp/run-evidence
+# 需要原始日志时，再向同一输出目录取回完整包。
+python3 scripts/tests/dragonball_m4_evidence.py fetch --host root@TEST_HOST \
+  --remote /var/tmp/run-bundle --output /tmp/run-evidence --full
+</code></pre>
+<p>默认只取回 <code>receipt.json</code> 和已核验的 <code>summary.json</code>；完整包只有在整体摘要和
+所有成员摘要通过后，才从 <code>.partial</code> 改为正式文件。无自动解压；链接、重复或
+未知成员被拒绝，源普通硬链接保存为独立文件成员。SSH 使用既有认证，单次传输
+总超时为 600 秒。中断/损坏文件保留为 <code>.partial</code>，重试使用新目录；既有输出
+绑定原回执，不自动追踪远端新一轮结果。完整包和小摘要的校验状态分别报告。</p>
 
                     </main>
 
