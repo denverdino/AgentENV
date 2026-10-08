@@ -18,6 +18,7 @@ on:
       - "scripts/tests/verify-package-*.sh"
       - "scripts/tests/*dragonball_m4*.py"
       - "scripts/tests/dragonball_regression.py"
+      - "scripts/tests/dragonball_revision.py"
       - "scripts/tests/dragonball_m4_workload.c"
       - "scripts/release/**"
       - "config/**"
@@ -39,6 +40,7 @@ on:
       - "scripts/tests/verify-package-*.sh"
       - "scripts/tests/*dragonball_m4*.py"
       - "scripts/tests/dragonball_regression.py"
+      - "scripts/tests/dragonball_revision.py"
       - "scripts/tests/dragonball_m4_workload.c"
       - "scripts/release/**"
       - "config/**"
@@ -46,6 +48,18 @@ on:
       - ".github/workflows/ci.yml"
 
 jobs:
+  dragonball-revision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Check current Dragonball pins before compilation
+        run: |
+          make check-dragonball-revision
+          python3 -B -m unittest discover -s scripts/tests -p 'test_dragonball_m4_revision.py'
+
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -58,6 +72,7 @@ jobs:
         run: make fmt
 
   clippy:
+    needs: dragonball-revision
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -68,6 +83,7 @@ jobs:
         run: make clippy
 
   unit-tests:
+    needs: dragonball-revision
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,6 +94,7 @@ jobs:
         run: make test-unit PROFILE=debug
 
   hypervisor-components:
+    needs: dragonball-revision
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

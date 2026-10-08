@@ -212,6 +212,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "vmm-sys-util",
 ]
 
@@ -2225,7 +2227,7 @@ dependencies = [
 [[package]]
 name = "dbs-acpi"
 version = "0.1.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "vm-memory",
 ]
@@ -2233,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "dbs-address-space"
 version = "0.3.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "arc-swap",
  "lazy_static",
@@ -2247,7 +2249,7 @@ dependencies = [
 [[package]]
 name = "dbs-allocator"
 version = "0.1.1"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2255,7 +2257,7 @@ dependencies = [
 [[package]]
 name = "dbs-arch"
 version = "0.2.3"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls 0.24.0",
@@ -2269,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "dbs-boot"
 version = "0.4.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "dbs-arch",
  "kvm-bindings",
@@ -2284,7 +2286,7 @@ dependencies = [
 [[package]]
 name = "dbs-device"
 version = "0.2.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2292,7 +2294,7 @@ dependencies = [
 [[package]]
 name = "dbs-interrupt"
 version = "0.2.2"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "bilge",
  "dbs-arch",
@@ -2306,7 +2308,7 @@ dependencies = [
 [[package]]
 name = "dbs-legacy-devices"
 version = "0.1.1"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "dbs-device",
  "dbs-utils",
@@ -2320,7 +2322,7 @@ dependencies = [
 [[package]]
 name = "dbs-snapshot"
 version = "0.1.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "serde_json",
  "thiserror 2.0.18",
@@ -2329,7 +2331,7 @@ dependencies = [
 [[package]]
 name = "dbs-utils"
 version = "0.2.1"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "anyhow",
  "event-manager",
@@ -2344,7 +2346,7 @@ dependencies = [
 [[package]]
 name = "dbs-virtio-devices"
 version = "0.3.1"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "byteorder",
  "caps",
@@ -2612,7 +2614,7 @@ dependencies = [
 [[package]]
 name = "dragonball"
 version = "0.1.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4703,7 +4705,7 @@ dependencies = [
 [[package]]
 name = "kata-sys-util"
 version = "0.1.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -4727,7 +4729,7 @@ dependencies = [
 [[package]]
 name = "kata-types"
 version = "0.1.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7447,7 +7449,7 @@ dependencies = [
 [[package]]
 name = "runtime-spec"
 version = "0.1.0"
-source = "git+https://github.com/denverdino/kata-containers.git?rev=9b0d2852e4a9d4c66a391c32fccb93b65e937f8f#9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+source = "git+https://github.com/denverdino/kata-containers.git?rev=9e41795fea9109bc1acf7b1f6d6b878cfff7b72e#9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
 dependencies = [
  "serde",
  "serde_derive",

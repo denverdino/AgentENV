@@ -879,6 +879,7 @@ impl FirecrackerSandbox {
     /// This should be called after `start_nowait()` if you want to interact with the sandbox.
     #[tracing::instrument(skip(self))]
     pub(crate) async fn wait_for_ready(&self) -> Result<()> {
+        let started = std::time::Instant::now();
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
@@ -888,6 +889,7 @@ impl FirecrackerSandbox {
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
+        let envd_us = started.elapsed().as_micros() as u64;
         if let Some(tools) = &self.tools_ublk_device {
             let _ = UblkDeviceManager::global()
                 .notify_sandbox_ready(tools.image_config_path())
@@ -914,6 +916,7 @@ impl FirecrackerSandbox {
                 self.launch.common().default_user.clone(),
             )
             .await?;
+        let initialized_us = started.elapsed().as_micros() as u64;
 
         // The snapshot already carries mount state for its existing drives.
         // Only drives newly supplied for this launch need a guest-side mount.
@@ -925,6 +928,13 @@ impl FirecrackerSandbox {
             Self::mount_initial_guest_drives(envd, self.initial_guest_drive_mounts.clone()).await?;
         }
 
+        tracing::debug!(
+            target: "agentenv::sandbox::startup_timing",
+            backend = "firecracker", sandbox_id = %self.id,
+            envd_us, initialized_us,
+            ready_us = started.elapsed().as_micros() as u64,
+            "readiness cumulative timing"
+        );
         Ok(())
     }
 
@@ -1803,6 +1813,7 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_resume(&mut self, config: FirecrackerSnapshotConfig) -> Result<()> {
+        let started = std::time::Instant::now();
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
@@ -1869,6 +1880,7 @@ impl FirecrackerSandbox {
         );
 
         // ── Tools drive: symlink rootfs.ext4 → tools drive (read-only, from snapshot config) ──
+        let disks_started = std::time::Instant::now();
         self.link_tools_drive(&config.common, fc_cwd)?;
 
         // ── User image: restore overlaybd via ublk ──
@@ -1951,6 +1963,9 @@ impl FirecrackerSandbox {
         }
 
         // ── Network + Firecracker spawn ──
+        let disks_us = disks_started.elapsed().as_micros() as u64;
+        let network_started = std::time::Instant::now();
+        let mut spawn_us = 0;
         let needs_socket_wait = self.network_slot.is_none();
         let interaction_ip = if let Some(slot) = self.network_slot.as_ref() {
             slot.host_interaction_ip
@@ -1966,6 +1981,7 @@ impl FirecrackerSandbox {
             let firecracker_binary = config.common.firecracker_binary.clone();
             let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
 
+            let spawn_started = std::time::Instant::now();
             self.fc_instance
                 .spawn_with_netns(
                     &firecracker_binary,
@@ -1974,6 +1990,7 @@ impl FirecrackerSandbox {
                     Some(&netns),
                 )
                 .await?;
+            spawn_us = spawn_started.elapsed().as_micros() as u64;
 
             interaction_ip
         };
@@ -1981,6 +1998,7 @@ impl FirecrackerSandbox {
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
+        let network_us = network_started.elapsed().as_micros() as u64 - spawn_us;
 
         // ── Custom extension hook: start-resume ──
         // Pack-recording VMs are throwaway recorders: hooks must not fire
@@ -2012,6 +2030,7 @@ impl FirecrackerSandbox {
             config.common.envd_access_token.clone(),
         ));
 
+        let memory_started = std::time::Instant::now();
         let mem_global_config = global_config
             .memory_snapshot
             .overlaybd_global_config_path
@@ -2117,6 +2136,8 @@ impl FirecrackerSandbox {
             device_path
         };
 
+        let memory_us = memory_started.elapsed().as_micros() as u64;
+        let runner_started = std::time::Instant::now();
         if needs_socket_wait {
             self.fc_instance
                 .wait_for_ready(
@@ -2127,9 +2148,11 @@ impl FirecrackerSandbox {
         }
 
         self.configure_logger(&config.common).await?;
+        let runner_us = spawn_us + runner_started.elapsed().as_micros() as u64;
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
+        let load_started = std::time::Instant::now();
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -2139,6 +2162,8 @@ impl FirecrackerSandbox {
                 config.common.track_dirty_pages,
             )
             .await?;
+        let load_us = load_started.elapsed().as_micros() as u64;
+        let post_load_started = std::time::Instant::now();
 
         // A volume absent from the source state was loaded as a placeholder.
         // Replace and PATCH it once so Firecracker reopens the path and reports
@@ -2177,7 +2202,17 @@ impl FirecrackerSandbox {
             .await
             .context("reconcile disk rate limiter on snapshot resume")?;
 
+        let post_load_us = post_load_started.elapsed().as_micros() as u64;
+        let release_started = std::time::Instant::now();
         self.fc_instance.resume().await?;
+        tracing::debug!(
+            target: "agentenv::sandbox::startup_timing",
+            backend = "firecracker", sandbox_id = %self.id,
+            network_us, disks_us, runner_us, memory_us, load_us, post_load_us,
+            release_us = release_started.elapsed().as_micros() as u64,
+            total_us = started.elapsed().as_micros() as u64,
+            "restore preparation phase timing"
+        );
 
         debug!("sandbox restored from snapshot config");
         Ok(())

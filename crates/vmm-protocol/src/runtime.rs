@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const QUALIFIED_DRAGONBALL_REVISION: &str = "9b0d2852e4a9d4c66a391c32fccb93b65e937f8f";
+pub const QUALIFIED_DRAGONBALL_REVISION: &str = "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e";
 pub const RUNTIME_FEATURE_PROFILE: &str = "db-virtio-blk-net-balloon-v2";
 // Kata's internal serializer epoch is independent of the AgentENV envelope ABI.
 pub const UPSTREAM_SNAPSHOT_FORMAT_EPOCH: u16 = 1;

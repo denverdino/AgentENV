@@ -40,6 +40,23 @@ pub(crate) struct EnvdInstance {
 }
 
 impl EnvdInstance {
+    /// Read the same defaults map that envd uses when spawning a process.
+    /// `/init` starts asynchronous metadata refresh, so its response alone does
+    /// not establish the identity inherited by the next guest command.
+    #[cfg(feature = "hypervisor-dragonball")]
+    pub(crate) async fn guest_identity_matches(
+        &self,
+        sandbox_id: &str,
+        template_id: &str,
+    ) -> Result<bool> {
+        self.ensure_live()?;
+        let vars = default_api::envs_get(&self.config).await?;
+        Ok(
+            vars.get("E2B_SANDBOX_ID").map(String::as_str) == Some(sandbox_id)
+                && vars.get("E2B_TEMPLATE_ID").map(String::as_str) == Some(template_id),
+        )
+    }
+
     pub(crate) async fn metrics(&self) -> Result<super::SandboxMetric> {
         self.ensure_live()?;
         let raw = default_api::metrics_get(&self.config).await?;
@@ -124,6 +141,7 @@ impl EnvdInstance {
             "waiting for envd"
         );
         let start = std::time::Instant::now();
+        let mut attempt = 0usize;
 
         loop {
             let elapsed = start.elapsed();
@@ -133,16 +151,21 @@ impl EnvdInstance {
 
             let remaining = timeout - elapsed;
             let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
+            attempt += 1;
+            let probe_started = std::time::Instant::now();
+            trace!(attempt, "envd health probe started");
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
-                    debug!(base_path = %self.config.base_path, "envd started successfully");
+                    debug!(base_path = %self.config.base_path, attempt, probe_us = probe_started.elapsed().as_micros() as u64, total_us = start.elapsed().as_micros() as u64, "envd started successfully");
                     return Ok(());
                 }
                 Ok(Err(error)) => {
-                    trace!(%error, "envd health probe failed");
+                    trace!(%error, attempt, probe_us = probe_started.elapsed().as_micros() as u64, "envd health probe failed");
                 }
                 Err(_) => {
                     trace!(
+                        attempt,
+                        probe_us = probe_started.elapsed().as_micros() as u64,
                         timeout_ms = probe_timeout.as_millis(),
                         "envd health probe timed out"
                     );
@@ -351,5 +374,98 @@ mod tests {
 
         assert!(stale.process_client().await.is_err());
         assert!(stale.filesystem_client().await.is_err());
+    }
+
+    #[cfg(feature = "hypervisor-dragonball")]
+    #[tokio::test]
+    async fn guest_identity_requires_both_exact_fields_and_uses_runtime_auth() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("identity-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let expected_token = token.clone();
+        let responses = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            serde_json::json!({"E2B_SANDBOX_ID": "old", "E2B_TEMPLATE_ID": "template"}),
+            serde_json::json!({"E2B_SANDBOX_ID": "new"}),
+            serde_json::json!({"E2B_SANDBOX_ID": "new", "E2B_TEMPLATE_ID": "other"}),
+            serde_json::json!({"E2B_SANDBOX_ID": "new\n", "E2B_TEMPLATE_ID": "template"}),
+            serde_json::json!({"E2B_SANDBOX_ID": "new", "E2B_TEMPLATE_ID": "template"}),
+        ])));
+        let queue = responses.clone();
+        let app = Router::new().route(
+            "/envs",
+            get(move |headers: HeaderMap| {
+                assert_eq!(headers["x-access-token"], expected_token.expose());
+                let body = queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected request");
+                async move { Json(body) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token));
+        for _ in 0..4 {
+            assert!(!envd.guest_identity_matches("new", "template").await?);
+        }
+        assert!(envd.guest_identity_matches("new", "template").await?);
+        envd.invalidate();
+        assert!(envd
+            .guest_identity_matches("new", "template")
+            .await
+            .is_err());
+        assert!(responses.lock().unwrap().is_empty());
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "hypervisor-dragonball")]
+    #[tokio::test]
+    async fn guest_identity_does_not_accept_http_or_decode_errors() -> Result<()> {
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, "{}"),
+            (StatusCode::OK, "not-json"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let app = Router::new().route(
+                "/envs",
+                get(move || async move { (status, [("content-type", "application/json")], body) }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let envd = EnvdInstance::new(format!("http://{address}"), None);
+            assert!(envd
+                .guest_identity_matches("new", "template")
+                .await
+                .is_err());
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "hypervisor-dragonball")]
+    #[tokio::test]
+    async fn guest_identity_request_is_bounded_by_the_callers_deadline() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            sender.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let envd = EnvdInstance::new(format!("http://{address}"), None);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            envd.guest_identity_matches("new", "template"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        receiver.await?;
+        server.abort();
+        Ok(())
     }
 }

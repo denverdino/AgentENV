@@ -13,6 +13,8 @@ anyhow = "1"
 agentenv-vmm-protocol = { path = "../vmm-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [build-dependencies]
 sha2 = "0.10"
@@ -25,4 +27,4 @@ libc = "0.2"
 crossbeam-channel = "0.5"
 seccompiler = "0.5"
 vmm-sys-util = "0.15"
-dragonball = { git = "https://github.com/denverdino/kata-containers.git", rev = "9b0d2852e4a9d4c66a391c32fccb93b65e937f8f", default-features = false, features = ["virtio-blk", "virtio-net", "virtio-balloon"] }
+dragonball = { git = "https://github.com/denverdino/kata-containers.git", rev = "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e", default-features = false, features = ["virtio-blk", "virtio-net", "virtio-balloon"] }

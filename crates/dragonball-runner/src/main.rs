@@ -5,6 +5,24 @@ fn main() {
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn reserve_fd_table() -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // The common block/net/balloon profile exceeds Linux's initial 64 slots.
+    // Expand while single-threaded: expansion after CLONE_FILES can wait for
+    // an RCU grace period in a device's otherwise cheap eventfd allocation.
+    // This is a capacity hint, not an FD limit or a permanently held FD.
+    let source = std::fs::File::open("/dev/null")?;
+    let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 127) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new descriptor owned exclusively by this call.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    Ok(())
+}
+
 fn run() -> anyhow::Result<()> {
     let mut args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--version-json" {
@@ -95,6 +113,17 @@ fn run() -> anyhow::Result<()> {
         } else {
             String::new()
         };
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("initialize runner diagnostics: {error}"))?;
+        if let Err(error) = reserve_fd_table() {
+            // A low RLIMIT_NOFILE must not make this optimization a new
+            // startup requirement; ordinary allocation retains its behavior.
+            tracing::debug!(%error, "runner FD table reservation unavailable");
+        }
         agentenv_dragonball_runner::seccomp::install_m0_filter()?;
         let vmm = DragonballVmm::new(&instance_id, &work_dir)?;
         if runtime {

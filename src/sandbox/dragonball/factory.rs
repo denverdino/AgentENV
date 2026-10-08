@@ -154,7 +154,11 @@ impl DragonballSandboxFactory {
             }),
             control_port: self.policy.app.tools.control_plane_port,
         };
-        self.build_paused(launch.sandbox_id, &state, launch.envd_access_token)
+        let mut sandbox = self.build_paused(launch.sandbox_id, &state, launch.envd_access_token)?;
+        // The synthetic paused state carries the new launch, but guest memory
+        // still contains the captured instance's identity.
+        sandbox.require_guest_identity = true;
+        Ok(sandbox)
     }
     pub fn new(policy: DragonballRuntimePolicy) -> Result<Self> {
         // This query creates no VM, network namespace, or managed device lease.
@@ -268,6 +272,7 @@ impl DragonballSandboxFactory {
         launch.envd_access_token = token;
         let mut sandbox = DragonballSandbox::new(factory, saved.artifacts.spec.clone(), launch)?;
         sandbox.restore = Some(Arc::new(saved.clone()));
+        sandbox.require_guest_identity = false;
         Ok(sandbox)
     }
 

@@ -8,11 +8,67 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
+import selectors
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
+
+from dragonball_m4_host import acquire_host_lock, require_clean_host
+from dragonball_m4_recovery import record_lab
+from dragonball_test_resources import RunRecord, owned_directory
+
+
+_NODE_READY_TIMEOUT = 15
+
+
+def _wait_node_ready(process, fd, deadline):
+    """Read one bounded JSON line; unshare may retain the writer until exit."""
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate field")
+            result[key] = value
+        return result
+
+    data = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while b"\n" not in data:
+            if process.poll() is not None:
+                raise RuntimeError(f"node readiness: init exited ({process.returncode})")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("node namespace readiness")
+            if not selector.select(min(remaining, 0.05)):
+                continue
+            chunk = os.read(fd, 4097 - len(data))
+            if not chunk:
+                raise RuntimeError("node readiness: pipe closed before complete message")
+            data.extend(chunk)
+            if len(data) > 4096:
+                raise RuntimeError("node readiness: oversized message")
+    try:
+        message = json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise RuntimeError("node readiness: malformed JSON") from error
+    if (not isinstance(message, dict) or set(message) != {"pid", "namespaces"}
+            or type(message["pid"]) is not int or message["pid"] != 1):
+        raise RuntimeError("node readiness: expected namespace init PID 1")
+    namespaces = message["namespaces"]
+    if not isinstance(namespaces, dict) or set(namespaces) != {"net", "mnt", "pid"}:
+        raise RuntimeError("node readiness: invalid namespaces")
+    for name, value in namespaces.items():
+        if not isinstance(value, str) or not re.fullmatch(name + r":\[[1-9][0-9]*\]", value):
+            raise RuntimeError("node readiness: invalid namespace identity")
+    if process.poll() is not None:
+        raise RuntimeError(f"node readiness: init exited ({process.returncode})")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("node namespace readiness")
+    return message
 
 
 def command(argv, **kwargs):
@@ -60,7 +116,7 @@ def delete_link(name):
 
 
 class Lab:
-    def __init__(self, root: Path, run_user: str):
+    def __init__(self, root: Path, run_user: str, preflight_profile=None):
         parent = os.environ.get("AENV_M4_PARENT_NET")
         if not parent or not Path("/proc/self/ns/net").exists() or parent == os.readlink("/proc/self/ns/net"):
             raise RuntimeError("lab requires a private network namespace")
@@ -81,8 +137,33 @@ class Lab:
         controllers = (base / "cgroup.subtree_control").read_text()
         require_controllers(controllers)
         self.cgroup = base / self.root.name
-        self.cgroup.mkdir()
+        self.host_lock = acquire_host_lock()
         try:
+            require_clean_host()
+            from dragonball_m4_preflight import check
+            profile = preflight_profile
+            if profile is None:
+                profile = {'disk_path': str(self.root), 'reserve_bytes': 20 * 1024**3,
+                           'planned_bytes': 0, 'retained_bytes': 0,
+                           'socket_paths': [str(self.root / name / 'run/db-runtime-XXXXXX/runner.sock')
+                                            for name in ('a', 'b')]}
+            if isinstance(profile, dict):
+                if profile.get('run_user', run_user) != run_user or profile.get('mode', 'm4') != 'm4':
+                    raise RuntimeError('M4 preflight account or mode differs from Lab')
+                profile = dict(profile, run_user=run_user)
+            report = check(profile)
+            if not report['ok']:
+                raise RuntimeError('M4 preflight refused: ' + '; '.join(report['errors']))
+            self.resources = RunRecord(self.root, 'm4-lab', owned=[self.root])
+            self.cgroup.mkdir()
+        except BaseException:
+            os.close(self.host_lock)
+            raise
+        try:
+            self.resources.record['resources'].append(owned_directory(self.cgroup))
+            self.resources.__enter__()
+            (self.root / 'preflight.json').write_text(json.dumps(report, indent=2) + '\n')
+            record_lab(self)
             (self.cgroup / "cgroup.subtree_control").write_text(
                 "+cpu +memory +pids" + (" +io" if "io" in controllers.split() else ""))
             self.root.chmod(0o755)
@@ -96,13 +177,16 @@ class Lab:
             command(["ip", "addr", "add", "10.241.0.1/24", "dev", "m4br"])
             command(["ip", "link", "set", "m4br", "up"])
         except BaseException:
+            self.resources.record['exit_code'] = 1
             self.close()
             raise
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, kind, *_):
+        if kind is not None:
+            self.resources.record['exit_code'] = 1
         self.close()
 
     def start_node(self, name):
@@ -111,6 +195,7 @@ class Lab:
         node = Node(self, name)
         self.nodes.append(node)
         node.start()
+        record_lab(self)
         return node
 
     def close(self):
@@ -133,8 +218,15 @@ class Lab:
             except Exception as error:
                 errors.append(str(error))
         if errors:
+            self.resources.record['cleanup'] = {'errors': errors}
+            self.resources.__exit__(RuntimeError, None, None)
             raise RuntimeError("lab cleanup: " + "; ".join(errors))
         self.closed = True
+        self.resources.record['cleanup'] = 'owned cgroup, nodes and bridge removed; state retained'
+        try:
+            self.resources.__exit__(None, None, None)
+        finally:
+            os.close(self.host_lock)
 
 
 class Node:
@@ -157,23 +249,41 @@ class Node:
         for key, value in {"memory.max": str(12 * 1024**3), "memory.swap.max": "0",
                            "cpu.max": "400000 100000", "pids.max": "2048"}.items():
             (self.cgroup / key).write_text(value)
-        with (self.lab.root / (self.name + ".init.log")).open("w") as log:
-            self.init = subprocess.Popen([
-                "unshare", "--mount", "--net", "--pid", "--fork", "--kill-child=KILL",
-                "--mount-proc", "--propagation", "private", sys.executable,
-                str(Path(__file__).resolve()), "--node-init", str(self.lab.root), self.name,
-            ], stdout=log, stderr=subprocess.STDOUT, preexec_fn=self._join_cgroup)
-        deadline = time.monotonic() + 15
-        while not (self.root / "ready").exists():
-            if self.init.poll() is not None:
-                raise RuntimeError((self.lab.root / (self.name + ".init.log")).read_text())
-            if time.monotonic() > deadline:
-                raise TimeoutError("node namespace readiness")
-            time.sleep(0.05)
+        deadline = time.monotonic() + _NODE_READY_TIMEOUT
+        read_fd, write_fd = os.pipe()
+        try:
+            try:
+                with (self.lab.root / (self.name + ".init.log")).open("w") as log:
+                    self.init = subprocess.Popen([
+                        "unshare", "--mount", "--net", "--pid", "--fork", "--kill-child=KILL",
+                        "--mount-proc", "--propagation", "private", sys.executable,
+                        str(Path(__file__).resolve()), "--node-init", str(self.lab.root), self.name,
+                        str(write_fd),
+                    ], stdout=log, stderr=subprocess.STDOUT, preexec_fn=self._join_cgroup,
+                        pass_fds=(write_fd,))
+            finally:
+                os.close(write_fd)
+            message = _wait_node_ready(self.init, read_fd, deadline)
+        finally:
+            os.close(read_fd)
         children = Path(f"/proc/{self.init.pid}/task/{self.init.pid}/children").read_text().split()
-        if len(children) != 1:
-            raise RuntimeError("expected one namespace init")
-        self.pid = int(children[0])
+        if len(children) != 1 or not re.fullmatch(r"[1-9][0-9]*", children[0]):
+            raise RuntimeError("node readiness: expected one namespace init")
+        pid = int(children[0])
+        status = Path(f"/proc/{pid}/status").read_text().splitlines()
+        namespace_pids = [line.split()[1:] for line in status if line.startswith("NSpid:")]
+        if (pid <= 1 or len(namespace_pids) != 1 or len(namespace_pids[0]) < 2
+                or namespace_pids[0][0] != str(pid) or namespace_pids[0][-1] != "1"):
+            raise RuntimeError("node readiness: namespace init PID mismatch")
+        for name, identity in message["namespaces"].items():
+            if (os.readlink(f"/proc/{pid}/ns/{name}") != identity
+                    or os.readlink(f"/proc/self/ns/{name}") == identity):
+                raise RuntimeError("node readiness: namespace identity mismatch")
+        if self.init.poll() is not None:
+            raise RuntimeError("node readiness: init exited during validation")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("node namespace readiness")
+        self.pid = pid
         command(["ip", "link", "add", self.host_link, "type", "veth", "peer", "name", "m4peer"])
         self.link_created = True
         command(["ip", "link", "set", "m4peer", "netns", str(self.pid)])
@@ -234,7 +344,9 @@ class Node:
             delete_link(self.host_link)
 
 
-def node_init(root, name):
+def node_init(root, name, ready_fd):
+    # Mount/network helpers must not inherit the readiness writer.
+    os.set_inheritable(ready_fd, False)
     temporary = root / name / "tmp"
     temporary.mkdir(mode=0o1777)
     temporary.chmod(0o1777)
@@ -245,8 +357,13 @@ def node_init(root, name):
     command(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", "/sys"])
     command(["ip", "link", "set", "lo", "up"])
     Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
-    (root / name / "ready").write_text(json.dumps({n: os.readlink("/proc/self/ns/" + n)
-                                                for n in ("net", "mnt", "pid")}))
+    namespaces = {n: os.readlink("/proc/self/ns/" + n) for n in ("net", "mnt", "pid")}
+    ready = root / name / "ready"
+    temporary_ready = ready.with_name(".ready.tmp")
+    temporary_ready.write_text(json.dumps(namespaces))
+    temporary_ready.replace(ready)
+    with os.fdopen(ready_fd, "w") as pipe:
+        pipe.write(json.dumps({"pid": os.getpid(), "namespaces": namespaces}) + "\n")
     while True:
         try:
             os.waitpid(-1, 0)
@@ -255,8 +372,8 @@ def node_init(root, name):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--node-init":
-        node_init(Path(sys.argv[2]), sys.argv[3])
+    if len(sys.argv) == 5 and sys.argv[1] == "--node-init":
+        node_init(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]))
     elif sys.argv[1:] == ["--self-test"]:
         raise SystemExit(subprocess.call([sys.executable, str(Path(__file__).with_name("test_dragonball_m4_lab.py")), "--linux"]))
     else:

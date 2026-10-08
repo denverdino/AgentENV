@@ -4,8 +4,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ ${1:-} != --inside ]]; then
     export AENV_DRAGONBALL_M0_PARENT_NETNS="$(readlink /proc/self/ns/net)"
-    exec "$repo_root/scripts/run-with-capabilities.sh" \
-        unshare --net --mount --propagation private bash "$0" --inside "$@"
+    export AENV_RUN_USER="${AENV_RUN_USER:-$(id -un)}"
+    # sudo closes arbitrary descriptors. Acquire after that boundary and before
+    # the capability wrapper creates state or unshare changes namespaces.
+    exec sudo -E python3 "$repo_root/scripts/tests/dragonball_m4_host.py" \
+        bash "$repo_root/scripts/run-with-capabilities.sh" unshare --net --mount --propagation private bash "$0" --inside "$@"
 fi
 shift
 [[ "$(readlink /proc/self/ns/net)" != "$AENV_DRAGONBALL_M0_PARENT_NETNS" ]]

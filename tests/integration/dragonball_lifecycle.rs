@@ -3044,6 +3044,68 @@ fn runtime_work_is_released(path: &Path) -> Result<bool> {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable namespace; disk failure after runner spawn must release ownership"]
+async fn dragonball_lifecycle_disk_failure_reaps_early_runner() -> Result<()> {
+    let (mut app, assets) = fixture().await?;
+    let isolated = tempfile::tempdir()?;
+    app.runtime_path = isolated.path().join("runtime");
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut build = spec(&assets)?;
+    build.image_config_path = isolated.path().join("invalid-root-image.json");
+    std::fs::write(&build.image_config_path, b"invalid image config")?;
+    let mut sandbox = factory.build_fresh(build, launch(&assets)?)?;
+    let error = sandbox
+        .start()
+        .await
+        .err()
+        .context("invalid disk was accepted")?;
+    assert!(
+        format!("{error:#}").contains("invalid-root-image.json"),
+        "{error:#}"
+    );
+    assert!(sandbox.executor().is_err());
+    sandbox.stop().await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runtime_work_is_released(&app.runtime_path)? {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    let evidence = app.runtime_path.join("dragonball-evidence/failures-v1");
+    let archives = std::fs::read_dir(evidence)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(archives.len(), 1);
+    assert!(
+        archives[0].join("runner-error.log").is_file(),
+        "runner must start before disk preparation"
+    );
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Ok(command) = std::fs::read(entry.path().join("cmdline")) {
+            assert!(
+                !command
+                    .windows(app.runtime_path.as_os_str().len())
+                    .any(|part| {
+                        use std::os::unix::ffi::OsStrExt;
+                        part == app.runtime_path.as_os_str().as_bytes()
+                    }),
+                "failed startup retained a runner: {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires disposable namespace; proves metadata failure rolls back allocations"]
 async fn dragonball_lifecycle_metadata_failure_rolls_back() -> Result<()> {
     let (app, assets) = fixture().await?;
@@ -3194,6 +3256,114 @@ async fn dragonball_lifecycle_cancel_during_startup_keeps_owner_until_reap() -> 
     })
     .await??;
     sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real snapshot and fork must confirm identity without a tools shell"]
+async fn dragonball_lifecycle_new_identity_requires_guest_confirmation() -> Result<()> {
+    let (app, assets) = fixture().await?;
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut build = spec(&assets)?;
+    build.context.user = Some("root".into());
+    let initial = launch(&assets)?;
+    let id = initial.sandbox_id;
+    let mut source = factory.build_fresh(build.clone(), initial)?;
+    source.start().await?;
+    let setup = source.run_command("/bin/sh", &["-ec",
+        "printf '#!/bin/sh\\nexit 97\\n' >/var/tmp/no-identity-shell; chmod 755 /var/tmp/no-identity-shell; mount --bind /var/tmp/no-identity-shell /agentenv/bin/busybox"
+    ]).await?;
+    assert_eq!(setup.exit_code, 0, "{}", setup.stderr);
+    let fork = fork_spec()?;
+    let fork_id = fork.sandbox_id;
+    let fork_token = fork.envd_access_token.clone();
+    let mut children = source.fork(&[fork]).await?;
+    let mut forked = children.remove(0)?;
+    assert_ne!(fork_id, id);
+    let fork_output = fork_command(
+        forked.as_ref(),
+        fork_token.as_ref(),
+        "printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\"",
+    )
+    .await;
+    forked.stop().await?;
+    let fork_output = fork_output?;
+    assert_eq!(fork_output.exit_code, 0, "{}", fork_output.stderr);
+    assert_eq!(
+        fork_output.stdout,
+        format!("{fork_id}\ndragonball-m1-existing-guest")
+    );
+    let captured = source.snapshot().await?;
+    let metadata = publish_metadata(id, &build, &assets, &captured)?;
+    let root = tempfile::tempdir()?;
+    let manager = posix_manager(root.path())?;
+    let record = manager.publish_captured(metadata, captured).await?;
+    source.stop().await?;
+    let runnable = manager
+        .load_runnable(record.id.to_string())
+        .await?
+        .context("snapshot")?;
+    let mut next = launch(&assets)?;
+    next.snapshot_id = record.id.to_string();
+    let child_id = next.sandbox_id;
+    assert_ne!(child_id, id);
+    let template_id = next.snapshot_id.clone();
+    let child_token = next.envd_access_token.clone();
+    let mut child = factory.build_from_snapshot(&runnable, next)?;
+    child.start().await?;
+    let output = fork_command(
+        child.as_ref(),
+        child_token.as_ref(),
+        "printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\"",
+    )
+    .await;
+    child.stop().await?;
+    let output = output?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, format!("{child_id}\n{template_id}"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Linux KVM/ublk/assets and disposable network/mount namespace"]
+async fn dragonball_lifecycle_same_id_resume_does_not_require_identity_shell() -> Result<()> {
+    let (app, assets) = fixture().await?;
+    let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
+        &app,
+        asset(&assets, "runner_path")?,
+        asset(&assets, "kernel_path")?,
+    )?)?;
+    let mut build = spec(&assets)?;
+    build.context.user = Some("root".into());
+    let launch = launch(&assets)?;
+    let (id, token) = (launch.sandbox_id, launch.envd_access_token.clone());
+    let mut source = factory.build_fresh(build, launch)?;
+    source.start().await?;
+    // Health and /init remain available. Only the optional tools shell is
+    // unavailable; restoring an application must not depend on executing it.
+    let setup = source.run_command("/bin/sh", &["-ec",
+        "printf '#!/bin/sh\\nexit 97\\n' >/var/tmp/no-identity-shell; chmod 755 /var/tmp/no-identity-shell; mount --bind /var/tmp/no-identity-shell /agentenv/bin/busybox"
+    ]).await?;
+    assert_eq!(setup.exit_code, 0, "{}", setup.stderr);
+    let paused = source.pause(None).await?;
+    source.stop().await?;
+    let mut restored = factory.build_paused(id, paused.as_ref(), token)?;
+    let result = restored.start().await;
+    if let Err(error) = result {
+        restored.stop().await?;
+        anyhow::bail!("health/init readiness depended on an identity shell: {error:#}");
+    }
+    let output = restored
+        .run_command("/bin/sh", &["-ec", "printf application-resumed"])
+        .await;
+    restored.stop().await?;
+    let output = output?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "application-resumed");
     Ok(())
 }
 

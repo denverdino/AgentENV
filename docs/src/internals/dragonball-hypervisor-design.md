@@ -34,10 +34,17 @@ guest 继续使用 envd。SnapshotManager、卷管理、模板和控制面保持
 当前 sandbox/template 身份。
 
 恢复先处于 LoadedHeld，完成身份、设备和限速绑定后再运行 guest。readiness
-初始化最终 USER/WORKDIR/环境变量，内部挂盘和身份探测明确使用 root 与 `/`。
-准确身份确认和 runner 安全检查完成后才发布 ready，不能用 socket 存在或 envd
-health 成功代替该屏障。生命周期实现见
-[sandbox.rs](../../../src/sandbox/dragonball/sandbox.rs)。
+等待 envd health 和 `/init`，初始化最终 USER/WORKDIR/环境变量；内部挂盘明确
+使用 root 与 `/`，并保留 runner 安全检查。
+
+新建 sandbox、快照/模板创建、fork 和启动预取记录器会产生新身份，必须确认 guest
+已读取当前 sandbox/template 身份后才发布 ready。身份确认使用带 runtime token 的
+envd `/envs`，精确核对两个字段；该接口与新命令读取同一份默认环境，避免为校验
+额外启动 shell。`/init` 的异步 metadata 刷新仍须等到字段匹配，保留原有截止时间。
+同 ID 的 pause/resume（包括服务重启后恢复原暂停实例）跳过内部身份轮询；它仍保留健康检查、初始化和
+必要挂盘。原地释放暂停的运行时沿用已有身份。
+性能评测分别记录 API 返回耗时和准确身份就绪耗时，两后端使用相同的外部身份检查。
+生命周期实现见 [sandbox.rs](../../../src/sandbox/dragonball/sandbox.rs)。
 
 ## 捕获、内存与存储
 

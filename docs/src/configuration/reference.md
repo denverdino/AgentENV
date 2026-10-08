@@ -487,11 +487,17 @@ looked up by consumers.
 ## `[snapshot.memory_startup_pack]`
 
 Optional startup-memory trace recording and best-effort prefetch for both
-`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
-waits for recording: a completed trace is encoded as a SHA-256-verified
-manifest and attached to the already committed snapshot. Snapshots without a
+`oss` and `posix_fs` repositories. It is disabled by default. Snapshot publication
+does not await recording or manifest publication: a completed trace is encoded as
+a SHA-256-verified manifest and attached to the already committed snapshot. Snapshots without a
 descriptor, with a missing/corrupt manifest, or with a failed prefetch always
 resume through the ordinary on-demand path.
+
+This applies to launching a new sandbox from a published template or checkpoint.
+Normal same-ID pause/resume does not record a startup manifest or inherit the
+template's manifest: pause captures a fresh state with no startup-prefetch
+descriptor. Startup access patterns must not be assumed to represent the
+workload at a later pause point.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -501,8 +507,26 @@ resume through the ordinary on-demand path.
 | `record_max_window_ms` | integer | `2000` | Hard recorder observation-window cap. |
 | `record_budget_secs` | integer | `10` | Best-effort recording budget; it never blocks the snapshot publish. |
 | `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and POSIX logical prefetch budget. |
-| `consume_enabled` | boolean | `false` | Enable resume-time prefetch; leave disabled for rollout and A/B comparisons. |
+| `consume_enabled` | boolean | `false` | Enable prefetch when launching from a template/checkpoint with a startup manifest; normal same-ID pause/resume is excluded. |
 | `consume_timeout_secs` | integer | `30` | Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it. |
+
+Recording and consumption are independent. A snapshot-producing node can use
+`enabled = true, consume_enabled = false`; a restore node can use
+`enabled = false, consume_enabled = true`. Set both to `true` when one node serves
+both roles. Recording starts a temporary VM and consumes CPU, memory and I/O;
+prefetch can bring reads forward or fetch pages the foreground does not need.
+Keep these costs in the workload's resource budget.
+
+A snapshot API response does not mean its startup manifest has been published.
+Immediate restores can therefore use the ordinary demand-read path even with
+consumption enabled. Enabling consumption also does not generate manifests for
+old snapshots. In an A/B test, verify the descriptor is present before either
+variant, use separate producer and consumer OverlayBD caches, and hold the
+recording setting constant. Otherwise the recorder's cache warming can obscure the effect
+of consumption. Shared host and object-store caches still affect the result.
+Check actual prefetch reads as well as task completion logs.
+See the [hypervisor validation results](../internals/hypervisor-validation.md)
+for the measured workload and its limits.
 
 For POSIX, the resolver hands the normal sandbox start path a `LocalPath`
 manifest. After acquiring the actual shared memory ublk device, the executor

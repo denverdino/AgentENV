@@ -18,6 +18,178 @@ def implementation():
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_api_and_identity_stages_reconcile_with_total(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        m = implementation()
+        guest = {"sandboxID": "current", "templateID": "template"}
+        clock = [10.0]
+        def create(_):
+            clock[0] += 3
+            return guest
+        def command(*args, **kwargs):
+            clock[0] += 2
+            return {"stdout": "current\ntemplate"}
+        with patch.object(m.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(m, "guest_command", side_effect=command):
+            rows = m.parallel_actions(1, create, identity_node=SimpleNamespace(request_timeout_seconds=180))
+        self.assertEqual(rows[0]["value"], guest)
+        self.assertEqual(rows[0]["api_seconds"], 3)
+        self.assertEqual(rows[0]["identity_seconds"], 2)
+        self.assertEqual(rows[0]["seconds"], 5)
+        self.assertEqual(rows[0]["identity_attempts"], 1)
+
+    def test_failed_identity_keeps_successful_api_stage(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        m = implementation()
+        clock = [10.0]
+        def create(_):
+            clock[0] += 3
+            return {"sandboxID": "current", "templateID": "template"}
+        def command(*args, **kwargs):
+            clock[0] += 2
+            raise RuntimeError("guest stream failed")
+        with patch.object(m.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(m, "guest_command", side_effect=command):
+            row = m.parallel_actions(1, create, identity_node=SimpleNamespace(request_timeout_seconds=180))[0]
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["api_seconds"], 3)
+        self.assertEqual(row["identity_seconds"], 2)
+        self.assertEqual(row["seconds"], 5)
+        self.assertEqual(row["identity_attempts"], 1)
+        self.assertIn("guest stream failed", row["error"])
+
+    def test_post_action_collection_failure_preserves_attempted_measurements(self):
+        m = implementation()
+        rows = [{"ok": True, "seconds": .2, "value": "created"},
+                {"ok": False, "seconds": .3, "error": "guest failed"}]
+        def fail():
+            raise RuntimeError("metrics disappeared")
+        proof = m.collect_after_action(rows, fail)
+        self.assertEqual(proof, {})
+        self.assertEqual([r["seconds"] for r in rows], [.2, .3])
+        self.assertEqual([r["guest_action_ok"] for r in rows], [True, False])
+        self.assertTrue(all(not r["ok"] for r in rows))
+        self.assertTrue(all("measurement proof" in r["error"] for r in rows))
+        self.assertIn("guest failed", rows[1]["error"])
+        self.assertEqual(rows[0]["value"], "created")
+
+    def test_identity_readiness_retries_stale_ids_with_remaining_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        m = implementation()
+        self.assertTrue(hasattr(m, "wait_guest_identity"), "exact identity readiness barrier missing")
+        node = SimpleNamespace(request_timeout_seconds=180)
+        guest = {"sandboxID": "current", "templateID": "template"}
+        for backend in ("firecracker", "dragonball"):
+            with self.subTest(backend=backend):
+                with patch.object(m.time, "monotonic", side_effect=[10, 11, 12, 13]), \
+                     patch.object(m.time, "sleep") as sleep, \
+                     patch.object(m, "guest_command", side_effect=[{"stdout": "old\ntemplate"},
+                                                                  {"stdout": "current\ntemplate"}]) as command:
+                    self.assertEqual(m.wait_guest_identity(node, guest, 15), guest)
+                self.assertEqual([call.kwargs["timeout"] for call in command.call_args_list], [5, 3])
+                self.assertIn('"$E2B_TEMPLATE_ID"', command.call_args.args[2])
+                sleep.assert_called_once_with(.005)
+                self.assertEqual(node.request_timeout_seconds, 180)
+
+    def test_identity_readiness_rejects_late_success_and_exhausted_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        m = implementation()
+        self.assertTrue(hasattr(m, "wait_guest_identity"), "exact identity readiness barrier missing")
+        guest = {"sandboxID": "current", "templateID": "template"}
+        for ticks, calls in (([10, 16], 1), ([16], 0)):
+            with self.subTest(ticks=ticks):
+                with patch.object(m.time, "monotonic", side_effect=ticks), \
+                     patch.object(m, "guest_command", return_value={"stdout": "current\ntemplate"}) as command:
+                    with self.assertRaisesRegex(TimeoutError, "identity"):
+                        m.wait_guest_identity(SimpleNamespace(request_timeout_seconds=180), guest, 15)
+                    self.assertEqual(command.call_count, calls)
+
+    def test_cell_input_guard_detects_artifact_and_dependency_changes(self):
+        m = implementation()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "binary"
+            artifact.write_bytes(b"frozen binary")
+            lower = root / "lower"
+            lower.write_bytes(b"guest filesystem")
+            image = root / "image.json"
+            image.write_text(json.dumps({"lowers": [{"file": str(lower)}]}))
+            manifest = root / "assets.json"
+            manifest.write_text(json.dumps({"runner_path": str(artifact), "kernel_path": str(artifact),
+                                            "tools_path": str(artifact), "image_path": str(image)}))
+            deps = root / "deps"
+            for name in ("overlaybd", "regctl"):
+                (deps / name).mkdir(parents=True)
+                (deps / name / "tool").write_bytes(b"dependency")
+            inputs = {name: str(artifact) for name in
+                      ("server", "server_fc", "daemon", "ublk_cli", "s3", "registry",
+                       "firecracker", "kernel_fc", "workload", "server_receipt", "server_fc_receipt")}
+            inputs.update(assets=str(manifest), deps=str(deps), oss_timeout_seconds=30)
+            expected = m.input_identity(inputs)
+            for path in (artifact, lower, image, manifest, deps / "regctl/tool"):
+                with self.subTest(path=path.name):
+                    original = path.read_bytes()
+                    path.write_bytes(original + b" ")
+                    self.assertNotEqual(m.input_identity(inputs), expected)
+                    path.write_bytes(original)
+            extra = deps / "overlaybd/new-config"
+            extra.write_text("different behavior")
+            self.assertNotEqual(m.input_identity(inputs), expected)
+            extra.unlink()
+            self.assertNotEqual(m.input_identity({**inputs, "oss_timeout_seconds": 120}), expected)
+            self.assertEqual(m.input_identity(inputs), expected)
+
+    def test_cell_input_guard_refuses_directory_symlinks(self):
+        m = implementation()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "overlaybd").symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "directory symlink"):
+                m.input_identity({"deps": str(root)})
+
+    def test_cell_completion_rechecks_inputs_and_preserves_original_failure(self):
+        from unittest.mock import patch
+        m = implementation()
+        before = {"builds": {"dragonball": {"source": "original"}}, "inputs": {"asset": "before"}}
+        for original_error in (None, "capture failed"):
+            with self.subTest(original_error=original_error):
+                result = {"cleanup": "passed"}
+                if original_error:
+                    result["error"] = original_error
+                with patch.object(m, "preflight", return_value={**before, "inputs": {"asset": "after"}}):
+                    m.verify_cell_inputs(result, {}, before)
+                self.assertFalse(result["inputs_verified"])
+                self.assertIn("inputs changed", result["error"])
+                if original_error:
+                    self.assertIn(original_error, result["error"])
+                self.assertEqual(result["cleanup"], "passed")
+        result = {}
+        with patch.object(m, "preflight", return_value=before):
+            m.verify_cell_inputs(result, {}, before)
+        self.assertTrue(result["inputs_verified"])
+        self.assertNotIn("error", result)
+
+    def test_cell_records_changed_inputs_even_when_vm_setup_fails(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        m = implementation()
+        before = {"builds": {"dragonball": {}}, "inputs": {"asset": "before"}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(m, "preflight", side_effect=[before, {**before, "inputs": {"asset": "after"}}]), \
+                 patch.object(m, "Lab", side_effect=RuntimeError("VM setup failed")):
+                result = m.run_cell(root, {"workload": str(Path(__file__))}, "dragonball",
+                                    {"memory_mib": 1024, "dirty": "low", "concurrency": 1},
+                                    SimpleNamespace(repeats=1), root)
+            self.assertEqual(result, json.loads((root / "result.json").read_text()))
+            self.assertFalse(result["inputs_verified"])
+            self.assertIn("VM setup failed", result["error"])
+            self.assertIn("inputs changed", result["error"])
+
     def test_direct_cell_rejects_kernel_mismatch_before_allocating_lab(self):
         from unittest.mock import patch
         m = implementation()
@@ -142,8 +314,9 @@ class PerformanceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "verification failed"):
                 m.verify_guest(None, {}, spec)
 
-    def test_server_config_uses_explicit_common_kernel_version_for_both_backends(self):
+    def test_server_config_uses_explicit_common_asset_versions_for_both_backends(self):
         import os
+        import pwd
         import configparser
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -155,16 +328,19 @@ class PerformanceTests(unittest.TestCase):
                 (deps / name).mkdir(parents=True)
             asset = root / "asset"
             asset.write_text("fixture")
+            asset.chmod(0o755)
             for backend in ("firecracker", "dragonball"):
                 node_root = root / backend
                 node_root.mkdir()
                 identity = {"backend": backend, "firecracker": backend == "firecracker", "dragonball": backend == "dragonball"}
                 node = SimpleNamespace(root=node_root, name="a", address="fixture", lab=SimpleNamespace(
-                    root=root, account=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())),
+                    root=root, run_user=pwd.getpwuid(os.getuid()).pw_name,
+                    account=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())),
                     run=lambda argv: SimpleNamespace(stdout="999" if argv[0] == "id" else json.dumps(identity)),
                     spawn=lambda *args: SimpleNamespace(poll=lambda: None))
                 inputs = {name: str(asset) for name in ("kernel_fc", "server", "server_fc", "firecracker", "daemon")}
                 inputs.update(deps=str(deps), kernel_version="vmlinux-6.1.175-common",
+                              tools_version="0.1.2-mmds.1",
                               oss_timeout_seconds=120, request_timeout_seconds=600)
                 assets = {name: str(asset) for name in ("kernel_path", "runner_path", "tools_path")}
                 with patch.object(scenario, "wait_http"):
@@ -172,6 +348,7 @@ class PerformanceTests(unittest.TestCase):
                 config = configparser.ConfigParser()
                 config.read_string("[root]\n" + (node_root / "config.toml").read_text())
                 self.assertEqual(json.loads(config["kernel"]["version"]), "vmlinux-6.1.175-common")
+                self.assertEqual(json.loads(config["tools"]["version"]), "0.1.2-mmds.1")
                 self.assertEqual(int(config["backend.oss"]["timeout_secs"]), 120)
                 self.assertEqual(node.request_timeout_seconds, 600)
 

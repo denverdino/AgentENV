@@ -22,6 +22,7 @@ import uuid
 
 from dragonball_m4_lab import Lab
 from dragonball_m4_build import verify as verify_build
+from dragonball_regression import digest as structured_digest
 from dragonball_m4_cleanup import cleanup_owned_ublk
 from dragonball_m4_metrics import resources
 from dragonball_m4_rollback import digest
@@ -32,6 +33,26 @@ from dragonball_m4_scenarios import (
 
 GIB = 1024 ** 3
 OPERATIONS = ("cold", "capture", "restore", "fork_1", "fork_n", "io", "pause_resume", "template")
+
+
+def wait_guest_identity(node, guest, deadline, measurements=None):
+    """Same final identity and API-to-ready budget for either hypervisor."""
+    expected = guest["sandboxID"] + "\n" + guest["templateID"]
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("API-to-guest-identity deadline exceeded")
+        if measurements is not None:
+            measurements["identity_attempts"] += 1
+        result = guest_command(node, guest,
+            "printf '%s\\n%s' \"$E2B_SANDBOX_ID\" \"$E2B_TEMPLATE_ID\"",
+            timeout=min(remaining, getattr(node, "request_timeout_seconds", 180)))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("API-to-guest-identity deadline exceeded")
+        if result["stdout"] == expected:
+            return guest
+        time.sleep(min(.005, remaining))
 
 
 def workload(memory_mib, dirty):
@@ -114,18 +135,44 @@ def summarize(samples):
                             "percentiles_are_diagnostic_not_slo_acceptance"]}
 
 
-def parallel_actions(count, action):
+def parallel_actions(count, action, *, identity_node=None):
     barrier = threading.Barrier(count)
     def execute(index):
         barrier.wait(timeout=30)
         started = time.monotonic()
+        measurements = {}
+        api_returned = None
         try:
             value = action(index)
-            return {"ok": True, "seconds": time.monotonic() - started, "value": value}
+            if identity_node is not None:
+                api_returned = time.monotonic()
+                measurements.update(api_seconds=api_returned - started, identity_attempts=0)
+                for guest in value if isinstance(value, list) else [value]:
+                    wait_guest_identity(identity_node, guest,
+                        started + identity_node.request_timeout_seconds, measurements)
+            row = {"ok": True, "value": value}
         except Exception as error:
-            return {"ok": False, "seconds": time.monotonic() - started, "error": str(error)}
+            row = {"ok": False, "error": str(error)}
+        finished = time.monotonic()
+        if api_returned is not None:
+            measurements["identity_seconds"] = finished - api_returned
+        return {**row, "seconds": finished - started, **measurements}
     with ThreadPoolExecutor(max_workers=count) as executor:
         return list(executor.map(execute, range(count)))
+
+
+def collect_after_action(rows, collect):
+    """A completed action remains a recorded attempt if instrumentation fails."""
+    for row in rows:
+        row["guest_action_ok"] = row["ok"]
+    try:
+        return collect()
+    except Exception as error:
+        for row in rows:
+            row["ok"] = False
+            row["proof_error"] = str(error)
+            row["error"] = (row.get("error", "") + "; measurement proof failed: " + str(error)).lstrip("; ")
+        return {}
 
 
 def append_json(path, value):
@@ -224,6 +271,34 @@ def cleanup_cell(lab, services, inputs):
 
 
 
+def input_identity(inputs):
+    """Fingerprint test inputs, including the bytes copied into disposable nodes."""
+    files = set()
+    for name in ("overlaybd", "regctl"):
+        directory = Path(inputs["deps"]) / name
+        for path in (directory, *directory.rglob("*")):
+            if path.is_symlink() and path.is_dir():
+                raise ValueError("directory symlink in test dependencies: " + str(path))
+            if path.is_file():
+                files.add(path)
+    for name in ("server", "server_fc", "daemon", "ublk_cli", "s3", "registry",
+                 "firecracker", "kernel_fc", "workload", "assets", "server_receipt", "server_fc_receipt"):
+        files.add(Path(inputs[name]))
+    if "heartbeat" in inputs:
+        files.add(Path(inputs["heartbeat"]))
+    assets = json.loads(Path(inputs["assets"]).read_text())
+    files.update(Path(assets[name]) for name in ("runner_path", "kernel_path", "tools_path", "image_path"))
+    image = json.loads(Path(assets["image_path"]).read_text())
+    files.update(Path(lower["file"]) for lower in image["lowers"])
+    scripts = Path(__file__).resolve().parent
+    files.update(scripts.glob("dragonball_m4*.py"))
+    files.update(scripts.glob("dragonball_m4*.c"))
+    files.update((scripts / "dragonball_regression.py", scripts.parent / "run-with-capabilities.sh"))
+    return {"settings_sha256": structured_digest(inputs),
+            "files": {str(path): {"sha256": digest(path), "mode": path.stat().st_mode & 0o777}
+                      for path in sorted(files)}}
+
+
 def preflight(inputs):
     """Shared admission for CLI and direct experiment callers; allocates no lab."""
     validate_inputs(inputs, "rollback", os.geteuid())
@@ -237,10 +312,36 @@ def preflight(inputs):
     builds = {}
     for backend, key in (("dragonball", "server"), ("firecracker", "server_fc")):
         builds[backend] = verify_build(Path(inputs.get(key + "_receipt", "")), inputs[key], backend)
-    return {"assets": assets, "builds": builds}
+    from dragonball_m4_inputs import check as check_inputs
+    report = check_inputs({
+        'files': [inputs['kernel_fc'], inputs['workload']],
+        'executables': [inputs[k] for k in ('server', 'server_fc', 'daemon', 'ublk_cli', 'firecracker', 's3', 'registry')],
+        'assets': [inputs['assets']], 'modules': [str(Path(__file__).resolve())],
+    }, run_user='aenv')
+    if not report['ok']:
+        raise ValueError('workload input preflight refused: ' + '; '.join(report['errors']))
+    versions = inputs.get('phase_timing_versions', {})
+    if not isinstance(versions, dict) or (versions and set(versions) != {'dragonball', 'firecracker'}):
+        raise ValueError('phase_timing_versions must name both backends')
+    from dragonball_m4_phases import validate_version
+    for backend, version in versions.items():
+        validate_version(backend, version)
+    return {"assets": assets, "builds": builds, "inputs": input_identity(inputs)}
 
 
-def comparable_builds(results):
+def verify_cell_inputs(result, inputs, expected):
+    """Keep cleanup and operation failures separate from invalidated evidence."""
+    try:
+        if preflight(inputs) != expected:
+            raise ValueError("test inputs changed during cell")
+        result["inputs_verified"] = True
+    except Exception as error:
+        result["inputs_verified"] = False
+        prior = result.get("error")
+        result["error"] = (prior + "; " if prior else "") + "input verification: " + str(error)
+
+
+def comparable_builds(results, expected_inputs):
     if any("error" in row for row in results):
         return False
     rows = [row for row in results if "identity" in row]
@@ -248,6 +349,8 @@ def comparable_builds(results):
         return False
     signatures = set()
     for row in rows:
+        if row.get("inputs_verified") is not True or row.get("input_identity") != expected_inputs:
+            return False
         receipt = row.get("build_receipt")
         if not receipt:
             return False
@@ -257,7 +360,7 @@ def comparable_builds(results):
     return len(signatures) == 1
 
 
-def run_cell(root, inputs, backend, cell, args, output):
+def run_cell(root, inputs, backend, cell, args, output, observe_batch=None):
     checked = preflight(inputs)
     receipt = checked["builds"][backend]
     samples = []
@@ -266,11 +369,16 @@ def run_cell(root, inputs, backend, cell, args, output):
     result = {"root": str(root), "backend": backend, **cell, "workload": spec,
               "oss_timeout_seconds": inputs.get("oss_timeout_seconds", 30),
               "request_timeout_seconds": inputs.get("request_timeout_seconds", 180),
+              "readiness_contract": "exact_sandbox_and_template_identity_v1",
               "repeats_requested": args.repeats, "samples": samples, "cleanup": "pending",
               "build_receipt": receipt,
+              "input_identity": checked["inputs"],
               "fixture_resources_path": str(root / "fixture-resources.json")}
+    phase_version = inputs.get('phase_timing_versions', {}).get(backend)
+    if phase_version:
+        result['phase_timings'] = {'rows': [], 'expected_operations': []}
     try:
-        with Lab(root, "aenv") as lab:
+        with Lab(root, "aenv", preflight_profile=getattr(args, "preflight_profile", None)) as lab:
             services = Services(lab, memory_gib=args.fixture_memory_gib)
             try:
                 cert, image, assets = fixtures(lab, inputs, services)
@@ -286,15 +394,36 @@ def run_cell(root, inputs, backend, cell, args, output):
                 result["namespaces"] = json.loads((node.root / "ready").read_text())
                 count = cell["concurrency"]
 
-                def batch(operation, action, request_count=count, **details):
+                def batch(operation, action, request_count=count, identity_ready=False, **details):
                     # Re-check actual disk/memory before every operation. No global cache flush.
                     if shutil.disk_usage(root).free < 8 * GIB + count * cell["memory_mib"] * 1024 ** 2:
                         raise RuntimeError("disk reserve reached; remaining operations not attempted")
                     if mem_available() < 10 * GIB:
                         raise RuntimeError("host memory reserve reached; remaining operations not attempted")
                     before = resources(node)
-                    rows = parallel_actions(request_count, action)
-                    after = resources(node)
+                    phase_operation = {'cold_api_to_identity_ready': 'cold',
+                                       'restore_api_to_identity_ready': 'restore',
+                                       'resume_api_to_identity_ready': 'resume'}.get(operation)
+                    window = None
+                    if phase_version and phase_operation:
+                        from dragonball_m4_phases import Window
+                        window = Window(root / (node.name + '.server.log'))
+                        operation_id = f'{root.name}/{repeat}/{operation}'
+                        result['phase_timings']['expected_operations'].extend(
+                            f'{operation_id}/{i}' for i in range(request_count))
+                    observation = observe_batch(node, operation, repeat) if observe_batch else None
+                    rows = parallel_actions(request_count, action, identity_node=node if identity_ready else None)
+                    def collect():
+                        # Finish the sampler before other fallible post-action reads.
+                        observations = observation.finish() if observation else None
+                        if window:
+                            timings = window.finish(rows, backend=backend, operation=phase_operation,
+                                                    operation_id=operation_id, timing_version=phase_version)
+                            result['phase_timings']['rows'].extend(timings)
+                            (root / 'phase-timings.json').write_text(json.dumps(result['phase_timings'], indent=2) + '\n')
+                        return {"resources": resources(node), "observations": observations}
+                    proof = collect_after_action(rows, collect)
+                    after = proof.get("resources")
                     for index, row in enumerate(rows):
                         sample = {**cell, "backend": backend, "operation": operation, "repeat": repeat,
                                   "request_index": index, "request_concurrency": request_count,
@@ -302,6 +431,14 @@ def run_cell(root, inputs, backend, cell, args, output):
                                   "ok": row["ok"], "seconds": row["seconds"],
                                   "resources_before_batch": before, "resources_after_batch": after,
                                   "resource_scope": "whole_node_batch_cumulative_memory_peak", **details}
+                        sample["guest_action_ok"] = row["guest_action_ok"]
+                        for key in ("api_seconds", "identity_seconds", "identity_attempts"):
+                            if key in row:
+                                sample[key] = row[key]
+                        if "proof_error" in row:
+                            sample["proof_error"] = row["proof_error"]
+                        if observation:
+                            sample["observations"] = proof.get("observations")
                         if "error" in row:
                             sample["error"] = row["error"]
                         samples.append(sample)
@@ -321,11 +458,10 @@ def run_cell(root, inputs, backend, cell, args, output):
 
                 for repeat in range(args.repeats):
                     def create(_):
-                        guest = api(node, "/sandboxes-cold", "POST", {"image": image, "cpuCount": 1,
+                        return api(node, "/sandboxes-cold", "POST", {"image": image, "cpuCount": 1,
                             "memoryMB": cell["memory_mib"], "timeout": 7200, "autoPause": False, "secure": False}, 201)
-                        guest_command(node, guest, "true")
-                        return guest
-                    guests = batch("cold_api_to_envd_ready", create, workload_phase="before_guest_workload")
+                    guests = batch("cold_api_to_identity_ready", create, identity_ready=True,
+                                   workload_phase="before_guest_workload")
                     try:
                         if set(args.operations) == {"cold"}:
                             continue
@@ -340,11 +476,9 @@ def run_cell(root, inputs, backend, cell, args, output):
                             verify(guests, "capture_source")
                             if "restore" in args.operations:
                                 def restore(i):
-                                    guest = api(node, "/sandboxes", "POST", {"templateID": snapshots[i]["snapshotID"],
+                                    return api(node, "/sandboxes", "POST", {"templateID": snapshots[i]["snapshotID"],
                                         "timeout": 7200, "autoPause": False, "secure": False}, 201)
-                                    guest_command(node, guest, "true")
-                                    return guest
-                                children = batch("restore_api_to_envd_ready", restore)
+                                children = batch("restore_api_to_identity_ready", restore, identity_ready=True)
                                 verify(children, "restore")
                                 remove(children)
                         for operation in ("fork_1", "fork_n"):
@@ -358,10 +492,9 @@ def run_cell(root, inputs, backend, cell, args, output):
                                 if len(entries) != child_count or any(not e.get("sandbox") or e.get("error") for e in entries):
                                     raise RuntimeError("partial fork failure: " + str(entries))
                                 children = [e["sandbox"] for e in entries]
-                                for child in children:
-                                    guest_command(node, child, "true")
                                 return children
-                            batches = batch(operation + "_api_to_envd_ready", fork, requests, children_per_request=child_count)
+                            batches = batch(operation + "_api_to_identity_ready", fork, requests,
+                                            identity_ready=True, children_per_request=child_count)
                             children = [child for children in batches for child in children]
                             verify(children, operation)
                             remove(children)
@@ -375,9 +508,8 @@ def run_cell(root, inputs, backend, cell, args, output):
                                 resumed = api(node, f"/sandboxes/{guests[i]['sandboxID']}/resume", "POST", {"timeout": 7200}, 201)
                                 if resumed["sandboxID"] != guests[i]["sandboxID"]:
                                     raise RuntimeError("resume changed sandbox ID")
-                                guest_command(node, resumed, "true")
                                 return resumed
-                            guests = batch("resume_api_to_envd_ready", resume)
+                            guests = batch("resume_api_to_identity_ready", resume, identity_ready=True)
                             verify(guests, "resume")
                         if "template" in args.operations:
                             templates = batch("template_empty_build_ready", lambda i: build_template(node, image, cell["memory_mib"]))
@@ -391,6 +523,14 @@ def run_cell(root, inputs, backend, cell, args, output):
     except Exception as error:
         result["error"] = str(error)
         result["cleanup"] = "check_retained_logs_and_cgroups"
+    if phase_version:
+        from dragonball_m4_phases import analyze
+        try:
+            result['phase_summary'] = analyze(result['phase_timings']['rows'],
+                                              result['phase_timings']['expected_operations'])
+        except ValueError as error:
+            result['error'] = (result.get('error', '') + '; phase analysis: ' + str(error)).lstrip('; ')
+    verify_cell_inputs(result, inputs, checked)
     result["measurements"] = summarize(samples)
     (root / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
     return result
@@ -435,7 +575,7 @@ def main():
         "fixture_memory_gib": args.fixture_memory_gib, "build_receipts": checked["builds"],
         "vcpu_per_sandbox": 1, "cache_policy": "fresh_node_caches_shared_host_cache_no_flush",
         "backend_order": "alternating_by_cell_firecracker_first_even_dragonball_first_odd",
-        "pool": "disabled", "storage": "overlaybd_ublk_oss_local_minio",
+        "pool": {"maintenance": False, "network_release_cache_high_watermark": inputs.get("network_cache_slots", 1), "block": False, "firecracker": False}, "storage": "overlaybd_ublk_oss_local_minio",
         "compression": "ordinary_publish_disabled_template_uses_identical_server_defaults",
         "kernel_sha256": digest(assets["kernel_path"]), "tools_sha256": digest(assets["tools_path"]),
         "rootfs_config_sha256": digest(assets["image_path"]),
@@ -471,12 +611,12 @@ def main():
             results.append(row)
             append_json(output / "cells.jsonl", row)
     samples = [sample for row in results for sample in row.get("samples", [])]
-    comparable = comparable_builds(results)
+    comparable = comparable_builds(results, checked["inputs"])
     report = {"conditions": conditions, "conditions_comparable": comparable,
               "cells": results, **summarize(samples)}
     if not comparable:
         for comparison in report["relative_diagnostics"].values():
-            comparison["status"] = "missing_or_mismatched_build_provenance"
+            comparison["status"] = "missing_or_mismatched_input_or_build_provenance"
     (output / "result.json").write_text(json.dumps(report, indent=2, allow_nan=False))
     print(json.dumps({"output": str(output), "performance_qualified": False,
                       "failed_cells": sum("error" in row for row in results)}), flush=True)

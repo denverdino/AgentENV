@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 class BuildReceiptTests(unittest.TestCase):
     def setUp(self):
+        platform = patch('dragonball_m4_preflight.platform.system', return_value='Linux')
+        platform.start()
+        self.addCleanup(platform.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
@@ -60,6 +63,20 @@ if os.getenv('MUTATE_SOURCE'):
 
     def build(self, backend='dragonball'):
         return self.module().build(self.source, backend, self.output, cargo=str(self.cargo))
+
+    def test_busy_host_refuses_before_candidate_or_cargo_mutation(self):
+        import dragonball_m4_host as host
+        m = self.module()
+        path = self.root / 'host.lock'
+        fd = host.acquire_host_lock(path)
+        try:
+            with patch.object(host, 'LOCK_PATH', path):
+                with self.assertRaisesRegex(RuntimeError, 'busy'):
+                    self.build()
+            self.assertFalse(self.output.exists())
+            self.assertFalse((self.root / 'compiled-server').exists())
+        finally:
+            os.close(fd)
 
     def test_dirty_build_records_real_head_and_rejects_replaced_binary_or_source(self):
         (self.source / 'input').write_text('dirty candidate')
@@ -130,15 +147,21 @@ if os.getenv('MUTATE_SOURCE'):
         performance = importlib.import_module('dragonball_m4_performance')
         asset = self.root / 'asset'
         asset.write_text('fixture')
+        asset.chmod(0o755)
+        image = self.root / 'image.json'
+        image.write_text(json.dumps({'lowers': [{'file': str(asset)}]}))
         assets = self.root / 'assets.json'
-        assets.write_text(json.dumps({'kernel_path': str(asset)}))
+        assets.write_text(json.dumps({'kernel_path': str(asset), 'runner_path': str(asset),
+                                     'tools_path': str(asset), 'image_path': str(image)}))
         inputs = {key: str(asset) for key in
                   ('daemon', 's3', 'registry', 'ublk_cli', 'workload', 'firecracker', 'kernel_fc')}
         inputs.update(server=str(db_output / 'server'), server_receipt=str(db_output / 'receipt.json'),
                       server_fc=str(self.output / 'server'), server_fc_receipt=str(self.output / 'receipt.json'),
                       assets=str(assets), deps=str(self.root))
         validate = performance.validate_inputs
-        with patch.object(performance, 'validate_inputs', side_effect=lambda inputs, scenario, uid: validate(inputs, scenario, 0)):
+        from dragonball_m4_inputs import check as check_inputs
+        with patch.object(performance, 'validate_inputs', side_effect=lambda inputs, scenario, uid: validate(inputs, scenario, 0)), \
+             patch('dragonball_m4_inputs.check', side_effect=lambda profile, run_user: check_inputs(profile)):
             checked = performance.preflight(inputs)
             self.assertEqual(checked['builds'], {'dragonball': db, 'firecracker': fc})
             frozen = self.output / 'server'
@@ -164,15 +187,39 @@ if os.getenv('MUTATE_SOURCE'):
         other = copy.deepcopy(receipt)
         other['source']['source'] = 'different-tree'
         performance = importlib.import_module('dragonball_m4_performance')
+        inputs = {'files': {'runner': {'sha256': 'original'}}}
         rows = [{'backend': b, 'identity': {'git_commit': receipt['identity']['git_commit']},
-                 'build_receipt': r} for b, r in [('dragonball', receipt), ('firecracker', other)]]
-        self.assertFalse(performance.comparable_builds(rows))
+                 'build_receipt': r, 'input_identity': inputs, 'inputs_verified': True}
+                for b, r in [('dragonball', receipt), ('firecracker', other)]]
+        self.assertFalse(performance.comparable_builds(rows, inputs))
         rows[1]['build_receipt'] = receipt
-        self.assertTrue(performance.comparable_builds(rows))
+        self.assertTrue(performance.comparable_builds(rows, inputs))
         changed = copy.deepcopy(receipt)
         changed['build']['configurations']['/external/config.toml'] = 'different'
         rows[1]['build_receipt'] = changed
-        self.assertFalse(performance.comparable_builds(rows))
+        self.assertFalse(performance.comparable_builds(rows, inputs))
+
+    def test_cells_with_inputs_changed_between_backends_are_not_comparable(self):
+        import copy
+        receipt = self.build()
+        performance = importlib.import_module('dragonball_m4_performance')
+        inputs = {'files': {'runner': {'sha256': 'original'}}}
+        rows = [{'backend': backend, 'identity': receipt['identity'],
+                 'build_receipt': receipt, 'input_identity': copy.deepcopy(inputs),
+                 'inputs_verified': True} for backend in ('firecracker', 'dragonball')]
+        self.assertTrue(performance.comparable_builds(rows, inputs))
+        rows[1]['input_identity']['files']['runner']['sha256'] = 'replaced-between-cells'
+        self.assertFalse(performance.comparable_builds(rows, inputs))
+        rows[0]['input_identity'] = rows[1]['input_identity']
+        self.assertFalse(performance.comparable_builds(rows, inputs), 'both cells drifted from matrix admission')
+        for row in rows:
+            row['input_identity'] = inputs
+        for value in (False, None):
+            rows[1]['inputs_verified'] = value
+            self.assertFalse(performance.comparable_builds(rows, inputs))
+        rows[1]['inputs_verified'] = True
+        del rows[1]['input_identity']
+        self.assertFalse(performance.comparable_builds(rows, inputs))
 
 
 if __name__ == '__main__':

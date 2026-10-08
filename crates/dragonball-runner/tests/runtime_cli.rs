@@ -16,10 +16,32 @@ struct RuntimeProcess {
 }
 impl RuntimeProcess {
     fn start() -> Self {
+        Self::start_with_fd_limit(None)
+    }
+
+    fn start_with_fd_limit(fd_limit: Option<u64>) -> Self {
+        use std::os::unix::process::CommandExt;
+
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let socket = root.path().join("runtime.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_aenv-dragonball"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aenv-dragonball"));
+        if let Some(limit) = fd_limit {
+            // SAFETY: the child hook only invokes setrlimit before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    let limit = libc::rlimit {
+                        rlim_cur: limit,
+                        rlim_max: limit,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = command
             .arg("--runtime")
             .arg("--socket")
             .arg(&socket)
@@ -98,6 +120,35 @@ impl Drop for RuntimeProcess {
 
 #[test]
 #[ignore = "Linux KVM runtime CLI qualification"]
+fn runtime_cli_reserves_fd_capacity_without_leaking_descriptors() {
+    let mut process = RuntimeProcess::start_with_fd_limit(Some(128));
+    process.call(1, RuntimeCommand::Hello).result.unwrap();
+    let status = fs::read_to_string(format!("/proc/{}/status", process.child.id())).unwrap();
+    let capacity: usize = status
+        .lines()
+        .find_map(|line| line.strip_prefix("FDSize:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        capacity >= 128,
+        "runner must reserve before starting workers"
+    );
+    assert!(!std::path::Path::new(&format!("/proc/{}/fd/127", process.child.id())).exists());
+    process.stop(2);
+}
+
+#[test]
+#[ignore = "Linux KVM runtime CLI qualification"]
+fn runtime_cli_fd_reservation_is_optional_under_low_limit() {
+    let mut process = RuntimeProcess::start_with_fd_limit(Some(64));
+    process.call(1, RuntimeCommand::Hello).result.unwrap();
+    process.stop(2);
+}
+
+#[test]
+#[ignore = "Linux KVM runtime CLI qualification"]
 fn runtime_cli_keeps_probe_separate_and_seccomp_enabled() {
     let mut process = RuntimeProcess::start();
     let RuntimeReply::Hello(hello) = process.call(1, RuntimeCommand::Hello).result.unwrap() else {
@@ -105,7 +156,7 @@ fn runtime_cli_keeps_probe_separate_and_seccomp_enabled() {
     };
     assert_eq!(
         hello.dragonball_revision,
-        "9b0d2852e4a9d4c66a391c32fccb93b65e937f8f"
+        "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
     );
     assert_eq!(hello.feature_profile, "db-virtio-blk-net-balloon-v2");
     assert_eq!(
