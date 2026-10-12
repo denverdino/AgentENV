@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fcbf58f7.js";
+            window.path_to_searchindex_js = "searchindex-f0b05eef.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-c125be5b.js"></script>
+        <script src="toc-5404fc80.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1809,6 +1809,226 @@ episode, and returns the task’s canonical test result as the GRPO reward.
 <p>For the complete training configuration, provider options, and operational
 notes, see the upstream
 <a href="https://github.com/radixark/miles/blob/main/examples/experimental/openenv/README.md">Miles OpenEnv Terminal-Bench-2 recipe</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="使用-harbor-在-dragonball-上运行小型评测"><a class="header" href="#使用-harbor-在-dragonball-上运行小型评测">使用 Harbor 在 Dragonball 上运行小型评测</a></h1>
+<p>本示例通过 AgentENV 的自定义 Harbor environment，在 Dragonball VM 中运行
+终端和桌面任务。先用正负对照验证后端与评分器，再运行百炼
+<code>qwen3.8-flash</code>。Oracle 或 GUI 对照的成功不计作模型成绩。</p>
+<p>实现入口为 <a href="../../scripts/harbor/README.html">scripts/harbor</a>。本文的远程目录
+对应 2026-10-09 已验证的串行示例环境；新机器的依赖准备见文末。
+当前仓库入口已改为每个 trial 4c8g、每机最多 8 并发；原始规格与历史结果
+保持独立。完整 Terminal-Bench 固定集合筛为 86 项，排除 3 个 Windows/QEMU
+完整虚机任务；配置与筛选说明见 <a href="../../HARBOR_INTEGRATION.html">集成经验</a>。
+完整模型评测保持停止，以下模型命令是小型诊断示例。</p>
+<h2 id="1-选择任务"><a class="header" href="#1-选择任务">1. 选择任务</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>示例</th><th>任务</th><th>运行内容</th><th>适用目的</th></tr>
+</thead>
+<tbody>
+<tr><td>后端冒烟</td><td><code>hello-workdir</code>、<code>hello-user</code>、<code>hello-multi-step-simple</code></td><td>Oracle 和 <code>nop</code>，共 6 个 trial</td><td>工作目录、用户权限、跨步骤状态</td></tr>
+<tr><td>Terminal-Bench</td><td><code>openssl-selfsigned-cert</code>、<code>log-summary-date-ranges</code></td><td>Oracle / <code>nop</code> 对照，再运行 Terminus-2 + Qwen</td><td>小型真实终端任务</td></tr>
+<tr><td>Computer Use</td><td><code>computer-1-click-calibration</code></td><td>GUI / <code>nop</code> 对照，再运行 Computer1 + Qwen</td><td>点击、双击、右键、输入、拖拽、滚动、截图裁剪</td></tr>
+</tbody>
+</table>
+</div>
+<p>Harbor 固定为 0.24.0，源码提交
+<code>4b94505a91c5ddcb70b5740ac95718ddee13e5a0</code>；Terminal-Bench 任务提交固定为
+<code>2fd12b88aafdd04a52c298e3940bcb189f9766d6</code>。任务、解答和 verifier 保留原样。
+上述历史示例每轮单并发、每任务一次，无 trial 自动重试；单次模型 API 重试仍遵循 Harbor。</p>
+<h2 id="2-连接远程环境并清理磁盘"><a class="header" href="#2-连接远程环境并清理磁盘">2. 连接远程环境并清理磁盘</a></h2>
+<p>在本地连接服务器，后续命令在远程 Bash 中运行：</p>
+<pre><code class="language-bash">ssh root@147.139.165.124
+bash
+cd /var/tmp/hb1008
+</code></pre>
+<p>root 只负责主机准备、namespace、资源回收；Harbor、AgentENV、VMM 和镜像
+构建由非 root 账号 <code>aenv</code> 执行。该目录已有以下制品：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>路径</th><th>内容</th></tr>
+</thead>
+<tbody>
+<tr><td><code>venv/</code></td><td>固定 Harbor 的 Python 环境</td></tr>
+<tr><td><code>source/scripts/harbor/</code></td><td>AgentENV 适配层、驱动、模型日志脱敏包装</td></tr>
+<tr><td><code>inputs.json</code>、<code>assets.json</code></td><td>已验证的运行时及依赖路径</td></tr>
+<tr><td><code>prepared-v1/</code></td><td>三个 hello 任务和冻结镜像</td></tr>
+<tr><td><code>terminal-prepared-v2/</code></td><td>两个 Terminal-Bench 任务和冻结镜像</td></tr>
+<tr><td><code>computer-prepared-v2/</code></td><td>Computer Use 任务和冻结镜像</td></tr>
+<tr><td><code>setup_host.py</code>、<code>restore_host.py</code></td><td>此环境的临时主机准备与恢复</td></tr>
+<tr><td><code>rerun.sh</code>、<code>tb_rerun.sh</code>、<code>cu_rerun.sh</code></td><td>带互斥和退出清理的运行入口</td></tr>
+</tbody>
+</table>
+</div>
+<p>先检查磁盘、inode 和残留资源，再清理超过一小时的未使用 Docker 构建缓存：</p>
+<pre><code class="language-bash">set -e
+df -h /var/tmp
+df -i /var/tmp
+python3 - &lt;&lt;'PY'
+import sys
+sys.path.insert(0, '/var/tmp/hb1008/source/scripts/tests')
+from dragonball_m4_host import require_clean_host
+require_clean_host()
+PY
+docker builder prune -f --filter until=1h
+python3 - &lt;&lt;'PY'
+import shutil
+free = shutil.disk_usage('/var/tmp').free
+assert free &gt;= 40 * 1024**3, '需要至少 40 GiB 可用空间'
+print(f'可用空间：{free / 1024**3:.1f} GiB')
+PY
+</code></pre>
+<p>预算包含 20 GiB 工作空间和 20 GiB 保留空间。保留镜像、快照、状态目录和
+历史结果；残留资源检查失败时先查所属任务。运行入口还会检查主机互斥、
+实际测试账号权限、源码、完整任务文件集合和镜像 hash；上述检查不替代这些准入。</p>
+<h2 id="3-示例-a不调用模型的后端冒烟"><a class="header" href="#3-示例-a不调用模型的后端冒烟">3. 示例 A：不调用模型的后端冒烟</a></h2>
+<pre><code class="language-bash">HB_RUN_OUTPUT="/var/tmp/hb1008/run-example-$(date -u +%Y%m%dT%H%M%SZ)"
+bash /var/tmp/hb1008/rerun.sh "$HB_RUN_OUTPUT"
+python3 -m json.tool "$HB_RUN_OUTPUT/receipt.json"
+</code></pre>
+<p>输出目录必须不存在；同机同时只能运行一个入口。三个任务的 Oracle 全部
+步骤应得 1，<code>nop</code> 全部步骤应得 0。多步骤任务有两次评分，所以共 6 个 trial、
+8 次步骤评分。无需百炼密钥。</p>
+<h2 id="4-示例-bterminal-bench--百炼-qwen"><a class="header" href="#4-示例-bterminal-bench--百炼-qwen">4. 示例 B：Terminal-Bench + 百炼 Qwen</a></h2>
+<p>在子 shell 中交互输入密钥，命令历史与配置只包含变量名：</p>
+<pre><code class="language-bash">(
+  set -e
+  trap 'unset DASHSCOPE_API_KEY' EXIT
+  read -r -s -p 'DASHSCOPE_API_KEY: ' DASHSCOPE_API_KEY
+  printf '\n'
+  test -n "$DASHSCOPE_API_KEY"
+  export DASHSCOPE_API_KEY
+  HB_RUN_OUTPUT="/var/tmp/hb1008/run-tb-example-$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '输出目录：%s\n' "$HB_RUN_OUTPUT"
+  bash /var/tmp/hb1008/tb_rerun.sh "$HB_RUN_OUTPUT"
+)
+</code></pre>
+<p>先运行 4 个 Oracle / <code>nop</code> 对照 trial，全部符合预期后才启动 2 个模型 trial。
+Terminus-2 最多 25 轮，关闭 thinking，每次最多输出 4096 tokens。
+百炼接口为 <code>https://dashscope.aliyuncs.com/compatible-mode/v1</code>。
+密钥只注入模型 CLI，不交给 guest，不写入 job JSON；模型日志落盘前脱敏。</p>
+<p>官方终端工具和 verifier 需要下载依赖。实验室提供隔离的 HTTP/CONNECT
+代理，并在评分前用实际 VM 验证 HTTP/HTTPS。这不代表任意 TCP/UDP 公网接入。</p>
+<h2 id="5-示例-ccomputer-use--百炼-qwen"><a class="header" href="#5-示例-ccomputer-use--百炼-qwen">5. 示例 C：Computer Use + 百炼 Qwen</a></h2>
+<pre><code class="language-bash">(
+  set -e
+  trap 'unset DASHSCOPE_API_KEY' EXIT
+  read -r -s -p 'DASHSCOPE_API_KEY: ' DASHSCOPE_API_KEY
+  printf '\n'
+  test -n "$DASHSCOPE_API_KEY"
+  export DASHSCOPE_API_KEY
+  HB_RUN_OUTPUT="/var/tmp/hb1008/run-cu-example-$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '输出目录：%s\n' "$HB_RUN_OUTPUT"
+  bash /var/tmp/hb1008/cu_rerun.sh "$HB_RUN_OUTPUT"
+)
+</code></pre>
+<p>该任务原始声明为 2 vCPU、4 GiB、无 GPU；当前入口默认覆盖为 4c8g。guest 中运行 Xvfb、XFCE、Chromium，本地
+页面为 <code>file:///app/click_calibration.html</code>，网络策略为 <code>no-network</code>。
+模型调用发生在驱动侧；guest 不注入代理。Computer1 使用注册名 <code>litellm</code>
+的通用视觉 provider，发送截图并执行桌面动作，最多 40 轮，禁用模型 shell 工具。</p>
+<p>GUI 正向对照应得 1、<code>nop</code> 应得 0，然后才执行模型。GUI 对照通过截图颜色
+定位控件，完成后从窗口标题读取随机 CODE；它用于验证环境和评分器。
+模型必须自行操作并读图，成绩单独记录。官方 verifier 检查 PASS 状态和 CODE，
+不强制校验 zoom，实际动作覆盖还需检查轨迹。</p>
+<p>任务 agent 预算为 600 秒。固定 Harbor 的 Computer1 在取消后的 <code>finally</code>
+中仍可能调用模型补写答案，因此这不是整个执行阶段的硬截止时间。
+已有一次执行记录为 663.971 秒，含约 64 秒收尾；外层驱动另设总时限。</p>
+<h2 id="6-检查成绩与清理"><a class="header" href="#6-检查成绩与清理">6. 检查成绩与清理</a></h2>
+<p>将输出目录替换为本轮打印的实际路径：</p>
+<pre><code class="language-bash">HB_RUN_OUTPUT=/var/tmp/hb1008/run-cu-example-替换为本轮时间戳
+python3 - "$HB_RUN_OUTPUT" &lt;&lt;'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+receipt = json.loads((root / 'receipt.json').read_text())
+print('整体验收:', receipt.get('passed'))
+print('清理:', receipt.get('cleanup'))
+print('剩余 sandbox:', receipt.get('remaining_sandboxes', '未记录，查看失败日志'))
+print('错误:', receipt.get('error'))
+for path in sorted((root / 'jobs').glob('*/*/result.json')):
+    row = json.loads(path.read_text())
+    for step in row.get('step_results') or [row]:
+        reward = ((step.get('verifier_result') or {}).get('rewards') or {}).get('reward')
+        error = step.get('exception_info') or row.get('exception_info')
+        print(row['task_name'], row['agent_info']['name'],
+              step.get('step_name', '-'), reward,
+              error.get('exception_type') if error else '-')
+PY
+</code></pre>
+<p>模型普通 0 分是有效成绩；<code>AgentTimeoutError</code>、缺失结果、评分不完整和对照
+失败属于评测异常，整体验收不通过。CLI 零退出码也不能替代这些检查。
+正常结束应有 <code>cleanup="passed"</code>、所有 <code>agentenv.json</code> 状态为 <code>deleted</code>、
+<code>remaining_sandboxes=[]</code>。主机恢复记录在
+<code>evidence/host-restored-&lt;输出目录名&gt;.json</code>，主机级日志在
+<code>evidence/&lt;输出目录名&gt;.log</code>。失败时保留原输出，下一轮使用新目录。</p>
+<p>主要产出：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>文件</th><th>用途</th></tr>
+</thead>
+<tbody>
+<tr><td><code>receipt.json</code></td><td>整体验收、运行时 hash、VMM UID、清理和错误</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/result.json</code></td><td>单 trial 或多步骤评分与异常</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/agentenv.json</code></td><td>sandbox 与镜像标识、删除状态</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/agent/</code></td><td>模型轨迹、截图、请求响应或 GUI 对照记录</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/verifier/</code></td><td>原始评分器日志与 Computer Use 校验说明</td></tr>
+</tbody>
+</table>
+</div>
+<p>运行入口生成 job 配置并调用 <code>harbor run --config</code>。历史 job JSON 中的 API
+地址属于临时 Lab，Lab 退出后不再可用，应通过入口重跑。</p>
+<p>已有验证结果：Terminal-Bench <code>run-tb-002</code> 的 Qwen 两项均得 1；Computer Use
+<code>run-cu-003</code> 的 GUI 对照得 1、<code>nop</code> 得 0，Qwen 得 0 并记录超时，卡在输入框
+坐标定位。这是小型接入评测，不代表完整 benchmark 得分或生产容量。</p>
+<h2 id="7-在新环境准备任务制品"><a class="header" href="#7-在新环境准备任务制品">7. 在新环境准备任务制品</a></h2>
+<p>需要 Linux、KVM、ublk、Docker、非 root 运行账号、Python 3.12+ 和固定 Harbor
+环境；Computer Use 对照还需 <code>Pillow==12.3.0</code>。按
+<a href="#dragonball-开发与功能回归">Dragonball 回归指南</a>准备运行时、内核、
+tools、OverlayBD、registry / S3 夹具以及 capability 委派。</p>
+<p>以具有 Docker socket 权限的非 root 账号，在 AgentENV 仓库根目录运行以下
+准备命令。路径须替换为实际位置；每个输出目录必须全新，其父目录须已存在。</p>
+<pre><code class="language-bash">HB_HARBOR_SOURCE=/path/to/pinned-harbor
+HB_HARBOR_MANIFEST=/path/to/harbor-manifest.json
+HB_TB_SOURCE=/path/to/pinned-terminal-bench-2
+HB_TB_MANIFEST=/path/to/terminal-bench-manifest.json
+HB_PREPARE_ROOT=/path/to/prepared-parent
+
+python scripts/harbor/prepare_tasks.py \
+  --harbor-source "$HB_HARBOR_SOURCE" --source-manifest "$HB_HARBOR_MANIFEST" \
+  --output "$HB_PREPARE_ROOT/hello"
+
+python scripts/harbor/prepare_tasks.py \
+  --harbor-source "$HB_HARBOR_SOURCE" --source-manifest "$HB_HARBOR_MANIFEST" \
+  --terminal-bench-source "$HB_TB_SOURCE" --terminal-bench-manifest "$HB_TB_MANIFEST" \
+  --output "$HB_PREPARE_ROOT/terminal-bench"
+
+python scripts/harbor/prepare_tasks.py \
+  --harbor-source "$HB_HARBOR_SOURCE" --source-manifest "$HB_HARBOR_MANIFEST" \
+  --computer-use --output "$HB_PREPARE_ROOT/computer-use"
+
+python -B -m unittest discover -s scripts/harbor -p 'test_*.py'
+</code></pre>
+<p>manifest 格式与生成要求见 <a href="../../scripts/harbor/README.html#从源码准备">适配层说明</a>：
+从干净、固定提交的 checkout 记录源码与完整任务文件的 SHA256；Harbor manifest
+包含 <code>src/</code>、<code>pyproject.toml</code>、三个 hello 目录，Computer Use 还需包含完整
+<code>examples/tasks/computer-1-click-calibration/</code>。Terminal-Bench manifest 包含两个
+完整任务目录。准备命令冻结镜像 archive 与 hash；运行时使用 OCI digest。</p>
+<p>准备制品后，<code>run_lab.py</code> 接受 <code>--inputs</code>、<code>--prepared</code>、<code>--output</code>、<code>--harbor</code>、
+<code>--run-user</code>，增加 <code>--model qwen3.8-flash</code> 才运行模型；省略则只跑评分对照。
+它仍需主机准备、恢复和互斥 wrapper。远程 <code>setup_host.py</code>、<code>restore_host.py</code>
+及资产路径是该实验室的环境配置，不是通用一键安装工具；不能直接把这些
+绝对路径复制到新机器。CPU / 内存受 VM 配置限制，<code>storage_mb</code> 尚未作为硬配额执行。</p>
+<p>配置字段与接口以固定版本的
+<a href="https://github.com/harbor-framework/harbor/blob/4b94505a91c5ddcb70b5740ac95718ddee13e5a0/src/harbor/models/job/config.py">JobConfig</a> 和
+<a href="https://github.com/harbor-framework/harbor/blob/4b94505a91c5ddcb70b5740ac95718ddee13e5a0/src/harbor/environments/base.py">BaseEnvironment</a> 为准。
+<a href="https://github.com/harbor-framework/harbor/blob/main/docs-mintlify/core-concepts/jobs/configs.mdx">官方最新配置说明</a>
+可能包含较新版本的字段；升级时需重新复核 agent 工厂构造、provider 注册名、
+日志脱敏与超时收尾。</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
 <p>AgentENV runs AI agents and their tools inside isolated, snapshot-capable Linux
@@ -5230,6 +5450,186 @@ ublk-daemon，准备资产并串行执行真实 OSS、扩展、私有 registry �
 <p>Integration Tests 工作流的 <code>dragonball_m3</code> 是默认关闭的手动开关，要求专用
 <code>dragonball-m3</code> runner 和同名受保护 environment；需由仓库管理员配置审批策略，
 YAML 本身不会创建审批规则。PR 事件不会触发该特权 job。</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="agentenv--dragonballqwen38-flash--max-对比报告"><a class="header" href="#agentenv--dragonballqwen38-flash--max-对比报告">AgentENV + Dragonball：Qwen3.8 Flash / Max 对比报告</a></h1>
+<p>Terminal-Bench <strong>2.0</strong>，固定任务提交 <code>69671fbaac6d67a7ef0dfec016cc38a64ef7a77c</code>；Harbor <strong>0.24.0</strong>。两轮各执行完全相同的 <strong>71 项</strong>。</p>
+<p><strong>原生 verifier 得1分：Flash 29/71（40.8%），Max 39/71（54.9%），增加10项、14.1个百分点。</strong> Max原生得分有15项提升、5项回退；AgentTimeoutError从33项降至14项。所有模型sandbox均删除，两机宿主恢复通过。</p>
+<h2 id="口径与配置"><a class="header" href="#口径与配置">口径与配置</a></h2>
+<p>原资格集合74项，其中Mailman待新模板/运行时验证，视频提取和MTEB leaderboard缺必需素材绑定，三项仍未执行。另12项资格未合格继续排除。按原资格集合计算的原生得1比例为29/74=39.2%、39/74=52.7%；不能把71项成绩写成完整89项官方榜单成绩。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>项目</th><th>两轮一致的配置</th></tr>
+</thead>
+<tbody>
+<tr><td>后端、任务分片</td><td>AgentENV + Dragonball；A 41项、B 30项</td></tr>
+<tr><td>guest / 节点</td><td>每任务4 vCPU / 8192MiB；每机节点64c / 128GiB</td></tr>
+<tr><td>并发、调度</td><td>每机最多8槽，确认删除后持续补位；实际VMM峰值均8</td></tr>
+<tr><td>模板与镜像</td><td>相同原始任务、镜像digest、已验证OSS模板、tools 0.1.2-p4.1</td></tr>
+<tr><td>Agent</td><td>Terminus-2；请求thinking=false、最多4096输出tokens；未设置25轮冒烟限制</td></tr>
+<tr><td>预算、重试</td><td>原task.toml阶段预算；每项一次，零trial自动重试</td></tr>
+<tr><td>凭据、记录</td><td>原生结果、消息/工具轨迹、token、阶段耗时、错误及删除前取证均保留</td></tr>
+</tbody>
+</table>
+</div>
+<p>两轮实际配额、任务契约与server/runner/kernel/tools摘要逐项核对相同。驱动Python文件仅run_lab.py变化，用于增加Max模型CLI选项；Agent参数除模型名称外一致。没有重跑Oracle/nop或增加Docker对照。</p>
+<h2 id="得分与运行状态"><a class="header" href="#得分与运行状态">得分与运行状态</a></h2>
+<p>原生reward与运行异常分别统计：Flash有两项Agent超时但verifier已得1（adaptive-rejection-sampler、llm-inference-batching-scheduler）。此前38.0%是“得1且无异常”口径；原生得分是40.8%，保持两条指标，不改写原始结果。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标</th><th style="text-align: right">Flash</th><th style="text-align: right">Max</th></tr>
+</thead>
+<tbody>
+<tr><td>原生 verifier 得1</td><td style="text-align: right">29/71（40.8%）</td><td style="text-align: right">39/71（54.9%）</td></tr>
+<tr><td>得1且无运行异常</td><td style="text-align: right">27/71（38.0%）</td><td style="text-align: right">39/71（54.9%）</td></tr>
+<tr><td>评测完成但未通过、无运行异常</td><td style="text-align: right">11</td><td style="text-align: right">18</td></tr>
+<tr><td>AgentTimeoutError</td><td style="text-align: right">33</td><td style="text-align: right">14</td></tr>
+<tr><td>其他原生运行异常</td><td style="text-align: right">0</td><td style="text-align: right">0</td></tr>
+<tr><td>模型任务全部结束 / sandbox删除 / 宿主恢复</td><td style="text-align: right">通过</td><td style="text-align: right">通过</td></tr>
+</tbody>
+</table>
+</div>
+<p>运行状态转换（不把无异常结束等同任务通过）：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flash状态 → Max状态</th><th style="text-align: right">项数</th></tr>
+</thead>
+<tbody>
+<tr><td>完成但未通过 → 完成但未通过</td><td style="text-align: right">8</td></tr>
+<tr><td>完成但未通过 → 通过</td><td style="text-align: right">3</td></tr>
+<tr><td>超时 → 完成但未通过</td><td style="text-align: right">7</td></tr>
+<tr><td>超时 → 超时</td><td style="text-align: right">13</td></tr>
+<tr><td>超时 → 通过</td><td style="text-align: right">13</td></tr>
+<tr><td>通过 → 完成但未通过</td><td style="text-align: right">3</td></tr>
+<tr><td>通过 → 超时</td><td style="text-align: right">1</td></tr>
+<tr><td>通过 → 通过</td><td style="text-align: right">23</td></tr>
+</tbody>
+</table>
+</div>
+<p>20项从超时转为无异常结束，另有compile-compcert新增超时。最终净减少19项超时；20项中也包含仍得0分的任务。</p>
+<h2 id="耗时与token"><a class="header" href="#耗时与token">耗时与Token</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标</th><th style="text-align: right">Flash</th><th style="text-align: right">Max</th></tr>
+</thead>
+<tbody>
+<tr><td>两机控制器总起止跨度</td><td style="text-align: right">2小时17分5秒</td><td style="text-align: right">1小时47分36秒</td></tr>
+<tr><td>A执行跨度</td><td style="text-align: right">2小时17分2秒</td><td style="text-align: right">1小时47分36秒</td></tr>
+<tr><td>B执行跨度</td><td style="text-align: right">1小时8分14秒</td><td style="text-align: right">0小时52分25秒</td></tr>
+<tr><td>累计Agent执行时间（并行任务求和）</td><td style="text-align: right">20.31小时</td><td style="text-align: right">13.20小时</td></tr>
+<tr><td>已返回模型请求计数</td><td style="text-align: right">2,627</td><td style="text-align: right">1,661</td></tr>
+<tr><td>模型请求往返中位数 / P95</td><td style="text-align: right">12.15s / 35.62s</td><td style="text-align: right">8.00s / 35.07s</td></tr>
+<tr><td>环境setup中位数</td><td style="text-align: right">2.60s</td><td style="text-align: right">2.74s</td></tr>
+<tr><td>输入tokens，包含缓存</td><td style="text-align: right">73,583,119</td><td style="text-align: right">50,666,015</td></tr>
+<tr><td>其中缓存tokens</td><td style="text-align: right">70,052,864</td><td style="text-align: right">47,757,056</td></tr>
+<tr><td>未命中缓存输入tokens</td><td style="text-align: right">3,530,255</td><td style="text-align: right">2,908,959</td></tr>
+<tr><td>输出tokens</td><td style="text-align: right">913,515</td><td style="text-align: right">945,842</td></tr>
+<tr><td>已返回用量字段覆盖</td><td style="text-align: right">71/71任务</td><td style="text-align: right">71/71任务</td></tr>
+<tr><td>账单费用</td><td style="text-align: right">未提供</td><td style="text-align: right">未提供</td></tr>
+</tbody>
+</table>
+</div>
+<p>本轮控制器跨度缩短21.5%，输入tokens减少31.1%，输出tokens增加3.5%。输入与缓存不能相加；累计阶段耗时含并行重叠，不能相加作为总墙钟。</p>
+<p>控制器跨度从模型轮控制器启动到最终清理结束，不含准备、磁盘清理审计和静态检查。两轮分日执行，API/网络与运行时下载负载可能变化；模型请求往返包含客户端/网络/服务等待，不是纯服务端推理时间，最后取消的请求可能没有完整计时或用量。Max两个辅助预检各17tokens单列，未纳入71项用量。费用字段缺失，不能由token总量推定实际账单变化。</p>
+<h2 id="逐项变化与剩余问题"><a class="header" href="#逐项变化与剩余问题">逐项变化与剩余问题</a></h2>
+<p><strong>原生得分提升15项：</strong> <code>bn-fit-modify</code>, <code>break-filter-js-from-html</code>, <code>circuit-fibsqrt</code>, <code>cobol-modernization</code>, <code>count-dataset-tokens</code>, <code>custom-memory-heap-crash</code>, <code>feal-differential-cryptanalysis</code>, <code>fix-ocaml-gc</code>, <code>largest-eigenval</code>, <code>merge-diff-arc-agi-task</code>, <code>model-extraction-relu-logits</code>, <code>regex-log</code>, <code>sparql-university</code>, <code>tune-mjcf</code>, <code>winning-avg-corewars</code>.</p>
+<p><strong>原生得分回退5项：</strong> <code>adaptive-rejection-sampler</code>, <code>compile-compcert</code>, <code>configure-git-webserver</code>, <code>db-wal-recovery</code>, <code>sqlite-with-gcov</code>.</p>
+<p>回退项优先复核。compile-compcert从无异常得1转为Agent超时；adaptive-rejection-sampler从“超时但得1”转为无异常得0，说明消除超时不必然提高产物质量。其他回退的具体原因需要查看Max轨迹/验收日志，不由分数直接判环境或模型责任。</p>
+<p><strong>Max仍超时14项：</strong> <code>compile-compcert</code>, <code>feal-linear-cryptanalysis</code>, <code>gcode-to-text</code>, <code>gpt2-codegolf</code>, <code>make-mips-interpreter</code>, <code>password-recovery</code>, <code>path-tracing</code>, <code>path-tracing-reverse</code>, <code>polyglot-rust-c</code>, <code>regex-chess</code>, <code>schemelike-metacircular-eval</code>, <code>torch-pipeline-parallelism</code>, <code>train-fasttext</code>, <code>write-compressor</code>.</p>
+<p>Flash两项guest Python OOM已对应到模型生成的巨大前缀列表和不收敛生成循环；Max的14份删除前内核日志未命中OOM关键词。这是捕获日志的观察，不能替代连续内存压力测量。Flash两项响应协议循环和31项超时的具体证据见旧轮分析；未对Max每个失败项完成根因复现，不把它们统一判为Dragonball故障。</p>
+<p>本次结果说明，同一AgentENV + Dragonball配置上，Max的得分和无异常结束比例更高。它不是VMM优化前后实验，环境setup中位数也没有显示同等规模的加速。后续优先分析5项回退、14项残留超时，以及性能断言、依赖准备、模型输出协议中未分离的贡献。</p>
+<h2 id="全部71项索引"><a class="header" href="#全部71项索引">全部71项索引</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>任务</th><th>Flash原生reward / 状态</th><th>Max原生reward / 状态</th></tr>
+</thead>
+<tbody>
+<tr><td><code>adaptive-rejection-sampler</code></td><td>1 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>bn-fit-modify</code></td><td>0 / 完成但未通过</td><td>1 / 通过</td></tr>
+<tr><td><code>break-filter-js-from-html</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>build-pov-ray</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>cancel-async-tasks</code></td><td>0 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>chess-best-move</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>circuit-fibsqrt</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>cobol-modernization</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>compile-compcert</code></td><td>1 / 通过</td><td>0 / 超时</td></tr>
+<tr><td><code>configure-git-webserver</code></td><td>1 / 通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>constraints-scheduling</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>count-dataset-tokens</code></td><td>0 / 完成但未通过</td><td>1 / 通过</td></tr>
+<tr><td><code>crack-7z-hash</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>custom-memory-heap-crash</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>db-wal-recovery</code></td><td>1 / 通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>distribution-search</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>dna-assembly</code></td><td>0 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>dna-insert</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>extract-elf</code></td><td>0 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>feal-differential-cryptanalysis</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>feal-linear-cryptanalysis</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>filter-js-from-html</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>financial-document-processor</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>fix-code-vulnerability</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>fix-git</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>fix-ocaml-gc</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>gcode-to-text</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>git-leak-recovery</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>git-multibranch</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>gpt2-codegolf</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>hf-model-inference</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>kv-store-grpc</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>large-scale-text-editing</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>largest-eigenval</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>llm-inference-batching-scheduler</code></td><td>1 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>log-summary-date-ranges</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>make-mips-interpreter</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>merge-diff-arc-agi-task</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>model-extraction-relu-logits</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>modernize-scientific-stack</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>mteb-retrieve</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>multi-source-data-merger</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>nginx-request-logging</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>openssl-selfsigned-cert</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>password-recovery</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>path-tracing</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>path-tracing-reverse</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>polyglot-c-py</code></td><td>0 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>polyglot-rust-c</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>portfolio-optimization</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>prove-plus-comm</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>pypi-server</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>pytorch-model-cli</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>query-optimize</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>raman-fitting</code></td><td>0 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>regex-chess</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>regex-log</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>reshard-c4-data</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>sam-cell-seg</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>sanitize-git-repo</code></td><td>0 / 完成但未通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>schemelike-metacircular-eval</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>sparql-university</code></td><td>0 / 完成但未通过</td><td>1 / 通过</td></tr>
+<tr><td><code>sqlite-db-truncate</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>sqlite-with-gcov</code></td><td>1 / 通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>torch-pipeline-parallelism</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>train-fasttext</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td><code>tune-mjcf</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>video-processing</code></td><td>0 / 超时</td><td>0 / 完成但未通过</td></tr>
+<tr><td><code>vulnerable-secret</code></td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td><code>winning-avg-corewars</code></td><td>0 / 超时</td><td>1 / 通过</td></tr>
+<tr><td><code>write-compressor</code></td><td>0 / 超时</td><td>0 / 超时</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="原生证据"><a class="header" href="#原生证据">原生证据</a></h2>
+<p>Flash执行：2026-10-11 19:53:14 → 2026-10-11 22:10:19；Max执行：2026-10-12 09:56:20 → 2026-10-12 11:43:57，均为UTC+8。</p>
+<p>两机原生记录分别保留在 <code>/var/tmp/hb1008/terminal-benchmark-20261011/shard-{0,1}-r1/run</code> 与 <code>/var/tmp/hb1008/qwen-max-20261012/shard-{0,1}/run</code>；sandbox只在删除回执核对后记完成。所有14项Max异常取证成功，清理无错误，冻结候选摘要核对通过。systemd非零退出来自任务异常汇总，队列reason=completed且pending=0，不是仍在运行或清理失败。</p>
+<p>结构化对比、逐项 CSV、来源摘要和最终清理证明保存在测试制品目录
+<code>/tmp/agentenv-harbor-qwen-max-20261012/</code>，Flash 来源位于
+<code>/tmp/agentenv-harbor-benchmark-20261011/</code>。原生结果路径如上，
+<a href="internals/harbor-qwen-timeout-analysis.html">超时分析</a>和
+<a href="../../HARBOR_INTEGRATION.html">集成记录</a>提供仓库内追溯入口。</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="hypervisor-验证摘要与已知限制"><a class="header" href="#hypervisor-验证摘要与已知限制">Hypervisor 验证摘要与已知限制</a></h1>
 <p>最后核对：2026-10-08。本轮候选基于 <code>84e21d5</code>，增加 DB 默认环境身份读取和

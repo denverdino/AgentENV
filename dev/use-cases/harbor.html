@@ -1,0 +1,462 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Evaluate with Harbor and Dragonball - AgentENV Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-f0b05eef.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-5404fc80.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">AgentENV Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/use-cases/harbor.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="使用-harbor-在-dragonball-上运行小型评测"><a class="header" href="#使用-harbor-在-dragonball-上运行小型评测">使用 Harbor 在 Dragonball 上运行小型评测</a></h1>
+<p>本示例通过 AgentENV 的自定义 Harbor environment，在 Dragonball VM 中运行
+终端和桌面任务。先用正负对照验证后端与评分器，再运行百炼
+<code>qwen3.8-flash</code>。Oracle 或 GUI 对照的成功不计作模型成绩。</p>
+<p>实现入口为 <a href="../../../scripts/harbor/README.html">scripts/harbor</a>。本文的远程目录
+对应 2026-10-09 已验证的串行示例环境；新机器的依赖准备见文末。
+当前仓库入口已改为每个 trial 4c8g、每机最多 8 并发；原始规格与历史结果
+保持独立。完整 Terminal-Bench 固定集合筛为 86 项，排除 3 个 Windows/QEMU
+完整虚机任务；配置与筛选说明见 <a href="../../../HARBOR_INTEGRATION.html">集成经验</a>。
+完整模型评测保持停止，以下模型命令是小型诊断示例。</p>
+<h2 id="1-选择任务"><a class="header" href="#1-选择任务">1. 选择任务</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>示例</th><th>任务</th><th>运行内容</th><th>适用目的</th></tr>
+</thead>
+<tbody>
+<tr><td>后端冒烟</td><td><code>hello-workdir</code>、<code>hello-user</code>、<code>hello-multi-step-simple</code></td><td>Oracle 和 <code>nop</code>，共 6 个 trial</td><td>工作目录、用户权限、跨步骤状态</td></tr>
+<tr><td>Terminal-Bench</td><td><code>openssl-selfsigned-cert</code>、<code>log-summary-date-ranges</code></td><td>Oracle / <code>nop</code> 对照，再运行 Terminus-2 + Qwen</td><td>小型真实终端任务</td></tr>
+<tr><td>Computer Use</td><td><code>computer-1-click-calibration</code></td><td>GUI / <code>nop</code> 对照，再运行 Computer1 + Qwen</td><td>点击、双击、右键、输入、拖拽、滚动、截图裁剪</td></tr>
+</tbody>
+</table>
+</div>
+<p>Harbor 固定为 0.24.0，源码提交
+<code>4b94505a91c5ddcb70b5740ac95718ddee13e5a0</code>；Terminal-Bench 任务提交固定为
+<code>2fd12b88aafdd04a52c298e3940bcb189f9766d6</code>。任务、解答和 verifier 保留原样。
+上述历史示例每轮单并发、每任务一次，无 trial 自动重试；单次模型 API 重试仍遵循 Harbor。</p>
+<h2 id="2-连接远程环境并清理磁盘"><a class="header" href="#2-连接远程环境并清理磁盘">2. 连接远程环境并清理磁盘</a></h2>
+<p>在本地连接服务器，后续命令在远程 Bash 中运行：</p>
+<pre><code class="language-bash">ssh root@147.139.165.124
+bash
+cd /var/tmp/hb1008
+</code></pre>
+<p>root 只负责主机准备、namespace、资源回收；Harbor、AgentENV、VMM 和镜像
+构建由非 root 账号 <code>aenv</code> 执行。该目录已有以下制品：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>路径</th><th>内容</th></tr>
+</thead>
+<tbody>
+<tr><td><code>venv/</code></td><td>固定 Harbor 的 Python 环境</td></tr>
+<tr><td><code>source/scripts/harbor/</code></td><td>AgentENV 适配层、驱动、模型日志脱敏包装</td></tr>
+<tr><td><code>inputs.json</code>、<code>assets.json</code></td><td>已验证的运行时及依赖路径</td></tr>
+<tr><td><code>prepared-v1/</code></td><td>三个 hello 任务和冻结镜像</td></tr>
+<tr><td><code>terminal-prepared-v2/</code></td><td>两个 Terminal-Bench 任务和冻结镜像</td></tr>
+<tr><td><code>computer-prepared-v2/</code></td><td>Computer Use 任务和冻结镜像</td></tr>
+<tr><td><code>setup_host.py</code>、<code>restore_host.py</code></td><td>此环境的临时主机准备与恢复</td></tr>
+<tr><td><code>rerun.sh</code>、<code>tb_rerun.sh</code>、<code>cu_rerun.sh</code></td><td>带互斥和退出清理的运行入口</td></tr>
+</tbody>
+</table>
+</div>
+<p>先检查磁盘、inode 和残留资源，再清理超过一小时的未使用 Docker 构建缓存：</p>
+<pre><code class="language-bash">set -e
+df -h /var/tmp
+df -i /var/tmp
+python3 - &lt;&lt;'PY'
+import sys
+sys.path.insert(0, '/var/tmp/hb1008/source/scripts/tests')
+from dragonball_m4_host import require_clean_host
+require_clean_host()
+PY
+docker builder prune -f --filter until=1h
+python3 - &lt;&lt;'PY'
+import shutil
+free = shutil.disk_usage('/var/tmp').free
+assert free &gt;= 40 * 1024**3, '需要至少 40 GiB 可用空间'
+print(f'可用空间：{free / 1024**3:.1f} GiB')
+PY
+</code></pre>
+<p>预算包含 20 GiB 工作空间和 20 GiB 保留空间。保留镜像、快照、状态目录和
+历史结果；残留资源检查失败时先查所属任务。运行入口还会检查主机互斥、
+实际测试账号权限、源码、完整任务文件集合和镜像 hash；上述检查不替代这些准入。</p>
+<h2 id="3-示例-a不调用模型的后端冒烟"><a class="header" href="#3-示例-a不调用模型的后端冒烟">3. 示例 A：不调用模型的后端冒烟</a></h2>
+<pre><code class="language-bash">HB_RUN_OUTPUT="/var/tmp/hb1008/run-example-$(date -u +%Y%m%dT%H%M%SZ)"
+bash /var/tmp/hb1008/rerun.sh "$HB_RUN_OUTPUT"
+python3 -m json.tool "$HB_RUN_OUTPUT/receipt.json"
+</code></pre>
+<p>输出目录必须不存在；同机同时只能运行一个入口。三个任务的 Oracle 全部
+步骤应得 1，<code>nop</code> 全部步骤应得 0。多步骤任务有两次评分，所以共 6 个 trial、
+8 次步骤评分。无需百炼密钥。</p>
+<h2 id="4-示例-bterminal-bench--百炼-qwen"><a class="header" href="#4-示例-bterminal-bench--百炼-qwen">4. 示例 B：Terminal-Bench + 百炼 Qwen</a></h2>
+<p>在子 shell 中交互输入密钥，命令历史与配置只包含变量名：</p>
+<pre><code class="language-bash">(
+  set -e
+  trap 'unset DASHSCOPE_API_KEY' EXIT
+  read -r -s -p 'DASHSCOPE_API_KEY: ' DASHSCOPE_API_KEY
+  printf '\n'
+  test -n "$DASHSCOPE_API_KEY"
+  export DASHSCOPE_API_KEY
+  HB_RUN_OUTPUT="/var/tmp/hb1008/run-tb-example-$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '输出目录：%s\n' "$HB_RUN_OUTPUT"
+  bash /var/tmp/hb1008/tb_rerun.sh "$HB_RUN_OUTPUT"
+)
+</code></pre>
+<p>先运行 4 个 Oracle / <code>nop</code> 对照 trial，全部符合预期后才启动 2 个模型 trial。
+Terminus-2 最多 25 轮，关闭 thinking，每次最多输出 4096 tokens。
+百炼接口为 <code>https://dashscope.aliyuncs.com/compatible-mode/v1</code>。
+密钥只注入模型 CLI，不交给 guest，不写入 job JSON；模型日志落盘前脱敏。</p>
+<p>官方终端工具和 verifier 需要下载依赖。实验室提供隔离的 HTTP/CONNECT
+代理，并在评分前用实际 VM 验证 HTTP/HTTPS。这不代表任意 TCP/UDP 公网接入。</p>
+<h2 id="5-示例-ccomputer-use--百炼-qwen"><a class="header" href="#5-示例-ccomputer-use--百炼-qwen">5. 示例 C：Computer Use + 百炼 Qwen</a></h2>
+<pre><code class="language-bash">(
+  set -e
+  trap 'unset DASHSCOPE_API_KEY' EXIT
+  read -r -s -p 'DASHSCOPE_API_KEY: ' DASHSCOPE_API_KEY
+  printf '\n'
+  test -n "$DASHSCOPE_API_KEY"
+  export DASHSCOPE_API_KEY
+  HB_RUN_OUTPUT="/var/tmp/hb1008/run-cu-example-$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '输出目录：%s\n' "$HB_RUN_OUTPUT"
+  bash /var/tmp/hb1008/cu_rerun.sh "$HB_RUN_OUTPUT"
+)
+</code></pre>
+<p>该任务原始声明为 2 vCPU、4 GiB、无 GPU；当前入口默认覆盖为 4c8g。guest 中运行 Xvfb、XFCE、Chromium，本地
+页面为 <code>file:///app/click_calibration.html</code>，网络策略为 <code>no-network</code>。
+模型调用发生在驱动侧；guest 不注入代理。Computer1 使用注册名 <code>litellm</code>
+的通用视觉 provider，发送截图并执行桌面动作，最多 40 轮，禁用模型 shell 工具。</p>
+<p>GUI 正向对照应得 1、<code>nop</code> 应得 0，然后才执行模型。GUI 对照通过截图颜色
+定位控件，完成后从窗口标题读取随机 CODE；它用于验证环境和评分器。
+模型必须自行操作并读图，成绩单独记录。官方 verifier 检查 PASS 状态和 CODE，
+不强制校验 zoom，实际动作覆盖还需检查轨迹。</p>
+<p>任务 agent 预算为 600 秒。固定 Harbor 的 Computer1 在取消后的 <code>finally</code>
+中仍可能调用模型补写答案，因此这不是整个执行阶段的硬截止时间。
+已有一次执行记录为 663.971 秒，含约 64 秒收尾；外层驱动另设总时限。</p>
+<h2 id="6-检查成绩与清理"><a class="header" href="#6-检查成绩与清理">6. 检查成绩与清理</a></h2>
+<p>将输出目录替换为本轮打印的实际路径：</p>
+<pre><code class="language-bash">HB_RUN_OUTPUT=/var/tmp/hb1008/run-cu-example-替换为本轮时间戳
+python3 - "$HB_RUN_OUTPUT" &lt;&lt;'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+receipt = json.loads((root / 'receipt.json').read_text())
+print('整体验收:', receipt.get('passed'))
+print('清理:', receipt.get('cleanup'))
+print('剩余 sandbox:', receipt.get('remaining_sandboxes', '未记录，查看失败日志'))
+print('错误:', receipt.get('error'))
+for path in sorted((root / 'jobs').glob('*/*/result.json')):
+    row = json.loads(path.read_text())
+    for step in row.get('step_results') or [row]:
+        reward = ((step.get('verifier_result') or {}).get('rewards') or {}).get('reward')
+        error = step.get('exception_info') or row.get('exception_info')
+        print(row['task_name'], row['agent_info']['name'],
+              step.get('step_name', '-'), reward,
+              error.get('exception_type') if error else '-')
+PY
+</code></pre>
+<p>模型普通 0 分是有效成绩；<code>AgentTimeoutError</code>、缺失结果、评分不完整和对照
+失败属于评测异常，整体验收不通过。CLI 零退出码也不能替代这些检查。
+正常结束应有 <code>cleanup="passed"</code>、所有 <code>agentenv.json</code> 状态为 <code>deleted</code>、
+<code>remaining_sandboxes=[]</code>。主机恢复记录在
+<code>evidence/host-restored-&lt;输出目录名&gt;.json</code>，主机级日志在
+<code>evidence/&lt;输出目录名&gt;.log</code>。失败时保留原输出，下一轮使用新目录。</p>
+<p>主要产出：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>文件</th><th>用途</th></tr>
+</thead>
+<tbody>
+<tr><td><code>receipt.json</code></td><td>整体验收、运行时 hash、VMM UID、清理和错误</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/result.json</code></td><td>单 trial 或多步骤评分与异常</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/agentenv.json</code></td><td>sandbox 与镜像标识、删除状态</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/agent/</code></td><td>模型轨迹、截图、请求响应或 GUI 对照记录</td></tr>
+<tr><td><code>jobs/&lt;阶段&gt;/&lt;trial&gt;/verifier/</code></td><td>原始评分器日志与 Computer Use 校验说明</td></tr>
+</tbody>
+</table>
+</div>
+<p>运行入口生成 job 配置并调用 <code>harbor run --config</code>。历史 job JSON 中的 API
+地址属于临时 Lab，Lab 退出后不再可用，应通过入口重跑。</p>
+<p>已有验证结果：Terminal-Bench <code>run-tb-002</code> 的 Qwen 两项均得 1；Computer Use
+<code>run-cu-003</code> 的 GUI 对照得 1、<code>nop</code> 得 0，Qwen 得 0 并记录超时，卡在输入框
+坐标定位。这是小型接入评测，不代表完整 benchmark 得分或生产容量。</p>
+<h2 id="7-在新环境准备任务制品"><a class="header" href="#7-在新环境准备任务制品">7. 在新环境准备任务制品</a></h2>
+<p>需要 Linux、KVM、ublk、Docker、非 root 运行账号、Python 3.12+ 和固定 Harbor
+环境；Computer Use 对照还需 <code>Pillow==12.3.0</code>。按
+<a href="../internals/dragonball-regression.html">Dragonball 回归指南</a>准备运行时、内核、
+tools、OverlayBD、registry / S3 夹具以及 capability 委派。</p>
+<p>以具有 Docker socket 权限的非 root 账号，在 AgentENV 仓库根目录运行以下
+准备命令。路径须替换为实际位置；每个输出目录必须全新，其父目录须已存在。</p>
+<pre><code class="language-bash">HB_HARBOR_SOURCE=/path/to/pinned-harbor
+HB_HARBOR_MANIFEST=/path/to/harbor-manifest.json
+HB_TB_SOURCE=/path/to/pinned-terminal-bench-2
+HB_TB_MANIFEST=/path/to/terminal-bench-manifest.json
+HB_PREPARE_ROOT=/path/to/prepared-parent
+
+python scripts/harbor/prepare_tasks.py \
+  --harbor-source "$HB_HARBOR_SOURCE" --source-manifest "$HB_HARBOR_MANIFEST" \
+  --output "$HB_PREPARE_ROOT/hello"
+
+python scripts/harbor/prepare_tasks.py \
+  --harbor-source "$HB_HARBOR_SOURCE" --source-manifest "$HB_HARBOR_MANIFEST" \
+  --terminal-bench-source "$HB_TB_SOURCE" --terminal-bench-manifest "$HB_TB_MANIFEST" \
+  --output "$HB_PREPARE_ROOT/terminal-bench"
+
+python scripts/harbor/prepare_tasks.py \
+  --harbor-source "$HB_HARBOR_SOURCE" --source-manifest "$HB_HARBOR_MANIFEST" \
+  --computer-use --output "$HB_PREPARE_ROOT/computer-use"
+
+python -B -m unittest discover -s scripts/harbor -p 'test_*.py'
+</code></pre>
+<p>manifest 格式与生成要求见 <a href="../../../scripts/harbor/README.html#从源码准备">适配层说明</a>：
+从干净、固定提交的 checkout 记录源码与完整任务文件的 SHA256；Harbor manifest
+包含 <code>src/</code>、<code>pyproject.toml</code>、三个 hello 目录，Computer Use 还需包含完整
+<code>examples/tasks/computer-1-click-calibration/</code>。Terminal-Bench manifest 包含两个
+完整任务目录。准备命令冻结镜像 archive 与 hash；运行时使用 OCI digest。</p>
+<p>准备制品后，<code>run_lab.py</code> 接受 <code>--inputs</code>、<code>--prepared</code>、<code>--output</code>、<code>--harbor</code>、
+<code>--run-user</code>，增加 <code>--model qwen3.8-flash</code> 才运行模型；省略则只跑评分对照。
+它仍需主机准备、恢复和互斥 wrapper。远程 <code>setup_host.py</code>、<code>restore_host.py</code>
+及资产路径是该实验室的环境配置，不是通用一键安装工具；不能直接把这些
+绝对路径复制到新机器。CPU / 内存受 VM 配置限制，<code>storage_mb</code> 尚未作为硬配额执行。</p>
+<p>配置字段与接口以固定版本的
+<a href="https://github.com/harbor-framework/harbor/blob/4b94505a91c5ddcb70b5740ac95718ddee13e5a0/src/harbor/models/job/config.py">JobConfig</a> 和
+<a href="https://github.com/harbor-framework/harbor/blob/4b94505a91c5ddcb70b5740ac95718ddee13e5a0/src/harbor/environments/base.py">BaseEnvironment</a> 为准。
+<a href="https://github.com/harbor-framework/harbor/blob/main/docs-mintlify/core-concepts/jobs/configs.mdx">官方最新配置说明</a>
+可能包含较新版本的字段；升级时需重新复核 agent 工厂构造、provider 注册名、
+日志脱敏与超时收尾。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../use-cases/miles.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../concepts/overview.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../use-cases/miles.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../concepts/overview.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/version-selector-067fd7db.js"></script>
+        <script src="../mermaid-init-3bdacd7b.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
