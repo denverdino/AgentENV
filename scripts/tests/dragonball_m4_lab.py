@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.request
 
-from dragonball_m4_host import acquire_host_lock, require_clean_host
+from dragonball_m4_host import acquire_host_lock, require_clean_host, lock_fds
 from dragonball_m4_recovery import record_lab
 from dragonball_test_resources import RunRecord, owned_directory
 
@@ -137,7 +137,8 @@ class Lab:
         controllers = (base / "cgroup.subtree_control").read_text()
         require_controllers(controllers)
         self.cgroup = base / self.root.name
-        self.host_lock = acquire_host_lock()
+        inherited = lock_fds()
+        self.host_lock = os.dup(inherited[0]) if inherited else acquire_host_lock()
         try:
             require_clean_host()
             from dragonball_m4_preflight import check

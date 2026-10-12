@@ -1,0 +1,3 @@
+harbor @ git+https://github.com/harbor-framework/harbor.git@4b94505a91c5ddcb70b5740ac95718ddee13e5a0
+Pillow==12.3.0
+boto3==1.43.109

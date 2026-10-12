@@ -6,11 +6,19 @@ on:
     paths:
       - "Makefile"
       - "scripts/tests/*dragonball*"
+      - "scripts/harbor/**"
+      - ".gitignore"
+      - "**/.env"
+      - "**/.env.*"
       - ".github/workflows/regression-tools.yml"
   push:
     paths:
       - "Makefile"
       - "scripts/tests/*dragonball*"
+      - "scripts/harbor/**"
+      - ".gitignore"
+      - "**/.env"
+      - "**/.env.*"
       - ".github/workflows/regression-tools.yml"
 
 permissions:
@@ -38,3 +46,21 @@ jobs:
       - name: Test regression receipts and process cleanup
         run: |
           make test-regression-tools test-hypervisor-tools
+
+  harbor-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install frozen Harbor test dependencies
+        run: python -m pip install -r scripts/harbor/requirements-test.txt
+      - name: Test Harbor driver without root or VMs
+        run: |
+          test "$(id -u)" != 0
+          for tool in bash tar sha256sum; do
+            command -v "$tool"
+          done
+          make test-harbor-tools REGRESSION_PYTHON=python

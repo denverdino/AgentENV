@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "harbor_revision": "4b94505a91c5ddcb70b5740ac95718ddee13e5a0",
+  "task_revision": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+  "tasks": {
+    "extract-moves-from-video": {
+      "task_sha256": "ac58768a04d5f1c3b10b898b987e4beeb5863e32efcf3a4f13a23a7e3825669e",
+      "inputs": [
+        {
+          "id": "zork-video",
+          "source_id": "youtube:ZCbvyPbhRfA",
+          "kind": "unchecked",
+          "url": "https://www.youtube.com/watch?v=ZCbvyPbhRfA",
+          "reason": "Original ubuntu task image has no media extractor; video accessibility and original URL delivery are unchecked. Oracle writes the answer without accessing this video."
+        }
+      ]
+    },
+    "mteb-leaderboard": {
+      "task_sha256": "75b2ce40c5e1a8446ac1f51dca9e32570e90a308b27c74f4f01494f5b1a62b97",
+      "inputs": [
+        {
+          "id": "historical-results",
+          "source_id": "github:embeddings-benchmark/results@c0fd3271442f8c0c839084a109fede85c8514dab",
+          "kind": "unchecked",
+          "url": "https://codeload.github.com/embeddings-benchmark/results/tar.gz/c0fd3271442f8c0c839084a109fede85c8514dab",
+          "reason": "Original Oracle uses this results repository and historical commit. Archive bytes/digest and current accessibility have not been frozen; an agent-guessed Hugging Face repository is not this input."
+        }
+      ]
+    }
+  }
+}

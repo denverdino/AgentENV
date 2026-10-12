@@ -231,6 +231,10 @@ test-dragonball-regression:
 	$(REGRESSION_PYTHON) scripts/tests/dragonball_regression.py \
 		--binary "$(AENV_REGRESSION_BINARY)" --output "$(AENV_REGRESSION_OUTPUT)" $(AENV_REGRESSION_ARGS)
 
+.PHONY: test-harbor-tools
+test-harbor-tools:
+	$(REGRESSION_PYTHON) -B scripts/harbor/check_tools.py
+
 test-regression-tools:
 	$(REGRESSION_PYTHON) -m unittest discover -s scripts/tests -p 'test_dragonball_regression*.py' -v
 
