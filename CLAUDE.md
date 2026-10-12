@@ -13,6 +13,10 @@ For multi-step development and testing, read and maintain
 [the engineering efficiency improvement log](AGENTS_Updated.md). It supplements
 this guide; distinguish proposed automation from implemented and verified tooling.
 
+For Harbor integration or remote evaluation, start with the
+[driver guide](scripts/harbor/README.md); current scope and evidence live in
+[the integration record](HARBOR_INTEGRATION.md).
+
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks,
 use judgment.
 
@@ -241,6 +245,7 @@ packaging, `config/deps_manifest.toml`, and the
 - [Architecture](docs/src/internals/architecture.md) and [persistence ownership](docs/src/internals/persistence-artifact-inventory.md).
 - [Snapshots](docs/src/concepts/snapshots.md), [volumes](docs/src/concepts/volumes.md), and [template testing](docs/src/internals/template-builder-testing.md).
 - [P2P](docs/src/internals/p2p-design.md), [control plane](services/README.md), and [custom extensions](docs/src/concepts/custom-extension.md).
+- [Harbor integration and evaluation lessons](HARBOR_INTEGRATION.md).
 - [Configuration](docs/src/configuration/reference.md) and [environment variables](docs/src/configuration/env-vars.md).
 
 Keep this guide concise; put implementation details in the linked docs or code.

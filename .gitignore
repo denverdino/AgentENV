@@ -63,6 +63,8 @@ Temporary Items
 ### Runtime Environment
 env/
 .env
+.env.*
+!.env.example
 # Host-specific test settings; commit only the corresponding examples.
 /config/tests/*.local.json
 
@@ -71,3 +73,7 @@ env/
 
 ### Node.js
 node_modules/
+
+# Python test and driver bytecode
+__pycache__/
+*.py[cod]

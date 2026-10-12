@@ -1,0 +1,7 @@
+{
+  "openssl-selfsigned-cert": {
+    "archive": "/path/on/this-host/openssl-selfsigned-cert.tar",
+    "archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "bytes": 44184576
+  }
+}

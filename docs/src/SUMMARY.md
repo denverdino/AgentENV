@@ -27,6 +27,7 @@
 - [Run Python Code](./use-cases/python.md)
 - [Run Codex in AgentENV](./use-cases/codex.md)
 - [Train Terminal-Bench-2 with Miles](./use-cases/miles.md)
+- [Evaluate with Harbor and Dragonball](./use-cases/harbor.md)
 
 # Core Concepts
 
@@ -84,6 +85,7 @@
 - [Dragonball Development and Regression](./internals/dragonball-regression.md)
 - [Hypervisor Components](./internals/hypervisor-components-design.md)
 - [Dragonball Packaging](./internals/dragonball-packaging.md)
+- [Harbor Qwen Evaluation Comparison](./internals/harbor-qwen-comparison.md)
 - [Hypervisor Validation and Known Limits](./internals/hypervisor-validation.md)
 - [Sandbox Network Architecture](./internals/networking.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)

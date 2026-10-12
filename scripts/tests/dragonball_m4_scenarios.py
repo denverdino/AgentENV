@@ -201,21 +201,22 @@ def create_fixture_bucket(endpoint, timeout=30):
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
-def fixtures(lab, inputs, services):
+def fixtures(lab, inputs, services, *, snapshot_config=None):
     repo = lab.root / "repo"
-    endpoint = "http://10.241.0.1:9000"
-    services.spawn("s3", [inputs["s3"], "server", "--address", "10.241.0.1:9000",
-                          "--console-address", "127.0.0.1:0", str(repo / "s3")],
-                   {"MINIO_ROOT_USER": "m4-test", "MINIO_ROOT_PASSWORD": "m4-disposable-password"})
-    wait_http(endpoint + "/minio/health/ready")
-    create_fixture_bucket(endpoint)
-    for expected in (200, 412):
-        probe = command(["curl", "--silent", "--show-error", "--max-time", "10", "--aws-sigv4",
-                         "aws:amz:us-east-1:s3", "--user", "m4-test:m4-disposable-password",
-                         "-X", "PUT", "-H", "If-None-Match: *", "--data", "probe",
-                         "-w", "\n%{http_code}", endpoint + "/m4-test/conditional-probe"])
-        body, status = probe.stdout.rsplit("\n", 1)
-        check_status(int(status), expected, body.encode())
+    if snapshot_config is None:
+        endpoint = "http://10.241.0.1:9000"
+        services.spawn("s3", [inputs["s3"], "server", "--address", "10.241.0.1:9000",
+                              "--console-address", "127.0.0.1:0", str(repo / "s3")],
+                       {"MINIO_ROOT_USER": "m4-test", "MINIO_ROOT_PASSWORD": "m4-disposable-password"})
+        wait_http(endpoint + "/minio/health/ready")
+        create_fixture_bucket(endpoint)
+        for expected in (200, 412):
+            probe = command(["curl", "--silent", "--show-error", "--max-time", "10", "--aws-sigv4",
+                             "aws:amz:us-east-1:s3", "--user", "m4-test:m4-disposable-password",
+                             "-X", "PUT", "-H", "If-None-Match: *", "--data", "probe",
+                             "-w", "\n%{http_code}", endpoint + "/m4-test/conditional-probe"])
+            body, status = probe.stdout.rsplit("\n", 1)
+            check_status(int(status), expected, body.encode())
     cert, key = lab.root / "registry.pem", repo / "registry.key"
     command(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
              "-subj", "/CN=m4-registry", "-addext", "subjectAltName=IP:10.241.0.1",
@@ -275,7 +276,7 @@ def network_cache_slots(inputs):
     return value
 
 
-def start_server(node, inputs, cert, assets, backend="dragonball"):
+def start_server(node, inputs, cert, assets, backend="dragonball", *, snapshot_config=None, extra_env=None):
     node.request_timeout_seconds = inputs.get("request_timeout_seconds", 180)
     deps = node.root / "deps"
     deps.mkdir()
@@ -340,6 +341,9 @@ access_key_secret = "m4-disposable-password"
 cache_max_size_gb = 2
 timeout_secs = {inputs.get("oss_timeout_seconds", 30)}
 ''')
+    if snapshot_config is not None:
+        config.write_text(config.read_text().split('\n[backend.oss]\n', 1)[0] + '\n[backend.oss]\n' +
+                          ''.join(f'{key} = {json.dumps(value)}\n' for key, value in snapshot_config.items()))
     if backend == "firecracker":
         binary = node.root / "deps/firecracker"
         shutil.copy2(inputs["firecracker"], binary)
@@ -362,7 +366,8 @@ timeout_secs = {inputs.get("oss_timeout_seconds", 30)}
     assert identity["runtime_uid"] != 0
     timing_env = (["RUST_LOG=info,agentenv::sandbox::startup_timing=debug,agentenv::sandbox::dragonball::sandbox=debug"]
                   if inputs.get('phase_timing_versions') else [])
-    child = node.spawn(["env", *timing_env, "AENV_API_KEY=" + API_KEY, "REGCTL_CONFIG=" + str(regctl),
+    child = node.spawn(["env", *timing_env, *[key + '=' + value for key, value in (extra_env or {}).items()],
+                        "AENV_API_KEY=" + API_KEY, "REGCTL_CONFIG=" + str(regctl),
                         "SSL_CERT_FILE=" + str(cert), "API_ADDR=0.0.0.0:8000",
                         server, "--config", str(config)], node.lab.root / (node.name + ".server.log"))
     wait_http(f"http://{node.address}:8000/health", timeout=90)
@@ -470,13 +475,14 @@ def terminate_controller(signum, _frame):
 
 
 def isolated_controller(argv, env):
+    from dragonball_m4_host import lock_fds
     child = None
     blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
     try:
         try:
             # Track the child before a pending cancellation can run our handler.
-            child = subprocess.Popen(argv, env=env, start_new_session=True,
+            child = subprocess.Popen(argv, env=env, start_new_session=True, pass_fds=lock_fds(),
                                      preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous))
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)

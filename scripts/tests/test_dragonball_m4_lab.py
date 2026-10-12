@@ -77,6 +77,34 @@ class ContractTests(unittest.TestCase):
             fd = real_lock(lock_path)
             os.close(fd)
 
+    def test_lab_borrows_parent_lease_and_refusal_preserves_parent_lock(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import dragonball_m4_host as host
+        import dragonball_m4_preflight as preflight
+        module = implementation()
+        real_read, real_resolve, real_readlink, real_exists = Path.read_text, Path.resolve, os.readlink, Path.exists
+        with tempfile.TemporaryDirectory(prefix='db-m4.', dir='/var/tmp') as directory, \
+                tempfile.TemporaryDirectory() as locks:
+            root, lock_path = Path(directory), Path(locks) / 'host.lock'
+            with patch.object(host, 'LOCK_PATH', lock_path), host.host_lock(lock_path), \
+                    patch.dict(os.environ, {'AENV_M4_PARENT_NET': 'net:[1]'}), \
+                    patch.object(module.os, 'geteuid', return_value=0), \
+                    patch.object(module.os, 'readlink', side_effect=lambda p: 'net:[2]' if str(p) == '/proc/self/ns/net' else real_readlink(p)), \
+                    patch.object(Path, 'resolve', lambda p, **kw: p if p == root else real_resolve(p, **kw)), \
+                    patch.object(module.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=1000, pw_gid=1000)), \
+                    patch.object(Path, 'read_text', lambda p, **kw: 'cpu memory pids' if str(p) == '/sys/fs/cgroup/cgroup.subtree_control' else real_read(p, **kw)), \
+                    patch.object(Path, 'exists', lambda p: True if str(p) == '/proc/self/ns/net' else real_exists(p)), \
+                    patch.object(module, 'acquire_host_lock', side_effect=lambda: host.acquire_host_lock(lock_path)), \
+                    patch.object(module, 'require_clean_host'), \
+                    patch.object(preflight, 'check', return_value={'ok': False, 'errors': ['injected refusal']}):
+                with self.assertRaisesRegex(RuntimeError, 'preflight'):
+                    module.Lab(root, 'aenv', preflight_profile={})
+                with self.assertRaisesRegex(RuntimeError, 'busy'):
+                    host.acquire_host_lock(lock_path)
+            fd = host.acquire_host_lock(lock_path)
+            os.close(fd)
+
 
 class ReadinessTests(unittest.TestCase):
     # These fixtures exercise the actual pipe reader and subprocess lifecycle,

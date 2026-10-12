@@ -106,6 +106,22 @@ class InheritedLockTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'busy'):
                     host.acquire_host_lock(path)
 
+    def test_isolated_controller_preserves_parent_lease_in_child(self):
+        import dragonball_m4_host as host
+        from dragonball_m4_scenarios import isolated_controller
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'host.lock'
+            code = ('import sys; from pathlib import Path; '
+                    'from dragonball_m4_host import lock_fds; '
+                    'assert lock_fds(Path(sys.argv[1]))')
+            with patch.object(host, 'LOCK_PATH', path), host.host_lock(path):
+                result = isolated_controller([sys.executable, '-c', code, str(path)],
+                    {**os.environ, 'PYTHONPATH': str(Path(__file__).parent)})
+                self.assertEqual(result, 0)
+                with self.assertRaisesRegex(RuntimeError, 'busy'):
+                    host.acquire_host_lock(path)
+
     def test_wrong_descriptor_cannot_bypass_a_busy_host(self):
         import dragonball_m4_host as host
         from unittest.mock import patch

@@ -1,0 +1,11 @@
+{
+  "files": [
+    "/path/to/candidate/source/harbor-control/controller.py",
+    "/path/to/candidate/source/harbor-control/setup_host.py",
+    "/path/to/candidate/source/harbor-control/restore_host.py",
+    "/path/on/this-host/openssl-selfsigned-cert.tar"
+  ],
+  "executables": ["/path/to/venv/bin/python", "/path/to/venv/bin/harbor"],
+  "json": ["/path/on/this-host/inputs.json", "/path/on/this-host/archives.json"],
+  "assets": ["/path/on/this-host/assets.json"]
+}
