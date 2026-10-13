@@ -260,7 +260,8 @@ def attempt_step(plan, step, directory, current, env, reason):
         fd = os.open(path.with_suffix('.log'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'wb') as stream:
             process = subprocess.Popen(step['argv'], cwd=plan['cwd'], env=env,
-                                       stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+                                       stdin=subprocess.DEVNULL, stdout=stream,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
             attempt['pid'] = process.pid
             save(path, attempt)
             code = process.wait(timeout=step['timeout_seconds'])

@@ -1654,6 +1654,9 @@ where
 
     /// Resumes a paused sandbox from its snapshot.
     ///
+    /// An in-flight pause is awaited before resuming, including when its caller
+    /// was cancelled while the cancellation-safe capture kept running.
+    ///
     /// If another `resume_sandbox` call is already in progress (`Resuming`
     /// state), this call waits for the ongoing resume to finish and then
     /// returns the actual outcome (either `Running` or an error) rather than
@@ -1689,6 +1692,12 @@ where
             .get(&sandbox_id)
             .await?
             .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+
+        if metadata.state == SandboxState::Pausing {
+            metadata = self
+                .wait_for_transition(sandbox_id, SandboxState::Pausing)
+                .await?;
+        }
 
         // If another resume is in progress, wait for it to complete and
         // re-evaluate the resulting stable state.

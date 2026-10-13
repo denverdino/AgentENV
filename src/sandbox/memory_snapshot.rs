@@ -16,6 +16,7 @@ pub(crate) struct MemorySegment {
     pub length: u64,
 }
 
+#[cfg(any(feature = "hypervisor-firecracker", test))]
 pub(crate) async fn write_memory_overlaybd(
     source: Arc<dyn VirtualFile>,
     segments: &[MemorySegment],
@@ -30,8 +31,8 @@ pub(crate) async fn write_memory_overlaybd(
     Ok(output)
 }
 
-/// Full Dragonball RAM has an implicit zero base; detect zeros while copying
-/// so frozen guest memory is read only once, without staging another RAM file.
+/// Detect zeros while copying Dragonball RAM once, without staging another RAM
+/// file. Explicit zero records mask ancestral data in incremental layers too.
 #[cfg(feature = "hypervisor-dragonball")]
 pub(crate) async fn write_sparse_memory_overlaybd(
     source: Arc<dyn VirtualFile>,
@@ -93,6 +94,7 @@ fn segment_mappings(segments: &[MemorySegment], virtual_size: u64) -> Result<Vec
     Ok(mappings)
 }
 
+#[cfg(any(feature = "hypervisor-firecracker", test))]
 pub(crate) async fn publish_memory_overlaybd_layer(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],

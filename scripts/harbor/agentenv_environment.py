@@ -64,6 +64,9 @@ class AgentENVEnvironment(BaseEnvironment):
         self.request_timeout_sec = request_timeout_sec
         self.sandbox_timeout_sec = sandbox_timeout_sec
         self.sandbox = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._paused = False
+        self._resume_pending = False
         self.template_start_requested = templates_path is not None
         self.templates = json.loads(Path(templates_path).read_text()) if self.template_start_requested else None
         self.template_run_id = template_run_id
@@ -217,6 +220,38 @@ class AgentENVEnvironment(BaseEnvironment):
         (self.trial_paths.trial_dir / 'material-inputs.json').write_text(json.dumps(self.material_checks, indent=2))
         if not self.material_checks['passed']:
             raise ValueError('Required task materials unavailable; see material-inputs.json')
+
+    async def pause(self):
+        async with self._lifecycle_lock:
+            if not self.sandbox:
+                raise RuntimeError('Sandbox has not been started')
+            if self._paused:
+                return
+            # An interrupted request may still complete on the server.
+            self._resume_pending = True
+            await self._request('POST', f'/sandboxes/{self.sandbox["sandboxID"]}/pause')
+            self._paused = True
+            self._receipt('paused')
+
+    async def resume(self):
+        async with self._lifecycle_lock:
+            if not self.sandbox:
+                raise RuntimeError('Sandbox has not been started')
+            if not self._resume_pending:
+                return
+            sandbox_id = self.sandbox['sandboxID']
+            # Once resume is sent, a lost response makes the state uncertain.
+            # The next inference must obtain a fresh pause acknowledgement.
+            self._paused = False
+            response = await self._request('POST', f'/sandboxes/{sandbox_id}/resume',
+                                           json={'timeout': self.sandbox_timeout_sec})
+            resumed = response.json()
+            if resumed['sandboxID'] != sandbox_id:
+                raise RuntimeError('Resume changed the Sandbox ID')
+            self.sandbox = resumed
+            self._paused = False
+            self._resume_pending = False
+            self._receipt('running')
 
     async def stop(self, delete: bool):
         # Harbor's keep-environment mode retains the running VM for inspection.

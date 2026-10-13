@@ -250,6 +250,8 @@ def worker_main(path):
                 from probe import probe_outer_timeout
                 command = [str(Path(spec['harbor']).parent / 'python'), '-B',
                            str(Path(__file__).with_name('probe.py')), str(p['job'])]
+                if spec.get('pause_taskvm_during_inference'):
+                    command.append('--pause-resume')
                 timeout = probe_outer_timeout(json.loads(p['job'].read_text()))
             else:
                 marker = 'spawned.json'; timeout = p['budget']
@@ -318,7 +320,9 @@ def run_trials(args, lab, node, inputs, prepared, plan, configs, runtime_assets,
         'regctl': inputs['regctl'], 'regctl_config': str(node.root / 'regctl.json'),
         'registry_path': str(lab.root / 'repo/registry'), 'node_home': str(node.root / 'home'),
         'harbor': str(args.harbor), 'acceptance_trials': args.acceptance_trials,
-        'agents': ([model_agent_config(args.model)] if args.model else [{'name': 'oracle'}, {'name': 'nop'}])}
+        'pause_taskvm_during_inference': args.pause_taskvm_during_inference,
+        'agents': ([model_agent_config(args.model, args.pause_taskvm_during_inference)]
+                   if args.model else [{'name': 'oracle'}, {'name': 'nop'}])}
     output = Path(spec['output']); output.mkdir();
     if output.stat().st_dev != lab.root.stat().st_dev: raise ValueError('Campaign output and runtime must share the budget filesystem')
     os.chown(output, lab.account.pw_uid, lab.account.pw_gid)

@@ -539,8 +539,8 @@ impl crate::runtime_service::RuntimeVmm for DragonballVmm {
         generation: u64,
     ) -> anyhow::Result<agentenv_vmm_protocol::runtime_memory::FrozenMemoryMap> {
         use agentenv_vmm_protocol::{runtime::CaptureToken, runtime_memory::*};
-        // Full captures classify zeros while copying RAM; incremental captures
-        // copy every changed range, including pages rewritten to zero.
+        // Captures classify zeros while copying RAM; incremental captures still
+        // include every changed range, including pages rewritten to zero.
         let data = self.runtime_action(VmmAction::ExportHeldMemoryMapWithoutZeroScan {
             generation,
             deadline: self.deadline,

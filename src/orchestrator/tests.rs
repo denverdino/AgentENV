@@ -2359,6 +2359,78 @@ async fn orchestrator_concurrent_pause_calls_all_succeed() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn resume_waits_for_in_flight_pause_after_caller_cancellation() -> Result<()> {
+    setup();
+    for fail_pause in [false, true] {
+        let behavior = Arc::new(MockBehavior::new());
+        let delay = Duration::from_millis(200);
+        behavior.push_action(
+            MockOperation::Pause,
+            if fail_pause {
+                MockAction::FailAfter {
+                    delay,
+                    message: "forced pause failure".to_string(),
+                }
+            } else {
+                MockAction::SucceedAfter(delay)
+            },
+        );
+        let orchestrator =
+            make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let id = created.id;
+        let leader = Arc::clone(&orchestrator);
+        let pause = tokio::spawn(async move { leader.pause_sandbox(id).await });
+        wait_for_state(&orchestrator, &id, SandboxState::Pausing).await?;
+        pause.abort();
+        assert!(pause.await.unwrap_err().is_cancelled());
+
+        let resumed = orchestrator
+            .resume_sandbox(id, NewTimeout::UseExisting)
+            .await?;
+        assert_eq!(resumed.id, id);
+        assert_eq!(resumed.state, SandboxState::Running);
+        assert_proxy_ready(&orchestrator, &id).await?;
+        orchestrator.delete_sandbox(id).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn timed_out_resume_waiter_recovers_after_in_flight_pause() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::SucceedAfter(Duration::from_millis(200)),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let id = created.id;
+    let leader = Arc::clone(&orchestrator);
+    let pause = tokio::spawn(async move { leader.pause_sandbox(id).await });
+    wait_for_state(&orchestrator, &id, SandboxState::Pausing).await?;
+    pause.abort();
+    assert!(pause.await.unwrap_err().is_cancelled());
+
+    assert!(tokio::time::timeout(
+        Duration::from_millis(20),
+        orchestrator.resume_sandbox(id, NewTimeout::UseExisting),
+    )
+    .await
+    .is_err());
+    wait_for_state(&orchestrator, &id, SandboxState::Running).await?;
+    assert_proxy_ready(&orchestrator, &id).await?;
+    orchestrator.delete_sandbox(id).await?;
+    Ok(())
+}
+
 /// Spawning N concurrent `resume_sandbox` calls on the same paused sandbox
 /// must result in every caller receiving metadata with state `Running` and the
 /// sandbox ending up running.

@@ -8,9 +8,7 @@ use anyhow::{ensure, Context, Result};
 use overlaybd::virtual_file::VirtualFile;
 
 use super::capture::DragonballCaptureArtifacts;
-use crate::sandbox::memory_snapshot::{
-    write_memory_overlaybd, write_sparse_memory_overlaybd, MemorySegment,
-};
+use crate::sandbox::memory_snapshot::{write_sparse_memory_overlaybd, MemorySegment};
 use crate::sandbox::storage_snapshot::{
     build_mem_snapshot_image_config_with_runtime_roots, canonicalized_runtime_owned_roots,
 };
@@ -36,12 +34,9 @@ pub(super) async fn write_incremental_memory(
     let layout = map.validate().map_err(anyhow::Error::msg)?;
     let source_bytes: u64 = segments.iter().map(|segment| segment.length).sum();
     let write_started = std::time::Instant::now();
-    let layer = if base.is_some() {
-        // Delta zeros must mask nonzero content in ancestral layers.
-        write_memory_overlaybd(reader, &segments, layout.image_size, output, mode).await?
-    } else {
-        write_sparse_memory_overlaybd(reader, &segments, layout.image_size, output, mode).await?
-    };
+    // Explicit zero records mask ancestral bytes without materializing zero RAM.
+    let layer =
+        write_sparse_memory_overlaybd(reader, &segments, layout.image_size, output, mode).await?;
     let write_ms = write_started.elapsed().as_millis();
     let mut memory_roots = canonicalized_runtime_owned_roots().to_vec();
     if let Some(base) = base {
@@ -85,8 +80,8 @@ fn memory_segments(
     let layout = map.validate().map_err(anyhow::Error::msg)?;
     if let Some(base) = base {
         ensure!(&layout == base, "incremental memory base/layout conflict");
-        // Zeros belong to the dirty set: write explicit bytes, not holes that
-        // would inherit the nonzero ancestral page.
+        // Zeros belong to the dirty set: the writer emits explicit zero records,
+        // not holes that would inherit the nonzero ancestral page.
         return Ok(map
             .changed_ranges
             .iter()
@@ -149,6 +144,7 @@ impl DragonballMemoryBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::memory_snapshot::write_memory_overlaybd;
     use agentenv_vmm_protocol::{
         runtime::CaptureToken,
         runtime_memory::{FrozenMemoryRegion, MemoryRange},
@@ -380,7 +376,7 @@ mod tests {
         let mut empty = map.clone();
         empty.changed_ranges.clear();
         empty.zero_ranges.clear();
-        let unchanged_delta = write_memory_overlaybd(
+        let unchanged_delta = write_sparse_memory_overlaybd(
             Arc::new(Pages {
                 bytes: vec![],
                 allowed: 0..0,
@@ -402,6 +398,7 @@ mod tests {
             unchanged.read_at(0, 16384).await.unwrap().as_ref(),
             original.as_slice()
         );
+        let mut layers = vec![layer(&ancestor).await, layer(&unchanged_delta).await];
         for (index, (value, classified)) in [(0, true), (0x7b, true), (0, false), (0x7b, false)]
             .into_iter()
             .enumerate()
@@ -414,7 +411,7 @@ mod tests {
             if value != 0 || !classified {
                 current.zero_ranges.clear();
             }
-            let delta = write_memory_overlaybd(
+            let delta = write_sparse_memory_overlaybd(
                 Arc::new(Pages {
                     bytes: expected.clone(),
                     allowed: 4096..12288,
@@ -426,12 +423,16 @@ mod tests {
             )
             .await
             .unwrap();
-            let stack = overlaybd::index_file::open_files_ro(&[
-                layer(&ancestor).await,
-                layer(&delta).await,
-            ])
-            .await
-            .unwrap();
+            let delta_image = overlaybd::index_file::open_file_ro(layer(&delta).await)
+                .await
+                .unwrap();
+            assert_eq!(
+                delta_image.data_stat().total_data_size,
+                if value == 0 { 4096 } else { 8192 },
+                "zero delta pages must mask ancestors without RAM payload"
+            );
+            layers.push(layer(&delta).await);
+            let stack = overlaybd::index_file::open_files_ro(&layers).await.unwrap();
             assert_eq!(
                 stack.read_at(0, 16384).await.unwrap().as_ref(),
                 expected.as_slice()

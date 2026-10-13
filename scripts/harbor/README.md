@@ -101,6 +101,47 @@ verifier 安装/执行。累计输入 34,006 tokens（含缓存命中 21,248）�
 `--terminal-bench-manifest`；manifest 的格式相同，文件集合覆盖两个完整
 任务目录。镜像下载使用具有 Docker socket 权限的非 root 账号。
 
+## 推理期间 pause/resume（Dragonball）
+
+Terminus-2 模型评测可在现有 `run_lab.py` 或 `run_campaign.py` 命令中增加
+`--pause-taskvm-during-inference`。开关默认关闭，仅支持宿主机运行的
+`DashScopeTerminus2`，不用于 Computer Use 或在 guest 内运行的 Coding Agent。
+例如在已冻结全任务格式的单任务准备目录上使用 `--model qwen3.8-flash`
+与该开关；共享模板复用仍需原有 `--oss-env --shared-templates reuse`
+配置，`run_lab.py` 还需 `--template-start`。
+
+Harbor/Terminus-2 与模型客户端运行在宿主机；tmux、任务命令和 verifier
+运行在 VM。每次模型调用先 `pause()`，模型返回后 `resume()`，再执行工具。
+适配器调用 AgentENV 同 ID pause/resume API，恢复后更新 data-plane token。
+包装已有 LLM 实例的 `call()`，覆盖 Chat 主推理、总结 subagent、短总结和
+fallback；不修改固定 Harbor 源码，也不改变原始评分、任务预算或重试配置。
+这只是模型等待期间释放 VM 资源，Harbor 并发槽仍由原 trial 占用。
+
+暂停失败或结果不确定时不发起模型请求，仍尝试恢复；模型失败或取消也在
+`finally` 中恢复。恢复请求有适配器原有请求截止时间，恢复失败向调用方报错。
+服务端收到恢复请求时若仍在 `Pausing`，先等待该暂停结束，再恢复或确认已回到
+`Running`；沿用已有 60 秒状态转换等待上限。客户端分开记录确认暂停与待恢复
+状态，发送恢复前撤销暂停确认；恢复响应丢失时，下次推理重新请求 pause，
+收到成功响应后才访问模型，直接重试 resume 也仍会发送请求。
+guest 后台进程与 VM 一起冻结；对依赖后台计算持续推进的任务，应评估这一
+执行语义是否适用。`autoPause` 仍只控制 sandbox TTL 到期后的休眠/删除。
+
+`test_pause_resume_http.py` 使用本机 HTTP 服务验证捕获仍进行时的客户端取消、
+HTTP 超时与恢复响应断开；通过真实适配器请求与推理包装，断言未暂停时不推理、
+恢复后仍为同 ID 并刷新 token。夹具模拟 VM 状态，不访问模型或启动真实 VM；
+服务端取消安全和状态等待另由 Rust orchestrator 回归覆盖。
+
+每个 trial 的 `agent/pause-resume.jsonl` 记录 `pause`、`infer`、`resume`
+耗时、请求序号和异常类型，不包含模型内容或凭据。启用开关时，传输预检
+额外检查同 ID 恢复、后台进程 PID/启动时间和文件内容，并将休眠与唤醒
+耗时写入 `transport-probe/checks.json`。最小验证及限制见
+[集成记录](../../HARBOR_INTEGRATION.md)。
+Harbor 原生 Agent 和外层 API 请求计时包含生命周期包装开销；单独分析模型
+请求往返时使用 `infer` 行，不把休眠或恢复算作模型服务延迟。
+
+实现参考 [harbor-agentenv](https://gitcode.com/ttcoding/harbor-agentenv)
+提交 `ee1526f574d2a9488cc5c3f3023c9e2bb6b82ad4` 的宿主机推理边界。
+
 ## Computer Use 小型任务
 
 使用同一固定 Harbor 提交中的
@@ -438,6 +479,9 @@ CIFAR 保留原始 HTTP URL，经测试代理读取同一归档；uv 安装器�
 
 候选冻结工具从已检查的基线复制依赖文件，并覆盖显式选中的驱动与配置示例：
 
+冻结前核对 `scripts/harbor/*.py` 的受管文件集合；旧基线中已被当前仓库删除的
+模块会被拒绝，错误列出文件名，且不会创建候选或删除旧基线证据。
+
 ```bash
 python scripts/harbor/freeze_driver.py \
   --baseline /absolute/path/to/previous-candidate/source \
@@ -473,6 +517,28 @@ python scripts/harbor/freeze_driver.py \
 保留为证据。源进程后续写入不会改变 final。发布期间还需要一份文件副本的磁盘空间。
 准备与测试仅使用 final。固定值来自已核验的生产端回执，不从正在传输的文件计算。
 优先用两机 VPC 地址传送数据，SSH 公网地址用于控制；校验标准相同。
+
+需要将传输和检查串联时，使用目标测试账号的固定 Python 运行下列入口。
+`--transfer` 放在最后，接收命令与参数数组；SSH 凭据沿用测试账号配置。
+SHA 与字节数仍来自已核验的生产端回执：
+
+```bash
+/path/to/venv/bin/python -B scripts/harbor/delivery_checks.py \
+  --partial /isolated/run/candidate.part --archive /isolated/run/candidate.tar.gz \
+  --candidate /isolated/run/candidate --receipts /isolated/run/receipts \
+  --sha256 FROZEN_SHA256 --bytes FROZEN_BYTE_COUNT --timeout 900 \
+  --transfer scp producer:/verified/candidate.tar.gz /isolated/run/candidate.part
+```
+
+入口复用既有阶段执行器，依次等待传输成功退出、发布校验副本、安全解包、核验
+完整候选清单，再以同一解释器执行 `check_tools.py`。传输非零、超时或校验失败
+都会阻止后续检查；阶段日志和原始退出码保存在 `receipts/`。子命令的 stdin 关闭，
+不会读取控制器输入。每次使用新的路径，失败包和候选保留；本入口不启动 VM、
+不替代 host lease 或宿主恢复。发布及解包需要额外磁盘空间。
+
+Rust 本地与远程检查从仓库根目录读取 `rust-toolchain.toml` 的固定版本，目前为
+1.98.1；普通 `make test-unit` 也使用所选 `AENV_TEST_STATE_DIR` 下的 home/run，
+并传入 `AENV_TEST_DEPS_PATH`。本轮按用户要求保持 GitHub Actions 配置原样。
 
 准备入口支持显式的本机缓存清单，见 [示例](examples/cached-archives.example.json)：
 示例路径、全零 SHA 和字节数均须替换为当前宿主已核验归档的实际值。
