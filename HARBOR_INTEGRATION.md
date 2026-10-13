@@ -1,10 +1,228 @@
 # Harbor 集成与评测经验
 
-更新：2026-10-11。范围：AgentENV / Dragonball、Harbor、Terminal-Bench 2.0 与 Linux Computer Use。操作入口见 [scripts/harbor/README.md](scripts/harbor/README.md)。本文区分已验证结果、原因推断与待完成项。
+更新：2026-10-13。范围：AgentENV / Dragonball、Harbor、Terminal-Bench 2.0 与 Linux Computer Use。操作入口见 [scripts/harbor/README.md](scripts/harbor/README.md)。本文区分已验证结果、原因推断与待完成项。
 
 2026-10-11 的过程与效率复盘见[本轮复盘](#harbor-集成过程与研发效率复盘2026-10-11)。
 当前工程改进状态见[执行记录](#复盘改进执行2026-10-11)；下文按日期保留历史评测记录，
 不作为当前任务正在运行的证明。
+
+## Dragonball 推理期间 pause/resume 最小验证（2026-10-13）
+
+已在现有 Harbor 自定义环境与 `DashScopeTerminus2` 中增加可选
+`--pause-taskvm-during-inference`，默认关闭。参考
+[harbor-agentenv](https://gitcode.com/ttcoding/harbor-agentenv) 提交
+`ee1526f574d2a9488cc5c3f3023c9e2bb6b82ad4` 的宿主机推理边界，包装固定
+Harbor 0.24.0 的 LLM `call()`，覆盖主推理与总结路径。Terminus-2 与模型
+客户端留在宿主机；仅 tmux/任务所在 VM 暂停，同 ID 恢复并更新访问 token。
+取消或暂停结果不确定时仍尝试恢复，模型响应须等恢复完成才交给工具执行。
+支持范围和计时口径见 [驱动指南](scripts/harbor/README.md#推理期间-pauseresumedragonball)。
+
+本次只测 **Dragonball**。B 机 `147.139.165.124` 复用既有运行时和合格
+OSS 模板，原始 Terminal-Bench 2.0 `log-summary-date-ranges`，4 vCPU/8 GiB、
+单并发、`qwen3.8-flash`、一次 model trial、零 trial 自动重试。原生 verifier
+得 **1.0**，无 trial 异常；7 次模型调用边界共 21 条生命周期事件全部成功。
+真实传输预检验证同 ID、后台进程 PID/启动时间和文件内容在休眠后保留。
+全部 sandbox 删除、隔离 Lab 清理及宿主恢复通过；观测到的 VMM 均为
+非 root UID 999 的 `aenv-dragonball`。未修改 Rust/Go 运行时、任务、解答或评分器。
+
+| 本轮计时 | 实测 |
+| --- | ---: |
+| 模型 trial 首次休眠 | 49.999 秒 |
+| 后续 6 次休眠 | 0.264–0.460 秒，中位数 0.292 秒 |
+| 7 次唤醒 API | 0.348–0.373 秒，中位数 0.368 秒 |
+| 7 次模型调用往返合计 | 47.713 秒 |
+| 控制器跨度，含预检、模型、verifier 与清理 | 233.180 秒 |
+
+独立预检的休眠/唤醒为 46.809/0.288 秒。上述唤醒行是 API 计时，首条命令
+和进程/文件检查另行验证；本轮不提供唤醒至任意应用就绪的分位数。
+仅一项任务，不代表全 Terminal-Bench 通过、RL 吞吐提升或生产 SLO。
+首轮休眠明显较慢，尚未完成原因归因；不能用后续中位数掩盖它，也不能将
+1 GiB 旧测量推广至本轮 8 GiB。Harbor 外层模型请求计时包含 pause/resume
+包装，单独的模型往返使用 `pause-resume.jsonl` 中的 `infer` 行。
+
+最终候选 v4 的 228 项 Harbor 工具检查通过。首次冻结基线残留当前仓库已移除
+的 `test_runtime_dirs.py`，两项检查失败；调整本次候选测试集合后通过。
+首次真实尝试的 VM 预检通过，但 CLI 在模型请求前拒绝未声明的 pause 参数；
+补齐 Agent `options_model` 与前置校验测试后重新执行，保留首次失败和清理回执。
+历史测试目录和共享模板保留，未执行历史 payload 回收。
+
+证据：远程 `/var/tmp/hb1008/pause-resume-20261013/smoke-v2/`，本地
+`/tmp/agentenv-harbor-pause-20261013/validation-summary.json` 和
+`smoke-evidence.tar.gz`（SHA-256
+`0433831051482980d89091c48db89c3282c8e301a17b88de2815001d3a54ba06`）。
+归档包含原生结果、模型轨迹、切换记录和宿主清理回执；模型凭据扫描无命中。
+最终候选 tar SHA-256 为
+`e87f77dea6ce33d0c8065ab27cab4aebcd47b08555d8b584e9055b991518913d`。
+
+## pause/resume 取消与响应丢失修复（2026-10-13）
+
+已修复审查中的两个 P2。服务端 `resume_sandbox_inner` 遇到 `Pausing` 时，
+复用既有状态转换等待机制，等待暂停完成，再恢复或确认已经回到 `Running`；
+沿用 60 秒等待上限。客户端将确认暂停 `_paused` 与待恢复 `_resume_pending`
+分开：pause 成功应答后才确认暂停，发送 resume 前撤销确认，成功核对同 ID
+并刷新 token 后才清除待恢复状态。丢失恢复响应时，下次推理会重新请求 pause；
+直接重试 resume 也会再次发送请求。
+
+原实现先复现：客户端测试断言模型在运行中的 VM 上推理，服务端测试返回
+`InvalidSandboxState(Pausing)`。修复后，非 root UID999 的 230 项 Harbor 工具
+检查与 156 项 Rust orchestrator 测试全部通过；其中新增两项服务端回归验证
+暂停请求被取消后的成功/失败恢复，以及恢复等待请求自身超时后仍完成后台恢复。
+Rust 使用 Dragonball feature 编译，格式与 workspace 全 target/feature clippy
+通过；clippy 沿用 Rust 1.98.1。上述计数包含回归用例，不重复计入单独重跑。
+本轮使用模拟 VM 后端验证真实 orchestrator 状态机，未新增真实 VM 或模型 trial。
+
+证据：本地 `/private/tmp/agentenv-pause-recovery-20261013/`，服务端测试与检查
+位于 A 机 `/var/tmp/pr13/`，Harbor 冻结驱动与检查位于 B 机
+`/var/tmp/hb1008/pause-recovery-green/` 和 `pause-recovery-python.log`。
+本轮未提交或推送，也未替换评测环境的服务器二进制。
+
+## 本轮复盘改进实现（2026-10-13）
+
+已落实 HTTP 故障回归、交付与检查串联、普通单元测试状态隔离、固定 Rust
+工具链和冻结文件集合校验。按用户后续要求，`.github` 下的 Actions 与工作流
+没有变更；Rust 本地/远程检查采用仓库声明的 1.98.1，未运行或声称通过托管 CI。
+
+`test_pause_resume_http.py` 通过真实 HTTP 客户端与适配器验证取消、请求截止和
+恢复响应断开；服务端夹具保留独立捕获任务，模型调用断言服务器确实暂停。
+新测试在旧适配器上先复现“运行中的 VM 上推理”，再在当前候选通过。
+`delivery_checks.py` 复用现有阶段执行器，等待传输成功退出，按生产端固定
+SHA/字节数发布独立副本，再安全解包、检查 manifest 并运行 Harbor 工具检查。
+非零退出、超时、截断、错误 manifest 和不安全归档均有回归；子命令 stdin
+关闭，原始阶段退出码与失败现场保留。操作见
+[交付入口](scripts/harbor/README.md#交付缓存准备与阶段检查)。
+
+最终冻结候选在 B 机由 UID999 完成真实 loopback HTTP 传输与完整检查：
+240 项 Harbor、32 项 regression tools、17 项阶段执行器测试全部通过，无 skip。
+158 个冻结输入在测试前后核验，当前实现与回归源码摘要和工作区一致；临时
+HTTP 服务关闭。本轮未启动真实 VM 或模型请求，也未替换服务器二进制。
+本地 macOS 同样通过 17 项阶段检查，32 项 regression tools 中仅一项 Linux
+身份检查 skip，未计作通过；Rust 1.98.1 格式检查通过。
+
+首个候选沿用基线的旧阶段测试文件，远程只执行 16 项；补齐冻结覆盖与先失败
+后通过的残留测试后，重建最终候选并完整复验，首轮记录保留。
+最终候选 SHA256：
+`9f3b606624b932f204daa309db6e1eb65ffb35df3db35c09aaa23558af45b0ad`。
+证据：本地 `/private/tmp/agentenv-retro-impl-20261013/`；远程
+`/var/tmp/hb1008/retro-impl-20261013-v2/`，早期候选在同名无 `-v2` 的目录。
+未提交或推送。
+
+## Dragonball 增量内存零区间优化（2026-10-13）
+
+Dragonball 捕获已统一使用现有 `compact_to_sparse` 写层入口。存在模板或恢复
+base 时仍只读取 `changed_ranges`，边读取边检查 4 KiB 全零页；全零区间保存为
+显式 `zeroed` 索引，不写 RAM 数据载荷，并覆盖父层可能存在的非零内容。
+未变化页继续继承父层，清零后重新写入的非零页按实际 RAM 内容保存。
+本地层仍为 RAW，没有更改 balloon/reporting、dirty 基底、快照格式或协议，
+也没有增加配置开关。普通 Firecracker 捕获仍走原有写层入口。
+
+已有增量栈测试增加数据载荷大小断言及多层零/重写覆盖：旧 writer 在零页载荷
+断言上失败（8,192 字节而非 4,096），新 writer 通过；空增量不读取 clean 页。
+非 root Linux release 检查通过：Dragonball 60 项、共享内存 writer 4 项、
+sparse compaction 3 项；writer 的特权 ENOSPC 测试保持 ignored，未计为通过。
+完整 workspace/all-targets/all-features 及 DB-only clippy 在 Rust 1.98.1 下
+通过，格式检查通过。首次 Rust 1.99 clippy 对既有代码报告弃用和新增 lint，
+日志保留；未以修改无关代码消除它们。
+
+B 机真实 Dragonball 检查均通过：清零后重写、恢复与 fork 隔离；8 GiB 跨 GPA
+hole 的增量镜像与同一 held token 下独立完整 RAM 导出逐字节相等；发布失败后
+保留相对启动基底的累计 dirty 数据。复用已冻结 runner/kernel/tools/daemon，
+server 与 harness 由本次源码以 UID 999 构建；接收端校验 SHA-256 后运行。
+三个用例的独立 namespace/cgroup/设备及临时宿主修改均完成清理。
+
+Terminal-Bench 2.0 `regex-log` 的 Flash 复测仍为 4 vCPU/8 GiB、单并发，
+原始超时、一次 trial、零 trial 自动重试。新 server 摘要使原共享模板 key
+失效；本轮用已合格依赖单独 prepare 该任务的新身份模板，随后模型阶段命中
+它的缓存。没有重建全部任务模板。Oracle=1、nop=0，均无异常。
+
+| 首次推理休眠指标 | 优化前 Flash 观测 | 优化后 Flash 观测 |
+| --- | ---: | ---: |
+| dirty 输入字节数 | 8,319,598,592 | 8,319,086,592 |
+| 新增内存层文件大小 | 7.748 GiB | 228.281 MiB |
+| pause API | 50.670 秒 | 5.284 秒 |
+| 读 RAM、检测零与写层阶段 | 50.364 秒 | 4.971 秒 |
+
+优化后新增层实际分配空间也是 239,370,240 字节，并非稀疏文件的虚拟长度。
+后续 17 轮 pause 为 0.300–0.412 秒，新层为 13.211–31.062 MiB。
+全部 18 轮推理边界和 6 轮真实预检 pause/resume 成功，无运行异常，宿主恢复
+通过。Flash 原生模型得分为 **0**：正则额外匹配了五条应排除的日志，
+`test_regex_matches_dates` 未通过；不把推理链路验证成功当作任务得分成功。
+这是一项任务的两轮观测，新模板按运行时身份独立准备，不是生产 SLO 或完整
+benchmark 结论。初次控制 CLI 退出和旧模板缓存未命中均单独保留。
+
+证据：远程 `/var/tmp/hb1008/delta-zero-20261013/`，本地
+`/tmp/agentenv-delta-zero-20261013/`。server SHA-256 为
+`7f11d731141df321a5fbc2617383685b22defff0871a04a39a8b6981ab815245`，
+构建来源、接收端摘要、原生结果、按当前内存配置顶层 inode 定位的大小和
+阶段计时均保留；Flash 归档凭据扫描通过。
+
+随后按用户要求换用 `qwen3.8-max`，复用同一新 server、原始任务、资源规格和
+已通过的 Oracle/nop 对照，新模板缓存命中；独立目录 `model-max-v1`，一次
+trial、零自动重试。原生模型得分 **1.0**、无异常，7 次推理边界及 6 次预检
+pause/resume 全部成功，宿主恢复通过。首轮仍为增量，dirty 输入
+8,319,336,448 字节，新层 254.625 MiB（实际分配空间相同），pause 5.681 秒，
+读 RAM/检测零/写层阶段 5.374 秒；后续 6 轮 pause 0.298–0.395 秒，新层
+13.516–25.211 MiB。Flash 的零分记录保留，Max 的通过不改写它。
+Max 大小与计时分别保存为 `size-summary-max.json`、`capture-sizes-max.csv`、
+`capture-timings-max.txt`，归档独立于 Flash。
+最终归档 `evidence-max.tar.gz` SHA-256 为
+`a41f1c5644f78e6eb296bd62fad17fc00a3e42dd8012149b3b0d8c8dce0ee230`，
+凭据扫描、下载后摘要及逐文件 manifest 核对通过；汇总在本地
+`validation-summary.json`，原生 Flash/Max 得分与异常分开保存。
+
+## 首轮休眠大小诊断与第二个用例（2026-10-13）
+
+仅 Dragonball、同一 B 机与冻结运行时，仍为 4 vCPU/8 GiB、单并发。
+新增 Terminal-Bench 2.0 `regex-log`，`qwen3.8-flash` 一次 trial，原生得分
+**1.0**、无异常，24 次推理边界全部完成 pause/resume。另对原任务
+`log-summary-date-ranges` 做无模型重放：两个新 sandbox 各三次 pause/resume，
+Oracle=1、nop=0，全部 VM、设备和宿主临时修改已清理。
+诊断候选沿用通过的 228 项工具检查；统计代码仅放在独立临时候选，未修改
+Rust/Go、快照格式、原任务或评分器。
+
+在每次 pause 完成、resume 前，对新增 `overlaybd.commit`、磁盘层、VM 状态及
+内存 `image.json` 记录文件长度、`st_blocks` 和 inode。继承层的硬链接单独记录，
+按 inode 去重，以下表格只统计本次新生成的内存层，不是整个快照链或配置的
+8 GiB 虚拟内存容量。
+
+| 场景 | pause API | 新增内存层文件大小 |
+| --- | ---: | ---: |
+| `regex-log` 模型 trial 首轮 | 50.670 秒 | 7.748 GiB |
+| `regex-log` 后续 23 轮 | 0.265–0.352 秒 | 8.934–30.074 MiB |
+| 原任务新 VM A 首轮 | 35.954 秒 | 5.287 GiB |
+| 原任务新 VM B 首轮 | 16.743 秒 | 2.673 GiB |
+| 原任务两 VM 的后续 4 轮 | 0.227–0.239 秒 | 5.855–8.895 MiB |
+
+大层的实际分配空间与文件大小近似相等，并非只报稀疏文件的虚拟容量。
+原任务两次首轮各抽样 64 个分散的 4 KiB 块，63 个全零；`regex-log` 首轮
+64/64 块全零。仅是抽样，不能声称逐字节验证整个文件全零。
+
+**增量机制从首轮就启用。** 本轮 36 次捕获日志全部 `incremental=true`，
+内存 lower 链在三轮预检中从 2→3→4。源码在存在 base 时只遍历
+`changed_ranges`；变化页包含被清零的页，RAW 增量层实际写入这些零字节，
+以覆盖父层可能存在的非零内容，不能直接当作稀疏空洞跳过。
+`regex-log` 首轮变化范围为 8,319,598,592 字节，写内存层 50.364 秒；
+内存映射完成到写入完成约 50.366 秒，之后磁盘阶段约 5.3 ms。该轮新增磁盘
+层约 105.7 MiB，VM 状态约 89 KiB。慢点已定位到大量增量内存数据的写入，
+父层配置构建、磁盘封存不能解释这 50 秒。
+
+源头的最强线索是启用的 virtio-balloon free-page reporting：qualified Kata
+`9e41795fea9109bc1acf7b1f6d6b878cfff7b72e` 的回收路径把私有 RAM 替换为
+匿名零页并标记 software dirty，捕获合并这些变化页。大量零块的抽样与该路径
+一致，但本轮尚未进行禁用 reporting 的独立 A/B，不能声称已独立归因全部零页。
+
+首轮慢可复现，但不是固定 50 秒，也不是“第一次全量、以后才增量”。
+`regex-log` 两个预检 VM 首轮分别 5.102 秒/912.7 MiB 和 0.284 秒/20.2 MiB；
+其中一个 VM 第三轮仍达 4.978 秒/899.9 MiB。耗时随当前变化范围而变。
+后续优化方向是减少零数据的实际写入，同时保留显式覆盖父层的语义；
+本轮只诊断和验证，没有改动内存回收或快照写入策略。
+
+证据：远程 `/var/tmp/hb1008/pause-sizes-20261013/`，本地
+`/tmp/agentenv-harbor-pause-sizes-20261013/size-summary.json`、
+`evidence/capture-sizes.csv`、`evidence/capture-timings.txt` 与原生 trial/清理回执。
+归档 `size-evidence.tar.gz` SHA-256 为
+`7b6e644f690a578779a954a1e77e2fd20fd293f792d7f721f75fca8d72c29b1e`，
+下载后已核对；模型与 OSS 凭据扫描无命中。原 50 秒症状的快速诊断命令保留在
+临时 `diagnostic-controls/check_repro.py`，10 秒及倍数阈值只用于诊断，不是产品 SLO。
 
 ## 当前评测目标与范围
 

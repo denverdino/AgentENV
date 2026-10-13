@@ -7,6 +7,17 @@ from freeze_driver import freeze
 
 
 class FreezeDriverTests(unittest.TestCase):
+    def test_deleted_harbor_module_is_rejected_before_candidate_creation(self):
+        repository = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory);baseline = root / 'baseline'
+            old = baseline / 'scripts/harbor/test_runtime_dirs.py'
+            old.parent.mkdir(parents=True);old.write_text('raise RuntimeError("stale test")\n')
+            with self.assertRaisesRegex(ValueError, 'test_runtime_dirs.py'):
+                freeze(baseline, repository, root / 'candidate')
+            self.assertFalse((root / 'candidate').exists())
+            self.assertEqual(old.read_text(), 'raise RuntimeError("stale test")\n')
+
     def test_private_env_in_baseline_is_rejected_before_output_is_created(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory);baseline = root / 'baseline';baseline.mkdir()
@@ -57,6 +68,8 @@ class FreezeDriverTests(unittest.TestCase):
             shutil.copytree(repository / 'scripts/tests', baseline / 'scripts/tests')
             old_lab = baseline / 'scripts/tests/dragonball_m4_lab.py'
             old_lab.write_text('raise RuntimeError("stale runtime")\n')
+            old_campaign_test = baseline / 'scripts/tests/test_dragonball_m4_campaign.py'
+            old_campaign_test.write_text('raise RuntimeError("stale campaign tests")\n')
             candidate = root / 'candidate'
             freeze(baseline, repository, candidate)
             verify_candidate(candidate)
@@ -72,6 +85,8 @@ class FreezeDriverTests(unittest.TestCase):
             self.assertEqual(runner.read_bytes(), (repository / 'scripts/run-with-capabilities.sh').read_bytes())
             self.assertEqual((tests / 'dragonball_m4_lab.py').read_bytes(),
                              (repository / 'scripts/tests/dragonball_m4_lab.py').read_bytes())
+            self.assertEqual((tests / 'test_dragonball_m4_campaign.py').read_bytes(),
+                             (repository / 'scripts/tests/test_dragonball_m4_campaign.py').read_bytes())
 
 
 if __name__ == '__main__':

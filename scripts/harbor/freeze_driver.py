@@ -24,6 +24,11 @@ def freeze(baseline, repository, output, *, controls=()):
     paths = [p for p in baseline.rglob('*') if p.is_file() or p.is_symlink()]
     if any(p.is_symlink() for p in paths) or forbidden([p.name for p in paths]):
         raise ValueError('Candidate baseline contains private env files or symlinks')
+    current = {path.name for path in (repository / 'scripts/harbor').glob('*.py')}
+    obsolete = sorted(path.name for path in (baseline / 'scripts/harbor').glob('*.py')
+                      if path.name not in current)
+    if obsolete:
+        raise ValueError('Candidate baseline contains deleted Harbor modules: ' + ', '.join(obsolete))
     if output.with_suffix('.tar.gz').exists():
         raise FileExistsError('Candidate archive already exists')
     output.mkdir()
@@ -44,6 +49,10 @@ def freeze(baseline, repository, output, *, controls=()):
               'tools-image/Makefile', 'tools-image/README.md',
               'tools-image/patches/envd-immediate-mmds.patch',
               'scripts/harbor/material-inputs.example.json']
+    names += ['scripts/tests/dragonball_m4_campaign.py', 'rust-toolchain.toml',
+              'scripts/tests/test_dragonball_m4_campaign.py',
+              'scripts/tests/test_dragonball_regression_environment.py',
+              'scripts/tests/test_dragonball_regression_toolchain.py']
     for name in names:
         if (repository / name).is_symlink():
             raise ValueError('Candidate source must not use symlinks')

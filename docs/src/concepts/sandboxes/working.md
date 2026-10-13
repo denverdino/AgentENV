@@ -93,6 +93,11 @@ aenv resume <sandbox-id> --timeout 600
 `aenv resume` accepts `--timeout <seconds>`, which defaults to 300 seconds and
 sets the new TTL from resume time.
 
+A resume request received while a pause is still in progress waits for that
+pause to finish before restoring the sandbox. This also applies when the pause
+caller's request was cancelled or timed out while capture continued. The wait
+uses the existing 60-second lifecycle transition timeout.
+
 By default, the sandbox automatically pauses when it reaches its TTL. See
 [Auto-Eviction](./auto-eviction.md) for how the deadline is set and how to delete
 instead of pause.

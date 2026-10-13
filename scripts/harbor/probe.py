@@ -116,7 +116,26 @@ print(json.dumps({'egress':egress,'local':local}))
     checks["directory_and_binary_fidelity"] = True
 
 
-async def run_probe(config, output):
+async def check_pause_resume(environment, checks):
+    sandbox_id = environment.sandbox['sandboxID']
+    process = await environment.exec(
+        'sleep 600 >/dev/null 2>&1 & pid=$!; printf "%s " "$pid"; '
+        'awk \'{print $22}\' /proc/$pid/stat', user='root', timeout_sec=5)
+    assert process.return_code == 0, process
+    pid, start_time = process.stdout.split()
+    for phase in ('pause', 'resume'):
+        started = time.monotonic()
+        await getattr(environment, phase)()
+        checks[phase + '_seconds'] = time.monotonic() - started
+    assert environment.sandbox['sandboxID'] == sandbox_id
+    result = await environment.exec(
+        f'printf "%s " "$E2B_SANDBOX_ID"; awk \'{{print $22}}\' /proc/{int(pid)}/stat; '
+        f'kill {int(pid)}', user='root', timeout_sec=5)
+    assert result.return_code == 0 and result.stdout.split() == [sandbox_id, start_time], result
+    checks['pause_resume_identity_and_process'] = True
+
+
+async def run_probe(config, output, *, pause_resume=False):
     output.mkdir()
     task = probe_task(config)
     startup = Task(task).config.environment.build_timeout_sec
@@ -142,6 +161,12 @@ async def run_probe(config, output):
         save()
         async with asyncio.timeout(TRANSPORT_TIMEOUT_SEC):
             await check_transport(environment, config, output, checks)
+            if pause_resume:
+                await check_pause_resume(environment, checks)
+                downloaded = output / 'after-resume'
+                await environment.download_dir('/tmp/harbor-tree', downloaded)
+                assert (downloaded / 'binary').read_bytes() == bytes(range(256))
+                checks['pause_resume_files'] = True
         checks['phase_seconds']['transport'] = time.monotonic() - started
         checks['passed'] = True
     except BaseException as error:
@@ -172,7 +197,8 @@ async def run_probe(config, output):
 
 async def main():
     path = Path(sys.argv[1])
-    checks = await run_probe(json.loads(path.read_text()), path.parent / "transport-probe")
+    checks = await run_probe(json.loads(path.read_text()), path.parent / "transport-probe",
+                             pause_resume='--pause-resume' in sys.argv[2:])
     print(json.dumps(checks))
 
 

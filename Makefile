@@ -153,8 +153,8 @@ test-vmm-unit: check-dragonball-revision
 	$(CARGO) test -p agentenv-vmm-protocol -p agentenv-dragonball-runner --locked
 
 test-unit: test-vmm-unit
-	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
-	$(CARGO) test -p aenv --bin aenv
+	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap --lib
+	$(CAPABILITY_TEST_ENV) $(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh

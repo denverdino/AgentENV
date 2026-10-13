@@ -115,14 +115,17 @@ def validate_benchmark_results(results, model=False, task_names=BENCHMARK_TASKS,
             raise ValueError('Invalid benchmark score or trial exception')
 
 
-def model_agent_config(model):
+def model_agent_config(model, pause_taskvm_during_inference=False):
     # Harbor prioritizes registered names over import_path: omit name so the
     # credential-safe subclass is selected. Its name() remains 'terminus-2'.
-    return {'import_path': 'dashscope_agent:DashScopeTerminus2', 'model_name': 'openai/' + model,
+    config = {'import_path': 'dashscope_agent:DashScopeTerminus2', 'model_name': 'openai/' + model,
         'kwargs': {'api_base': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
             'enable_summarize': False,
             'model_info': {'max_input_tokens': 1000000, 'max_output_tokens': 4096},
             'llm_call_kwargs': {'extra_body': {'enable_thinking': False}, 'max_tokens': 4096}}}
+    if pause_taskvm_during_inference:
+        config['kwargs']['pause_taskvm_during_inference'] = True
+    return config
 
 
 def computer_agent_config(model):
@@ -138,7 +141,8 @@ def evaluation_agents(args, computer=False):
     controls = ([{'import_path': 'computer_control:ComputerCalibrationControl'}, {'name': 'nop'}]
                 if computer else [{'name': 'oracle'}, {'name': 'nop'}])
     return ([] if args.model_only else controls) + (
-        [computer_agent_config(args.model) if computer else model_agent_config(args.model)] if args.model else [])
+        [computer_agent_config(args.model) if computer else model_agent_config(
+            args.model, getattr(args, 'pause_taskvm_during_inference', False))] if args.model else [])
 
 
 def run_material_preflight(args, task_names, downloads):
@@ -203,6 +207,8 @@ def _main(argv=None):
     parser.add_argument("--run-user", default="aenv")
     parser.add_argument("--inside", action="store_true")
     parser.add_argument("--model", choices=['qwen3.8-flash', 'qwen3.8-max'])
+    parser.add_argument('--pause-taskvm-during-inference', action='store_true',
+                        help='Pause Terminus-2 sandbox during each model call; resume before tools')
     parser.add_argument('--model-only', action='store_true',
                         help='Complete a full-suite task previously stopped by its Oracle diagnostic')
     parser.add_argument('--dependencies', type=Path, help='Verified immutable dependency binding')
@@ -246,6 +252,8 @@ def _main(argv=None):
     if args.model_only and not (full and args.model):
         parser.error('--model-only requires a frozen full-suite task and --model')
     computer = prepared.get('computer_use', False)
+    if args.pause_taskvm_during_inference and (not args.model or computer):
+        parser.error('--pause-taskvm-during-inference requires a Terminus-2 model evaluation')
     task_names = COMPUTER_TASKS if computer else BENCHMARK_TASKS if benchmark else TASKS
     if full:
         source, entries = verify_delivery(Path(full))
@@ -500,7 +508,8 @@ def _main(argv=None):
             def transport_probe():
                 probe = node.run(["env", "AENV_API_KEY=" + API_KEY,
                     str(args.harbor.parent / "python"), str(Path(__file__).with_name("probe.py")),
-                    str(config_path)], timeout=probe_outer_timeout(config))
+                    str(config_path), *(['--pause-resume'] if args.pause_taskvm_during_inference else [])],
+                    timeout=probe_outer_timeout(config))
                 report["transport_probe"] = json.loads(probe.stdout)
 
             if args.shared_templates != 'reuse':
@@ -546,7 +555,8 @@ def _main(argv=None):
             if args.model_only:
                 phases = []
             if args.model and model_task_names:
-                phases.append(('dragonball-model', [computer_agent_config(args.model) if computer else model_agent_config(args.model)]))
+                phases.append(('dragonball-model', [computer_agent_config(args.model) if computer else model_agent_config(
+                    args.model, args.pause_taskvm_during_inference)]))
             report['harbor_exit_codes'] = {}
             for job_name, agents in phases:
                 phase_tasks = model_task_names if job_name == 'dragonball-model' else task_names

@@ -55,6 +55,15 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_plan()
 
+    def test_child_does_not_consume_controller_stdin(self):
+        self.plan['steps'][0] = self.step('one',
+            'from pathlib import Path; import sys; Path("count").write_text(sys.stdin.read())')
+        path = self.root / 'plan.json';path.write_text(json.dumps(self.plan))
+        result = subprocess.run([sys.executable, campaign.__file__, 'run', '--plan', str(path),
+            '--output', str(self.output)], input=b'controller input', capture_output=True, env=self.env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'count').read_text(), '')
+
     def test_changed_input_plan_and_environment_rejected(self):
         self.run_plan()
         self.input.write_text('changed')
