@@ -311,6 +311,21 @@ fn runtime_envelope_rejects_identity_topology_and_short_memory() {
 }
 
 #[test]
+fn runtime_envelope_restores_other_builds_without_rewriting_provenance() {
+    let source = machine();
+    let mut envelope = capture_envelope(raw_state(), &source, 16 * 1024 * 1024).unwrap();
+    envelope.identity.runner_build_id = format!("sha256:{}", "b".repeat(64));
+    envelope.identity.dragonball_revision = "c77812d669737c11cb16321827acc1c79bf065f3".into();
+    let original = serde_json::to_vec(&envelope).unwrap();
+    let restored = restore_state(&envelope, &source, 16 * 1024 * 1024).unwrap();
+    assert_eq!(serde_json::to_vec(&envelope).unwrap(), original);
+    assert_eq!(
+        restored["vcpu_states"],
+        envelope.upstream_state["vcpu_states"]
+    );
+}
+
+#[test]
 fn runtime_envelope_rejects_unknown_state_fields_and_device_tampering() {
     let source = machine();
     for pointer in [

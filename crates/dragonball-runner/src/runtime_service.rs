@@ -3,7 +3,7 @@ use agentenv_vmm_protocol::{runtime::*, validate_runtime_request};
 use std::{path::Path, time::Duration};
 
 pub const RUNTIME_PROFILE: &str = RUNTIME_FEATURE_PROFILE;
-pub const RESTORE_ABI: &str = concat!("dragonball-held-cow-v2@", env!("DRAGONBALL_REVISION"));
+pub const RESTORE_ABI: &str = RESTORE_ABI_ID;
 
 /// The adapter has positively confirmed a usable VM state, not merely timed out.
 /// Outputs from a failed export can still be partial and must never be published.
@@ -27,7 +27,7 @@ pub fn restore_identity(
         virtualization_mode: "kvm".into(),
         runner_build_id: env!("RUNTIME_BUILD_ID").into(),
         dragonball_revision: env!("DRAGONBALL_REVISION").into(),
-        snapshot_format_epoch: 2,
+        snapshot_format_epoch: SNAPSHOT_FORMAT_EPOCH,
         restore_abi_id: RESTORE_ABI.into(),
         cpu_policy_id: "host-default".into(),
         device_profile_id: RUNTIME_FEATURE_PROFILE.into(),
@@ -265,7 +265,8 @@ impl<V: RuntimeVmm> RuntimeService<V> {
             }
             RuntimeCommand::LoadHeld(input) if self.phase == RuntimePhase::Configured => {
                 let config = self.machine.as_ref().expect("configured machine");
-                if input.probe_only || input.identity != config.identity {
+                if input.probe_only || !input.identity.is_restore_compatible_with(&config.identity)
+                {
                     return Err(runtime_error(
                         "snapshot_preflight_error",
                         "probe or incompatible snapshot",

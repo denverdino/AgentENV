@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 pub const QUALIFIED_DRAGONBALL_REVISION: &str = "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e";
 pub const RUNTIME_FEATURE_PROFILE: &str = "db-virtio-blk-net-balloon-v2";
+pub const SNAPSHOT_FORMAT_EPOCH: u16 = 2;
+/// Bump when serialized state or restore semantics become incompatible.
+/// Source revisions and build fingerprints are provenance, not ABI versions.
+pub const RESTORE_ABI_ID: &str = "agentenv-dragonball-snapshot-v2";
 // Kata's internal serializer epoch is independent of the AgentENV envelope ABI.
 pub const UPSTREAM_SNAPSHOT_FORMAT_EPOCH: u16 = 1;
 
@@ -102,10 +106,13 @@ impl SnapshotRestoreIdentity {
         if self.backend != "dragonball"
             || self.architecture != "x86_64"
             || self.virtualization_mode != "kvm"
-            || self.dragonball_revision != QUALIFIED_DRAGONBALL_REVISION
-            || self.snapshot_format_epoch != 2
-            || self.restore_abi_id
-                != format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}")
+            || self.dragonball_revision.len() != 40
+            || !self
+                .dragonball_revision
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.snapshot_format_epoch != SNAPSHOT_FORMAT_EPOCH
+            || self.restore_abi_id != RESTORE_ABI_ID
             || self.cpu_policy_id != "host-default"
             || self.device_profile_id != RUNTIME_FEATURE_PROFILE
             || self.memory_layout_id != "packed-ram-4k-v2"
@@ -120,6 +127,24 @@ impl SnapshotRestoreIdentity {
             return Err("unsupported or incomplete restore identity");
         }
         Ok(())
+    }
+
+    /// Compare reader compatibility without conflating it with artifact identity.
+    /// Records referring to the same captured state must still use exact equality.
+    pub fn is_restore_compatible_with(&self, other: &Self) -> bool {
+        self.validate_profile().is_ok()
+            && other.validate_profile().is_ok()
+            && self.backend == other.backend
+            && self.architecture == other.architecture
+            && self.virtualization_mode == other.virtualization_mode
+            && self.snapshot_format_epoch == other.snapshot_format_epoch
+            && self.restore_abi_id == other.restore_abi_id
+            && self.cpu_policy_id == other.cpu_policy_id
+            && self.device_profile_id == other.device_profile_id
+            && self.memory_layout_id == other.memory_layout_id
+            && self.kernel_version == other.kernel_version
+            && self.tools_drive_version == other.tools_drive_version
+            && self.envd_version == other.envd_version
     }
 }
 

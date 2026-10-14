@@ -469,8 +469,7 @@ mod component_tests {
         let mut factory = factory_for_tests();
         factory.policy.tools = asset.clone();
         factory.build.runner_build_id = format!("sha256:{}", "a".repeat(64));
-        factory.build.restore_abi_id =
-            format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}");
+        factory.build.restore_abi_id = agentenv_vmm_protocol::runtime::RESTORE_ABI_ID.into();
         let reader =
             super::super::restore_identity::RestoreReader::from_build(factory.build.clone())
                 .unwrap();

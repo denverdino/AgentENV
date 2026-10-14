@@ -66,14 +66,26 @@ VolumeManager/仓库负责；跨后端抽象不能改变这些生命周期。
 
 ## 恢复身份与依赖
 
-恢复校验 backend、runner build ID、Kata revision、格式 epoch、ABI 以及设备/CPU
-拓扑；不兼容记录明确拒绝并保留。沿用既有仓库键名不表示 FC 与 DB 状态可互读。
+恢复校验 backend、架构、虚拟化模式、格式 epoch、固定 ABI 以及设备/CPU/内存
+profile 和拓扑。当前 epoch 为 2，ABI 为 `agentenv-dragonball-snapshot-v2`；
+仅在格式或恢复语义不兼容时提升相应版本。runner build ID 和 Kata revision
+保留为来源记录，不要求它们与当前读取器相同；同一快照的 record、manifest 和
+envelope 仍须完整身份一致。runner 握手仍校验本次启动的二进制没有在预检后被
+替换，节点依赖仍固定到已验证的 revision。不兼容记录明确拒绝并保留。
+恢复后的新捕获记录当前 runner 的来源，原快照不变。
+沿用既有仓库键名不表示 FC 与 DB 状态可互读。
 Firecracker 与 Dragonball 双向跨后端内存恢复不在支持范围内；模板可按 recipe/OCI
 重新构建，节点按后端分池。
 
 Kata 补丁保留在固定 fork revision，实际依赖以 [Cargo.toml](../../../Cargo.toml)
 和 [Cargo.lock](../../../Cargo.lock) 为准。依赖升级需同步 runner 身份与打包断言，
-并验证新候选的当前版本恢复；开发期旧版本升级集成测试按格式/兼容规则变更或
+并验证新候选的当前版本恢复；同 ABI 的不同构建应覆盖发布快照和 pause/resume。
+旧 `dragonball-held-cow-v2@<revision>` 标识不自动视为兼容：迁移必须核验原
+revision、epoch 和 profile，同步备份并修改 record、manifest、envelope；
+不改 SHA/revision 或 guest 状态，不给未知旧格式重新贴版本标签。消费迁移后的
+快照需使用新读取器和刷新过的元数据/VM-state 缓存；旧缓存及 P2P 副本不构成
+云端迁移验收的一部分。
+开发期旧版本升级集成测试按格式/兼容规则变更或
 发布需要专项运行，不成为每次迭代的固定成本。
 
 开发入口见[功能回归](dragonball-regression.md)，交付资产见
