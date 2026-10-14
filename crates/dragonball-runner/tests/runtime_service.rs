@@ -395,6 +395,61 @@ fn runtime_rejects_probe_snapshot() {
 }
 
 #[test]
+fn runtime_config_requires_the_current_process_build_provenance() {
+    let mut machine = config();
+    agentenv_dragonball_runner::runtime_service::validate_runtime_config(&machine).unwrap();
+    machine.identity.runner_build_id = format!("sha256:{}", "b".repeat(64));
+    machine.identity.dragonball_revision = "c77812d669737c11cb16321827acc1c79bf065f3".into();
+    assert!(
+        agentenv_dragonball_runner::runtime_service::validate_runtime_config(&machine).is_err()
+    );
+    machine = config();
+    machine.identity.restore_abi_id = "dragonball-held-cow-v3".into();
+    assert!(
+        agentenv_dragonball_runner::runtime_service::validate_runtime_config(&machine).is_err()
+    );
+}
+
+#[test]
+fn runtime_load_checks_abi_before_calling_the_vmm() {
+    let mut service = configured();
+    let mut identity = config().identity;
+    identity.restore_abi_id = "dragonball-held-cow-v3".into();
+    let input = RuntimeSnapshotInput {
+        state_path: "/inputs/state".into(),
+        memory_path: "/inputs/memory".into(),
+        identity,
+        probe_only: false,
+    };
+    assert!(service
+        .handle(request(2, RuntimeCommand::LoadHeld(input)))
+        .result
+        .is_err());
+    assert_eq!(service.phase(), RuntimePhase::Configured);
+    assert_eq!(service.vmm.actions, ["configure"]);
+}
+
+#[test]
+fn runtime_load_accepts_another_build_with_the_same_abi() {
+    let mut service = configured();
+    let mut identity = config().identity;
+    identity.runner_build_id = format!("sha256:{}", "b".repeat(64));
+    identity.dragonball_revision = "c77812d669737c11cb16321827acc1c79bf065f3".into();
+    let input = RuntimeSnapshotInput {
+        state_path: "/inputs/state".into(),
+        memory_path: "/inputs/memory".into(),
+        identity,
+        probe_only: false,
+    };
+    // The fixture fails load deliberately; reaching it proves identity preflight passed.
+    assert!(service
+        .handle(request(2, RuntimeCommand::LoadHeld(input)))
+        .result
+        .is_err());
+    assert_eq!(service.vmm.actions, ["configure", "load", "stop"]);
+}
+
+#[test]
 fn runtime_rejects_stale_capture_token() {
     let (mut service, mut token) = held();
     token.generation += 1;
@@ -540,7 +595,7 @@ fn runtime_release_invalidates_old_token() {
 }
 
 #[test]
-fn runtime_hello_has_content_build_identity_and_qualified_abi() {
+fn runtime_hello_has_content_build_identity_and_fixed_abi() {
     let mut service = RuntimeService::new("sandbox".into(), "runner-1".into(), TestVmm::default());
     let RuntimeReply::Hello(hello) = service
         .handle(request(1, RuntimeCommand::Hello))
@@ -556,5 +611,5 @@ fn runtime_hello_has_content_build_identity_and_qualified_abi() {
     assert_eq!(hash.len(), 64);
     assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_ne!(hello.restore_abi_id, hello.dragonball_revision);
-    assert!(hello.restore_abi_id.contains("held-cow-v2"));
+    assert_eq!(hello.restore_abi_id, RESTORE_ABI_ID);
 }

@@ -90,7 +90,17 @@ async fn dragonball_compatibility_previous_kata_snapshots_rejected_without_lease
     ];
     drop(current);
     for (path, bytes) in &published_files {
-        std::fs::write(path, bytes)?;
+        // Resolved VM state is an immutable cache file. Deliberate corruption
+        // for this rejection fixture must preserve its original permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(path)?.permissions();
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(original.mode() | 0o200),
+        )?;
+        let result = std::fs::write(path, bytes);
+        std::fs::set_permissions(path, original)?;
+        result.with_context(|| format!("overwrite rejection fixture {}", path.display()))?;
     }
     let old = manager
         .load_runnable(record.id.to_string())
@@ -169,5 +179,124 @@ async fn dragonball_compatibility_previous_kata_snapshots_rejected_without_lease
         "previous-pin published snapshot was accepted"
     );
     assert!(paused_rejected, "previous-pin paused snapshot was accepted");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real KVM/ublk restore between two runner builds with the same fixed ABI"]
+async fn dragonball_compatibility_different_builds_restore_published_and_paused() -> Result<()> {
+    use super::dragonball_support::fork_command;
+    use agentenv::sandbox::SandboxExecutor;
+    let (mut app, assets) = fixture().await?;
+    let root = tempfile::tempdir()?;
+    app.runtime_path = root.path().join("runtime");
+    let policy = |runner| {
+        DragonballRuntimePolicy::from_app_config(&app, runner, asset(&assets, "kernel_path")?)
+    };
+    let source_runner = PathBuf::from(
+        std::env::var_os("AENV_DRAGONBALL_COMPATIBILITY_SOURCE_RUNNER")
+            .context("set AENV_DRAGONBALL_COMPATIBILITY_SOURCE_RUNNER to a second build")?,
+    );
+    let source_factory = DragonballSandboxFactory::new(policy(source_runner)?)?;
+    let reader_factory = DragonballSandboxFactory::new(policy(asset(&assets, "runner_path")?)?)?;
+    let spec = spec(&assets)?;
+    let source_launch = launch(&assets)?;
+    let mut source = source_factory.build_fresh(spec.clone(), source_launch.clone())?;
+    source.start().await?;
+    let output = source
+        .run_command("sh", &["-ec", "printf compatible > /tmp/abi-proof"])
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    let captured = source.snapshot().await?;
+    let source_identity = captured
+        .manifest()
+        .restore_identity
+        .clone()
+        .context("source identity")?;
+    let reader_identity = reader_factory
+        .runtime_versions()?
+        .context("reader versions")?
+        .restore_identity
+        .context("reader identity")?;
+    assert_ne!(
+        source_identity.runner_build_id,
+        reader_identity.runner_build_id
+    );
+    assert_eq!(
+        source_identity.restore_abi_id,
+        reader_identity.restore_abi_id
+    );
+    let manager = posix_manager(root.path())?;
+    let record = manager
+        .publish_captured(
+            publish_metadata(source_launch.sandbox_id, &spec, &assets, &captured)?,
+            captured,
+        )
+        .await?;
+    let pause_root = root.path().join("paused");
+    let paused = source.pause(Some(&pause_root)).await?;
+    let encoded = paused.encode()?;
+    paused.persistence_committed();
+    source.stop().await?;
+    drop(source);
+    let runnable = manager
+        .load_runnable(record.id.to_string())
+        .await?
+        .context("snapshot")?;
+    let child_launch = launch(&assets)?;
+    let mut child = reader_factory.build_from_snapshot(&runnable, child_launch.clone())?;
+    child.start().await?;
+    let output = fork_command(
+        child.as_ref(),
+        child_launch.envd_access_token.as_ref(),
+        "cat /tmp/abi-proof",
+    )
+    .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "compatible");
+    let recaptured = child.snapshot().await?;
+    assert_eq!(
+        recaptured
+            .manifest()
+            .restore_identity
+            .as_ref()
+            .unwrap()
+            .runner_build_id,
+        reader_identity.runner_build_id,
+        "new captures must identify the current reader build"
+    );
+    drop(recaptured);
+    child.stop().await?;
+    let decoded = reader_factory.decode_paused_state(pause_root, encoded.clone())?;
+    let mut resumed = reader_factory.build_from_paused_state(
+        source_launch.sandbox_id,
+        decoded.as_ref(),
+        source_launch.envd_access_token.clone(),
+    )?;
+    resumed.start().await?;
+    let output = fork_command(
+        resumed.as_ref(),
+        source_launch.envd_access_token.as_ref(),
+        "cat /tmp/abi-proof",
+    )
+    .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "compatible");
+    resumed.stop().await?;
+    assert_eq!(
+        paused.encode()?,
+        encoded,
+        "restore must preserve source provenance"
+    );
+    assert_eq!(
+        runnable.manifest().restore_identity.as_ref(),
+        Some(&source_identity)
+    );
+    drop(resumed);
+    drop(child);
+    drop(decoded);
+    drop(paused);
+    drop(runnable);
+    manager.delete(record.id.to_string()).await?;
     Ok(())
 }

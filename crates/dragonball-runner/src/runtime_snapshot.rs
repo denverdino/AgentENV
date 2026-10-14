@@ -261,7 +261,9 @@ pub fn restore_state(
         .validate_state_topology()
         .map_err(anyhow::Error::msg)?;
     ensure!(
-        envelope.identity == machine.identity
+        envelope
+            .identity
+            .is_restore_compatible_with(&machine.identity)
             && envelope.machine.vcpu_count == machine.vcpu_count
             && envelope.machine.memory_mib == machine.memory_mib
             && envelope.machine.network_id == machine.network.iface_id

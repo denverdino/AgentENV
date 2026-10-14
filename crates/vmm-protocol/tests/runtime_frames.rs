@@ -13,7 +13,7 @@ fn request() -> RuntimeRequest {
 }
 
 #[test]
-fn runtime_identity_rejects_previous_kata_revision_with_matching_abi() {
+fn runtime_identity_uses_fixed_abi_and_preserves_build_provenance() {
     let mut identity = SnapshotRestoreIdentity {
         backend: "dragonball".into(),
         architecture: "x86_64".into(),
@@ -21,7 +21,7 @@ fn runtime_identity_rejects_previous_kata_revision_with_matching_abi() {
         runner_build_id: format!("sha256:{}", "a".repeat(64)),
         dragonball_revision: QUALIFIED_DRAGONBALL_REVISION.into(),
         snapshot_format_epoch: 2,
-        restore_abi_id: format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}"),
+        restore_abi_id: "agentenv-dragonball-snapshot-v2".into(),
         cpu_policy_id: "host-default".into(),
         device_profile_id: RUNTIME_FEATURE_PROFILE.into(),
         memory_layout_id: "packed-ram-4k-v2".into(),
@@ -31,12 +31,50 @@ fn runtime_identity_rejects_previous_kata_revision_with_matching_abi() {
     };
     identity.validate_profile().unwrap();
 
-    let previous_revision = "c77812d669737c11cb16321827acc1c79bf065f3";
-    identity.dragonball_revision = previous_revision.into();
-    identity.restore_abi_id = format!("dragonball-held-cow-v2@{previous_revision}");
+    let current = identity.clone();
+    identity.dragonball_revision = "c77812d669737c11cb16321827acc1c79bf065f3".into();
+    identity.runner_build_id = format!("sha256:{}", "b".repeat(64));
+    identity.validate_profile().unwrap();
+    assert!(current.is_restore_compatible_with(&identity));
+    assert_ne!(
+        current, identity,
+        "artifact provenance must still compare exactly"
+    );
+    for field in [
+        "backend",
+        "architecture",
+        "virtualization_mode",
+        "runner_build_id",
+        "dragonball_revision",
+        "restore_abi_id",
+        "cpu_policy_id",
+        "device_profile_id",
+        "memory_layout_id",
+    ] {
+        let mut value = serde_json::to_value(&identity).unwrap();
+        value[field] = serde_json::json!("unsupported");
+        let bad: SnapshotRestoreIdentity = serde_json::from_value(value).unwrap();
+        assert!(
+            !current.is_restore_compatible_with(&bad),
+            "accepted {field}"
+        );
+    }
+    for field in ["kernel_version", "tools_drive_version", "envd_version"] {
+        let mut value = serde_json::to_value(&identity).unwrap();
+        value[field] = serde_json::json!("different");
+        let bad: SnapshotRestoreIdentity = serde_json::from_value(value).unwrap();
+        assert!(
+            !current.is_restore_compatible_with(&bad),
+            "accepted {field}"
+        );
+    }
+    identity.snapshot_format_epoch += 1;
+    assert!(!current.is_restore_compatible_with(&identity));
+    identity = current.clone();
+    identity.restore_abi_id = format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}");
     assert!(
         identity.validate_profile().is_err(),
-        "matching legacy revision and ABI must not qualify an old snapshot"
+        "legacy revision-qualified ABI requires an explicit migration"
     );
 }
 

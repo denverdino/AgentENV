@@ -848,3 +848,77 @@ Flash/Max 的实际节点与 guest 配额、任务契约、模板及 server/runn
 测试包缺少既有 Rust revision 夹具而失败，补齐不变的输入后复验通过，失败日志保留。
 本次未运行模型、重建模板或发布 tools，复用已有两轮运行证据。验证与环境审计
 记录位于 `/tmp/agentenv-harbor-merge-20261012/`。
+
+## 固定快照 ABI 后的 Qwen3.8-Max 两机复测（2026-10-14）
+
+两台测试机使用包含 `agentenv-dragonball-snapshot-v2` 修改的同一 server/runner，
+复测上轮实际执行的 71 项（A 41、B 30）。保留任务 revision、镜像、kernel、
+tools 0.1.2-p4.1 和原始阶段预算；guest 4c8g、节点 64c/128GiB、每机最多八槽，
+实测 VMM 峰值均为八。Qwen3.8-Max 关闭 thinking，每次输出上限 4096 token，
+无额外轮数限制；每项一次、无 trial 自动重试，inference pause 关闭。
+
+两机 UID999 各通过 240 项 Harbor 检查与 3 项控制器检查。模型前分别复验
+openssl/log-summary 的 Oracle=1、nop=0 与空快照缓存恢复；未重复全套资格。
+71 个旧模板增加绑定新消费者资产的兼容索引，保留旧索引、快照内容及来源身份。
+运行证明同一 Kata pin 下跨构建恢复可用，不证明跨 revision 或异构 CPU 兼容。
+
+| 主机 | 执行项 | 原生 reward=1 | 无异常通过 | 正常 0 分 | AgentTimeoutError |
+| --- | --- | --- | --- | --- | --- |
+| A | 41 | 19 | 19 | 10 | 12 |
+| B | 30 | 16 | 14 | 8 | 8 |
+| 合计 | 71 | 35 | 33 | 18 | 20 |
+
+原生得分 35/71（49.3%）；其中 largest-eigenval、path-tracing-reverse 的
+reward=1 同时带 Agent 超时，原始得分和异常均保留。无异常通过率 33/71
+（46.5%）。两机合并墙钟 6925.14 秒（115.4 分钟）；输入 35,269,446 token，
+其中缓存 32,562,560，输出 869,388，71 项用量均有记录；账单费用未知。
+这是已选 71 项的结果，不是原始 89 项官方全套成绩。其余范围仍按此前资格及
+素材准入记录保留，未据本轮失败缩小分母。
+
+20 项异常的删除前取证回执全部通过，71 个 sandbox 均确认删除，无清理错误；
+两机宿主恢复和冻结摘要核验通过。临时保护的 A 59/B 15 个历史目录身份未变，
+保护标记已恢复，smoke/model 历史 GC 均未删除目录。所有原生轨迹及失败现场
+保留在两机 `/var/tmp/hb1008/tb-max-abi-20261014/model/`；本地摘要、原生来源
+SHA 和收尾证据位于 `/tmp/agentenv-terminal-max-abi-20261014/` 的
+`final-summary.json`、`task-results.json`、`final-evidence/`。
+
+上轮 Max 同一 71 项为 39/71；本轮运行时和驱动已变化，外部输入及模型存在
+变动，不能将得分或耗时差异归因于快照 ABI。新运行时用于本轮隔离 Lab，未替换
+旧部署或提交、推送代码。
+
+## Max 新增超时项的新旧运行时对照（2026-10-14）
+
+针对新增的 8 项 Agent 超时，两机各执行新旧运行时一轮，共 16 个模型 trial。
+同一任务固定同一宿主，A 6 项先新后旧、B 2 项先旧后新；两组使用同一当前
+Qwen3.8-Max 驱动、任务契约/原预算、4c8g guest、64c/128GiB 节点配额和
+kernel/tools。旧 server/runner 摘要与 10-12 证据相同；旧 ABI 的原始三份
+元数据和相同 payload 复制到独立临时 OSS 前缀，正式快照及索引不回退。
+两机 UID999 各 240 项 Harbor、3 项控制器检查通过，新旧组分别完成严格
+Oracle/nop、空缓存恢复资格后才调用模型。每项每组一次，无 trial 自动重试。
+
+| 运行时 | 执行项 | 原生 reward=1 | 无异常通过 | 正常 0 分 | AgentTimeoutError |
+| --- | --- | --- | --- | --- | --- |
+| 新 | 8 | 5 | 5 | 0 | 3 |
+| 旧 | 8 | 3 | 2 | 1 | 5 |
+
+两组均超时：adaptive-rejection-sampler、chess-best-move、winning-avg-corewars。
+仅旧组超时：financial-document-processor、llm-inference-batching-scheduler；
+前者超时但原生 reward=1。新组独有超时为零，没有复现新运行时系统性增加
+超时。首次复测和本次对照均关闭 inference pause，两机均无 pause/resume
+事件；Harbor 的 Agent 墙钟预算覆盖整个 agent.run，若启用休眠则不会暂停计时。
+这不是完整复刻旧部署：两组使用当前驱动，外部依赖/模型服务仍可变化，实际
+活跃任务为 A 6/B 2，低于 71 项基线的每机八槽；单次采样不证明所有环境因素
+无关。逐项结果与请求计时见
+[对照报告](docs/src/internals/harbor-qwen-comparison.md#新增超时项的新旧运行时对照2026-10-14)。
+
+16 个 sandbox 删除及 8 项失败取证通过；两机宿主恢复、158 份候选源码及
+5 份操作脚本摘要核验通过，A 61/B 17 个历史目录身份和原 pin 状态保留。
+临时旧 ABI 前缀 `harbor/integration/rerun-old-20261014/shared-templates-v1`
+的 100 个对象按来源清单核验后全部删除，回读为空，正式前缀写入数为零。
+原生轨迹保留在两机 `/var/tmp/hb1008/tb-max-rerun-20261014/{new,old}/model/`；
+本地 `final-summary.json`、`task-results.json`、`final-evidence/`、
+`pause-resume-audit.json`、`quota-timer-evidence.json`、
+`old-repository-cleanup.json` 位于 `/tmp/agentenv-terminal-max-rerun-20261014/`。
+首次 smoke 路径错误在 Lab 启动前失败，修正并通过真实路径夹具后启动正式轮；
+批量 OSS 删除被拒绝，保留首次错误后改为逐个精确 key 删除。均未重试模型 trial，
+未替换旧部署或提交、推送代码。

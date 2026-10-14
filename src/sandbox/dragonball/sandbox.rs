@@ -556,7 +556,12 @@ impl DragonballSandbox {
         let reader = RestoreReader::new(hello)?;
         let identity = if let Some(saved) = &restore {
             reader.validate_restore(&saved.artifacts.envelope.identity)?;
-            saved.artifacts.envelope.identity.clone()
+            let saved_identity = &saved.artifacts.envelope.identity;
+            reader.identity(
+                saved_identity.kernel_version.clone(),
+                saved_identity.tools_drive_version.clone(),
+                saved_identity.envd_version.clone(),
+            )
         } else {
             reader.identity(
                 app.resolved_kernel_version().into(),
@@ -688,7 +693,7 @@ impl DragonballSandbox {
                     RuntimeCommand::LoadHeld(RuntimeSnapshotInput {
                         state_path,
                         memory_path,
-                        identity: machine.identity.clone(),
+                        identity: saved.artifacts.envelope.identity.clone(),
                         probe_only: false,
                     }),
                     Duration::from_secs(30),

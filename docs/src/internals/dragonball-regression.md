@@ -9,7 +9,7 @@ sandbox/runner/protocol 职责划分，运行时协议和快照身份由各后�
 | 生命周期、捕获/恢复 | `test-dragonball-regression` + `--suite lifecycle` | 预构建 DB-only harness |
 | 增量内存、balloon/slots、启动优化 | `--suite memory` / `--suite slots` / `--suite startup` | 默认与 lifecycle 一起执行，套件不重叠 |
 | 平台/OSS/模板功能 | `test-dragonball-platform` | 显式 native S3/registry/server 夹具 |
-| 持久化身份兼容 | `--suite compatibility` | 显式选择，日常默认不执行旧 revision 专项 |
+| 持久化身份兼容 | `--suite compatibility` | 显式选择；跨构建正例需第二个 runner 构建 |
 | 底层 VMM 诊断 | `test-dragonball-probe` | 保留独立 probe 保存/恢复能力 |
 | 双后端 feature 构建 / DB-only 完整运行时 | `test-dragonball-dual-backend` / `test-dragonball-runtime` | 两种 feature 覆盖分别保留 |
 | 同机跨节点 / 跨物理主机 / 性能 | `test-hypervisor-cross-node` / `test-hypervisor-physical` / `test-hypervisor-performance` | 显式输入与容量预检，性能默认仅生成计划 |
@@ -23,6 +23,12 @@ lab 工具集，继续复用，功能入口不要求理解编号。`AENV_DRAGONB
 
 发布/资产清单能力由[打包脚本](dragonball-packaging.md)和后端组件测试负责。
 验证结论及已知限制见[验证摘要](hypervisor-validation.md)。
+
+兼容套件通过 `AENV_DRAGONBALL_COMPATIBILITY_SOURCE_RUNNER` 指定第二个 runner
+构建的绝对路径；它应与 assets 中的 runner 具有不同 build ID、相同固定 ABI。
+套件验证发布快照恢复、同 ID pause/resume、guest 文件内容及再次捕获的新来源。
+旧 revision-qualified ABI 拒绝用例只验证版本边界，不声称对应旧二进制的状态
+已经通过跨版本资格测试。
 
 ## 使用
 

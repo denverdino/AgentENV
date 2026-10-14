@@ -71,13 +71,12 @@ impl RestoreReader {
     pub fn validate_restore(&self, identity: &SnapshotRestoreIdentity) -> Result<()> {
         identity.validate_profile().map_err(anyhow::Error::msg)?;
         ensure!(
-            *identity
-                == self.identity(
-                    identity.kernel_version.clone(),
-                    identity.tools_drive_version.clone(),
-                    identity.envd_version.clone()
-                ),
-            "snapshot requires a different qualified reader build"
+            identity.is_restore_compatible_with(&self.identity(
+                identity.kernel_version.clone(),
+                identity.tools_drive_version.clone(),
+                identity.envd_version.clone()
+            )),
+            "snapshot requires a different restore ABI or runtime profile"
         );
         Ok(())
     }
@@ -284,7 +283,7 @@ mod tests {
             runner_build_id: format!("sha256:{}", "a".repeat(64)),
             dragonball_revision: QUALIFIED_DRAGONBALL_REVISION.into(),
             snapshot_format_epoch: 2,
-            restore_abi_id: format!("dragonball-held-cow-v2@{QUALIFIED_DRAGONBALL_REVISION}"),
+            restore_abi_id: agentenv_vmm_protocol::runtime::RESTORE_ABI_ID.into(),
             cpu_policy_id: "host-default".into(),
             device_profile_id: RUNTIME_FEATURE_PROFILE.into(),
             memory_layout_id: "packed-ram-4k-v2".into(),
@@ -471,11 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_identity_requires_exact_qualified_reader_not_just_epoch() {
+    fn restore_identity_accepts_other_builds_with_the_same_abi() {
         let reader = reader();
         reader.validate_restore(&identity()).unwrap();
         let mut other = identity();
         other.runner_build_id = format!("sha256:{}", "b".repeat(64));
+        other.dragonball_revision = "c77812d669737c11cb16321827acc1c79bf065f3".into();
+        reader.validate_restore(&other).unwrap();
+        other.restore_abi_id = "dragonball-held-cow-v3".into();
         assert!(reader.validate_restore(&other).is_err());
         other = identity();
         other.snapshot_format_epoch = 1;
@@ -486,13 +488,13 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_consistent_previous_kata_revision() {
+    fn restore_rejects_consistent_legacy_revision_qualified_abi() {
         let (mut record, mut manifest, mut envelope) = artifacts();
         let reader = reader();
         validate_artifact_identity(&reader, &record, &manifest, &envelope).unwrap();
 
         // Keep all three identities consistent and the build ID, profile and
-        // epochs valid: rejection must come from the previous revision/ABI.
+        // epochs valid: rejection must come from the legacy revision-qualified ABI.
         let previous = "c77812d669737c11cb16321827acc1c79bf065f3";
         envelope.identity.dragonball_revision = previous.into();
         envelope.identity.restore_abi_id = format!("dragonball-held-cow-v2@{previous}");
@@ -503,7 +505,7 @@ mod tests {
         let before = serde_json::to_value((&record, &manifest, &envelope)).unwrap();
 
         let error = validate_artifact_identity(&reader, &record, &manifest, &envelope)
-            .expect_err("previous Kata revision must require its original reader");
+            .expect_err("legacy ABI must require explicit migration");
         assert!(error
             .to_string()
             .contains("unsupported or incomplete restore identity"));
