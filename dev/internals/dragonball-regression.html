@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-be6cca5e.js";
+            window.path_to_searchindex_js = "../searchindex-6ff213d4.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-5404fc80.js"></script>
@@ -194,7 +194,7 @@ sandbox/runner/protocol 职责划分，运行时协议和快照身份由各后�
 <tr><td>生命周期、捕获/恢复</td><td><code>test-dragonball-regression</code> + <code>--suite lifecycle</code></td><td>预构建 DB-only harness</td></tr>
 <tr><td>增量内存、balloon/slots、启动优化</td><td><code>--suite memory</code> / <code>--suite slots</code> / <code>--suite startup</code></td><td>默认与 lifecycle 一起执行，套件不重叠</td></tr>
 <tr><td>平台/OSS/模板功能</td><td><code>test-dragonball-platform</code></td><td>显式 native S3/registry/server 夹具</td></tr>
-<tr><td>持久化身份兼容</td><td><code>--suite compatibility</code></td><td>显式选择，日常默认不执行旧 revision 专项</td></tr>
+<tr><td>持久化身份兼容</td><td><code>--suite compatibility</code></td><td>显式选择；跨构建正例需第二个 runner 构建</td></tr>
 <tr><td>底层 VMM 诊断</td><td><code>test-dragonball-probe</code></td><td>保留独立 probe 保存/恢复能力</td></tr>
 <tr><td>双后端 feature 构建 / DB-only 完整运行时</td><td><code>test-dragonball-dual-backend</code> / <code>test-dragonball-runtime</code></td><td>两种 feature 覆盖分别保留</td></tr>
 <tr><td>同机跨节点 / 跨物理主机 / 性能</td><td><code>test-hypervisor-cross-node</code> / <code>test-hypervisor-physical</code> / <code>test-hypervisor-performance</code></td><td>显式输入与容量预检，性能默认仅生成计划</td></tr>
@@ -209,6 +209,11 @@ lab 工具集，继续复用，功能入口不要求理解编号。<code>AENV_DR
 夹具变量及 probe wire/profile 标识保留，避免无收益的配置和协议扰动。</p>
 <p>发布/资产清单能力由<a href="dragonball-packaging.html">打包脚本</a>和后端组件测试负责。
 验证结论及已知限制见<a href="hypervisor-validation.html">验证摘要</a>。</p>
+<p>兼容套件通过 <code>AENV_DRAGONBALL_COMPATIBILITY_SOURCE_RUNNER</code> 指定第二个 runner
+构建的绝对路径；它应与 assets 中的 runner 具有不同 build ID、相同固定 ABI。
+套件验证发布快照恢复、同 ID pause/resume、guest 文件内容及再次捕获的新来源。
+旧 revision-qualified ABI 拒绝用例只验证版本边界，不声称对应旧二进制的状态
+已经通过跨版本资格测试。</p>
 <h2 id="使用"><a class="header" href="#使用">使用</a></h2>
 <p>在隔离的 Linux x86_64 测试服务器上，以原有非 root 测试账号运行。
 需要 Python 3.11+、已有 capability runner 的 sudo 委派、KVM/ublk 访问权限，

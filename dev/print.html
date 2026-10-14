@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-be6cca5e.js";
+            window.path_to_searchindex_js = "searchindex-6ff213d4.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-5404fc80.js"></script>
@@ -5004,13 +5004,25 @@ balloon 回收不能修改共享 lower。全量文件模式保留为诊断对照
 <a href="#persistence-artifact-inventory">持久化清单</a>。卷预约、fork 和发布状态仍由
 VolumeManager/仓库负责；跨后端抽象不能改变这些生命周期。</p>
 <h2 id="恢复身份与依赖"><a class="header" href="#恢复身份与依赖">恢复身份与依赖</a></h2>
-<p>恢复校验 backend、runner build ID、Kata revision、格式 epoch、ABI 以及设备/CPU
-拓扑；不兼容记录明确拒绝并保留。沿用既有仓库键名不表示 FC 与 DB 状态可互读。
+<p>恢复校验 backend、架构、虚拟化模式、格式 epoch、固定 ABI 以及设备/CPU/内存
+profile 和拓扑。当前 epoch 为 2，ABI 为 <code>agentenv-dragonball-snapshot-v2</code>；
+仅在格式或恢复语义不兼容时提升相应版本。runner build ID 和 Kata revision
+保留为来源记录，不要求它们与当前读取器相同；同一快照的 record、manifest 和
+envelope 仍须完整身份一致。runner 握手仍校验本次启动的二进制没有在预检后被
+替换，节点依赖仍固定到已验证的 revision。不兼容记录明确拒绝并保留。
+恢复后的新捕获记录当前 runner 的来源，原快照不变。
+沿用既有仓库键名不表示 FC 与 DB 状态可互读。
 Firecracker 与 Dragonball 双向跨后端内存恢复不在支持范围内；模板可按 recipe/OCI
 重新构建，节点按后端分池。</p>
 <p>Kata 补丁保留在固定 fork revision，实际依赖以 <a href="../../Cargo.toml">Cargo.toml</a>
 和 <a href="../../Cargo.lock">Cargo.lock</a> 为准。依赖升级需同步 runner 身份与打包断言，
-并验证新候选的当前版本恢复；开发期旧版本升级集成测试按格式/兼容规则变更或
+并验证新候选的当前版本恢复；同 ABI 的不同构建应覆盖发布快照和 pause/resume。
+旧 <code>dragonball-held-cow-v2@&lt;revision&gt;</code> 标识不自动视为兼容：迁移必须核验原
+revision、epoch 和 profile，同步备份并修改 record、manifest、envelope；
+不改 SHA/revision 或 guest 状态，不给未知旧格式重新贴版本标签。消费迁移后的
+快照需使用新读取器和刷新过的元数据/VM-state 缓存；旧缓存及 P2P 副本不构成
+云端迁移验收的一部分。
+开发期旧版本升级集成测试按格式/兼容规则变更或
 发布需要专项运行，不成为每次迭代的固定成本。</p>
 <p>开发入口见<a href="#dragonball-开发与功能回归">功能回归</a>，交付资产见
 <a href="#dragonball-候选包">候选包</a>，已验证范围和已知限制见
@@ -5029,7 +5041,7 @@ sandbox/runner/protocol 职责划分，运行时协议和快照身份由各后�
 <tr><td>生命周期、捕获/恢复</td><td><code>test-dragonball-regression</code> + <code>--suite lifecycle</code></td><td>预构建 DB-only harness</td></tr>
 <tr><td>增量内存、balloon/slots、启动优化</td><td><code>--suite memory</code> / <code>--suite slots</code> / <code>--suite startup</code></td><td>默认与 lifecycle 一起执行，套件不重叠</td></tr>
 <tr><td>平台/OSS/模板功能</td><td><code>test-dragonball-platform</code></td><td>显式 native S3/registry/server 夹具</td></tr>
-<tr><td>持久化身份兼容</td><td><code>--suite compatibility</code></td><td>显式选择，日常默认不执行旧 revision 专项</td></tr>
+<tr><td>持久化身份兼容</td><td><code>--suite compatibility</code></td><td>显式选择；跨构建正例需第二个 runner 构建</td></tr>
 <tr><td>底层 VMM 诊断</td><td><code>test-dragonball-probe</code></td><td>保留独立 probe 保存/恢复能力</td></tr>
 <tr><td>双后端 feature 构建 / DB-only 完整运行时</td><td><code>test-dragonball-dual-backend</code> / <code>test-dragonball-runtime</code></td><td>两种 feature 覆盖分别保留</td></tr>
 <tr><td>同机跨节点 / 跨物理主机 / 性能</td><td><code>test-hypervisor-cross-node</code> / <code>test-hypervisor-physical</code> / <code>test-hypervisor-performance</code></td><td>显式输入与容量预检，性能默认仅生成计划</td></tr>
@@ -5044,6 +5056,11 @@ lab 工具集，继续复用，功能入口不要求理解编号。<code>AENV_DR
 夹具变量及 probe wire/profile 标识保留，避免无收益的配置和协议扰动。</p>
 <p>发布/资产清单能力由<a href="#dragonball-候选包">打包脚本</a>和后端组件测试负责。
 验证结论及已知限制见<a href="#hypervisor-验证摘要与已知限制">验证摘要</a>。</p>
+<p>兼容套件通过 <code>AENV_DRAGONBALL_COMPATIBILITY_SOURCE_RUNNER</code> 指定第二个 runner
+构建的绝对路径；它应与 assets 中的 runner 具有不同 build ID、相同固定 ABI。
+套件验证发布快照恢复、同 ID pause/resume、guest 文件内容及再次捕获的新来源。
+旧 revision-qualified ABI 拒绝用例只验证版本边界，不声称对应旧二进制的状态
+已经通过跨版本资格测试。</p>
 <h2 id="使用"><a class="header" href="#使用">使用</a></h2>
 <p>在隔离的 Linux x86_64 测试服务器上，以原有非 root 测试账号运行。
 需要 Python 3.11+、已有 capability runner 的 sudo 委派、KVM/ublk 访问权限，
@@ -5626,6 +5643,80 @@ YAML 本身不会创建审批规则。PR 事件不会触发该特权 job。</p>
 </tbody>
 </table>
 </div>
+<h2 id="2026-10-14-max-复测的新增超时"><a class="header" href="#2026-10-14-max-复测的新增超时">2026-10-14 Max 复测的新增超时</a></h2>
+<p>前述 Flash/Max 数字是 10-11/12 的历史对比，不用后续复测覆盖。本轮同一
+71 项 Max 从 14 项 Agent 超时增至 20 项：新增 8 项、2 项不再超时，净增 6。
+<code>regex-chess</code> 转为正常 0 分，<code>schemelike-metacircular-eval</code> 转为得 1。
+两轮实际执行任务的阶段预算、资源配额与 Agent 配置相同；新运行时和驱动已变化。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>新增超时项</th><th style="text-align: right">上轮 Agent 秒数 → 本轮预算秒数</th><th>原生轨迹中观察到的路径</th></tr>
+</thead>
+<tbody>
+<tr><td>adaptive-rejection-sampler</td><td style="text-align: right">736 → 900</td><td>重写有界域采样代码，截止时仍在追加测试函数，R 文件未闭合</td></tr>
+<tr><td>chess-best-move</td><td style="text-align: right">703 → 900</td><td>持续辨认棋盘与棋子，截止时仍在寻找 Stockfish；已返回模型请求等待约 679 秒</td></tr>
+<tr><td>count-dataset-tokens</td><td style="text-align: right">363 → 900</td><td>额外安装 torch，先中断 pip 再以 no-cache-dir 重试；554.6 MB 下载未完成</td></tr>
+<tr><td>db-wal-recovery</td><td style="text-align: right">665 → 900</td><td>转向 debugfs 和全盘扫描，截止时未生成 recovered.json；上轮正常得 0</td></tr>
+<tr><td>financial-document-processor</td><td style="text-align: right">446 → 1200</td><td>反复修改 OCR 金额/VAT 提取，最终部分 VAT 仍为 0，verifier 未通过</td></tr>
+<tr><td>largest-eigenval</td><td style="text-align: right">834 → 900</td><td>完成声明后再次自检，打断连续完成确认；verifier 得 1，但 Agent 未及时结束</td></tr>
+<tr><td>llm-inference-batching-scheduler</td><td style="text-align: right">973 → 1800</td><td>两轮完成请求均 22 次，请求等待 436→934 秒，本轮方案仍未满足约束</td></tr>
+<tr><td>winning-avg-corewars</td><td style="text-align: right">950 → 3600</td><td>解题轮数 34→80，仍在搜索满足所有对手胜率的 warrior 参数</td></tr>
+</tbody>
+</table>
+</div>
+<p>这些记录支持依赖下载、不同解题路径和更长模型请求等待共同消耗预算；不能
+给每类分配确定的因果占比。全部已返回请求的往返中位数 8.00→10.55 秒，P95
+35.07→50.86 秒；计时包含请求内容、生成、网络及服务等待，不证明单独的服务端
+性能下降。已取消请求可能缺少完整计时。新增项恢复阶段均约 2–3 秒，未观察到
+快照恢复失败；未做固定命令跨运行时性能实验，不能据此彻底排除运行时影响。</p>
+<p>本轮原生 reward=1 为 35/71，无异常通过 33/71；20 项超时中
+largest-eigenval、path-tracing-reverse 仍得 1。逐项来源 SHA、脱敏轨迹摘录及
+请求计时核对在 <code>/tmp/agentenv-terminal-max-abi-20261014/timeout-investigation/analysis.json</code>。
+这是历史记录分析，本次未新增模型请求、重跑任务或修改运行行为。</p>
+<p>本轮及后续新旧运行时对照均关闭 <code>pause_taskvm_during_inference</code>；两机首次复测
+和对照目录均未出现 <code>pause-resume.jsonl</code> 或生命周期事件，新增超时不能归因于
+推理期间休眠/唤醒。Harbor 0.24.0 的 Agent 阶段以 <code>asyncio.wait_for(agent.run, timeout=timeout_sec)</code> 计时；若开启该功能，pause、模型请求与 resume 都在该调用
+内部，VM 暂停不会暂停 Agent 的时间预算。计时源码摘要与事件审计保存在
+<code>/tmp/agentenv-terminal-max-rerun-20261014/</code> 的 <code>quota-timer-evidence.json</code> 和
+<code>pause-resume-audit.json</code>。</p>
+<h2 id="新增超时项的新旧运行时对照2026-10-14"><a class="header" href="#新增超时项的新旧运行时对照2026-10-14">新增超时项的新旧运行时对照（2026-10-14）</a></h2>
+<p>对前述 8 项新增超时各运行一次新、旧 server/runner，共 16 个模型 trial，
+使用 Qwen3.8-Max。每个任务的新旧组固定在同一宿主：A 6 项、B 2 项；
+A 先新后旧、B 先旧后新。两组实际任务契约、阶段预算、Agent 驱动/参数、
+4c8g guest、节点配额、kernel/tools 摘要均相同，运行时及匹配的 ABI 元数据不同。
+无 trial 重试，inference pause 关闭；旧二进制摘要与 10-12 留存证据一致。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>任务</th><th>新运行时 reward / 状态</th><th>旧运行时 reward / 状态</th></tr>
+</thead>
+<tbody>
+<tr><td>adaptive-rejection-sampler</td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td>chess-best-move</td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td>count-dataset-tokens</td><td>1 / 通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td>db-wal-recovery</td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td>financial-document-processor</td><td>1 / 通过</td><td>1 / 超时</td></tr>
+<tr><td>largest-eigenval</td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td>llm-inference-batching-scheduler</td><td>1 / 通过</td><td>0 / 超时</td></tr>
+<tr><td>winning-avg-corewars</td><td>0 / 超时</td><td>0 / 超时</td></tr>
+</tbody>
+</table>
+</div>
+<p>新组 3/8 超时、5/8 无异常通过；旧组 5/8 超时、2/8 无异常通过，另有一项
+正常 0 分。旧组 financial-document-processor 虽超时仍得 1，原生得分为
+3/8。新组独有超时为零；仅旧组超时为 financial-document-processor 和
+llm-inference-batching-scheduler。首次新环境复测中，这 8 项全部超时。</p>
+<p>本次没有复现新运行时系统性增加超时，休眠/唤醒也未参与这些 trial；结果不支持
+将此前净增 6 项超时直接归因于 ABI 修改。不能证明所有环境变化无关：每项每组
+仅一次模型采样，模型服务和外部依赖仍会变化，两组都使用当前驱动；实际活跃
+任务上限为 A 6/B 2，低于 71 项基线的每机八槽，并非完整复刻 10-12 部署。</p>
+<p>新/旧组已返回请求分别 205/201 次，往返中位数 14.22/13.72 秒、P95
+41.18/43.63 秒；已取消请求可能没有完整计时，不将往返差异解释为单独的
+服务端或 VMM 性能变化。16 个 sandbox 删除、8 项失败取证、两机宿主恢复
+和候选源码/操作摘要检查全部通过。逐项来源 SHA、有效配置及收尾回执见
+<code>/tmp/agentenv-terminal-max-rerun-20261014/</code> 的 <code>task-results.json</code>、
+<code>final-summary.json</code> 和 <code>final-evidence/</code>。</p>
 <h2 id="原生证据"><a class="header" href="#原生证据">原生证据</a></h2>
 <p>Flash执行：2026-10-11 19:53:14 → 2026-10-11 22:10:19；Max执行：2026-10-12 09:56:20 → 2026-10-12 11:43:57，均为UTC+8。</p>
 <p>两机原生记录分别保留在 <code>/var/tmp/hb1008/terminal-benchmark-20261011/shard-{0,1}-r1/run</code> 与 <code>/var/tmp/hb1008/qwen-max-20261012/shard-{0,1}/run</code>；sandbox只在删除回执核对后记完成。所有14项Max异常取证成功，清理无错误，冻结候选摘要核对通过。systemd非零退出来自任务异常汇总，队列reason=completed且pending=0，不是仍在运行或清理失败。</p>

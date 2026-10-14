@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-be6cca5e.js";
+            window.path_to_searchindex_js = "../searchindex-6ff213d4.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-5404fc80.js"></script>
@@ -352,6 +352,80 @@
 </tbody>
 </table>
 </div>
+<h2 id="2026-10-14-max-复测的新增超时"><a class="header" href="#2026-10-14-max-复测的新增超时">2026-10-14 Max 复测的新增超时</a></h2>
+<p>前述 Flash/Max 数字是 10-11/12 的历史对比，不用后续复测覆盖。本轮同一
+71 项 Max 从 14 项 Agent 超时增至 20 项：新增 8 项、2 项不再超时，净增 6。
+<code>regex-chess</code> 转为正常 0 分，<code>schemelike-metacircular-eval</code> 转为得 1。
+两轮实际执行任务的阶段预算、资源配额与 Agent 配置相同；新运行时和驱动已变化。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>新增超时项</th><th style="text-align: right">上轮 Agent 秒数 → 本轮预算秒数</th><th>原生轨迹中观察到的路径</th></tr>
+</thead>
+<tbody>
+<tr><td>adaptive-rejection-sampler</td><td style="text-align: right">736 → 900</td><td>重写有界域采样代码，截止时仍在追加测试函数，R 文件未闭合</td></tr>
+<tr><td>chess-best-move</td><td style="text-align: right">703 → 900</td><td>持续辨认棋盘与棋子，截止时仍在寻找 Stockfish；已返回模型请求等待约 679 秒</td></tr>
+<tr><td>count-dataset-tokens</td><td style="text-align: right">363 → 900</td><td>额外安装 torch，先中断 pip 再以 no-cache-dir 重试；554.6 MB 下载未完成</td></tr>
+<tr><td>db-wal-recovery</td><td style="text-align: right">665 → 900</td><td>转向 debugfs 和全盘扫描，截止时未生成 recovered.json；上轮正常得 0</td></tr>
+<tr><td>financial-document-processor</td><td style="text-align: right">446 → 1200</td><td>反复修改 OCR 金额/VAT 提取，最终部分 VAT 仍为 0，verifier 未通过</td></tr>
+<tr><td>largest-eigenval</td><td style="text-align: right">834 → 900</td><td>完成声明后再次自检，打断连续完成确认；verifier 得 1，但 Agent 未及时结束</td></tr>
+<tr><td>llm-inference-batching-scheduler</td><td style="text-align: right">973 → 1800</td><td>两轮完成请求均 22 次，请求等待 436→934 秒，本轮方案仍未满足约束</td></tr>
+<tr><td>winning-avg-corewars</td><td style="text-align: right">950 → 3600</td><td>解题轮数 34→80，仍在搜索满足所有对手胜率的 warrior 参数</td></tr>
+</tbody>
+</table>
+</div>
+<p>这些记录支持依赖下载、不同解题路径和更长模型请求等待共同消耗预算；不能
+给每类分配确定的因果占比。全部已返回请求的往返中位数 8.00→10.55 秒，P95
+35.07→50.86 秒；计时包含请求内容、生成、网络及服务等待，不证明单独的服务端
+性能下降。已取消请求可能缺少完整计时。新增项恢复阶段均约 2–3 秒，未观察到
+快照恢复失败；未做固定命令跨运行时性能实验，不能据此彻底排除运行时影响。</p>
+<p>本轮原生 reward=1 为 35/71，无异常通过 33/71；20 项超时中
+largest-eigenval、path-tracing-reverse 仍得 1。逐项来源 SHA、脱敏轨迹摘录及
+请求计时核对在 <code>/tmp/agentenv-terminal-max-abi-20261014/timeout-investigation/analysis.json</code>。
+这是历史记录分析，本次未新增模型请求、重跑任务或修改运行行为。</p>
+<p>本轮及后续新旧运行时对照均关闭 <code>pause_taskvm_during_inference</code>；两机首次复测
+和对照目录均未出现 <code>pause-resume.jsonl</code> 或生命周期事件，新增超时不能归因于
+推理期间休眠/唤醒。Harbor 0.24.0 的 Agent 阶段以 <code>asyncio.wait_for(agent.run, timeout=timeout_sec)</code> 计时；若开启该功能，pause、模型请求与 resume 都在该调用
+内部，VM 暂停不会暂停 Agent 的时间预算。计时源码摘要与事件审计保存在
+<code>/tmp/agentenv-terminal-max-rerun-20261014/</code> 的 <code>quota-timer-evidence.json</code> 和
+<code>pause-resume-audit.json</code>。</p>
+<h2 id="新增超时项的新旧运行时对照2026-10-14"><a class="header" href="#新增超时项的新旧运行时对照2026-10-14">新增超时项的新旧运行时对照（2026-10-14）</a></h2>
+<p>对前述 8 项新增超时各运行一次新、旧 server/runner，共 16 个模型 trial，
+使用 Qwen3.8-Max。每个任务的新旧组固定在同一宿主：A 6 项、B 2 项；
+A 先新后旧、B 先旧后新。两组实际任务契约、阶段预算、Agent 驱动/参数、
+4c8g guest、节点配额、kernel/tools 摘要均相同，运行时及匹配的 ABI 元数据不同。
+无 trial 重试，inference pause 关闭；旧二进制摘要与 10-12 留存证据一致。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>任务</th><th>新运行时 reward / 状态</th><th>旧运行时 reward / 状态</th></tr>
+</thead>
+<tbody>
+<tr><td>adaptive-rejection-sampler</td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td>chess-best-move</td><td>0 / 超时</td><td>0 / 超时</td></tr>
+<tr><td>count-dataset-tokens</td><td>1 / 通过</td><td>0 / 完成但未通过</td></tr>
+<tr><td>db-wal-recovery</td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td>financial-document-processor</td><td>1 / 通过</td><td>1 / 超时</td></tr>
+<tr><td>largest-eigenval</td><td>1 / 通过</td><td>1 / 通过</td></tr>
+<tr><td>llm-inference-batching-scheduler</td><td>1 / 通过</td><td>0 / 超时</td></tr>
+<tr><td>winning-avg-corewars</td><td>0 / 超时</td><td>0 / 超时</td></tr>
+</tbody>
+</table>
+</div>
+<p>新组 3/8 超时、5/8 无异常通过；旧组 5/8 超时、2/8 无异常通过，另有一项
+正常 0 分。旧组 financial-document-processor 虽超时仍得 1，原生得分为
+3/8。新组独有超时为零；仅旧组超时为 financial-document-processor 和
+llm-inference-batching-scheduler。首次新环境复测中，这 8 项全部超时。</p>
+<p>本次没有复现新运行时系统性增加超时，休眠/唤醒也未参与这些 trial；结果不支持
+将此前净增 6 项超时直接归因于 ABI 修改。不能证明所有环境变化无关：每项每组
+仅一次模型采样，模型服务和外部依赖仍会变化，两组都使用当前驱动；实际活跃
+任务上限为 A 6/B 2，低于 71 项基线的每机八槽，并非完整复刻 10-12 部署。</p>
+<p>新/旧组已返回请求分别 205/201 次，往返中位数 14.22/13.72 秒、P95
+41.18/43.63 秒；已取消请求可能没有完整计时，不将往返差异解释为单独的
+服务端或 VMM 性能变化。16 个 sandbox 删除、8 项失败取证、两机宿主恢复
+和候选源码/操作摘要检查全部通过。逐项来源 SHA、有效配置及收尾回执见
+<code>/tmp/agentenv-terminal-max-rerun-20261014/</code> 的 <code>task-results.json</code>、
+<code>final-summary.json</code> 和 <code>final-evidence/</code>。</p>
 <h2 id="原生证据"><a class="header" href="#原生证据">原生证据</a></h2>
 <p>Flash执行：2026-10-11 19:53:14 → 2026-10-11 22:10:19；Max执行：2026-10-12 09:56:20 → 2026-10-12 11:43:57，均为UTC+8。</p>
 <p>两机原生记录分别保留在 <code>/var/tmp/hb1008/terminal-benchmark-20261011/shard-{0,1}-r1/run</code> 与 <code>/var/tmp/hb1008/qwen-max-20261012/shard-{0,1}/run</code>；sandbox只在删除回执核对后记完成。所有14项Max异常取证成功，清理无错误，冻结候选摘要核对通过。systemd非零退出来自任务异常汇总，队列reason=completed且pending=0，不是仍在运行或清理失败。</p>
