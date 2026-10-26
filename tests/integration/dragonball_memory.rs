@@ -537,7 +537,10 @@ async fn dragonball_memory_shared_memory_retires_with_pool_enabled() -> Result<(
     config["pool"]["block"]["enabled"] = toml::Value::Boolean(true);
     // Leave enough idle capacity that the last RAM generation really would be
     // cached; overflow deletion must not make the negative control pass.
-    config["pool"]["high_watermark"] = toml::Value::Integer(64);
+    config["pool"]
+        .as_table_mut()
+        .context("pool configuration table")?
+        .insert("high_watermark".into(), toml::Value::Integer(64));
     let config_path = root.path().join("pool-enabled.toml");
     std::fs::write(&config_path, toml::to_string(&config)?)?;
     let status = tokio::time::timeout(
