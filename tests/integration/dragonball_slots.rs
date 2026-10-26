@@ -175,8 +175,9 @@ async fn slot_launch_cases(cases: &[(u64, bool, usize)]) -> Result<()> {
                 "missing backing unexpectedly started"
             );
             drop(failed);
+            // Existing recorders may retire; every newly allocated runtime must disappear.
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while live_works()? != before {
+                while !live_works()?.is_subset(&before) {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 Ok::<_, anyhow::Error>(())
