@@ -84,7 +84,11 @@ async fn dragonball_lifecycle_posix_volume_snapshot_rebinds_logical_devices() ->
             virtual_size: Some(128 << 20),
             sub_path: None,
             snapshot_output_dir: (volume && !read_only).then_some(output),
-            volume,
+            kind: if volume {
+                agentenv::types::ExtraDriveKind::Volume
+            } else {
+                agentenv::types::ExtraDriveKind::Physical
+            },
         });
         originals.push(record);
     }
@@ -994,7 +998,11 @@ async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
         virtual_size: Some(1024 * 1024 * 1024),
         sub_path: None,
         snapshot_output_dir: volume.then_some(output.clone()),
-        volume,
+        kind: if volume {
+            agentenv::types::ExtraDriveKind::Volume
+        } else {
+            agentenv::types::ExtraDriveKind::Physical
+        },
     };
     let mut source_spec = spec(&assets)?;
     source_spec.context.user = Some("root".into());
