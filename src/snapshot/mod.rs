@@ -23,7 +23,9 @@ pub use startup_pack::{
     ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,
     MEMORY_STARTUP_TRACE_ARTIFACT,
 };
-pub(crate) use types::{default_backend, MANIFEST_FORMAT_VERSION};
+pub(crate) use types::default_backend;
+#[cfg(feature = "hypervisor-dragonball")]
+pub(crate) use types::MANIFEST_FORMAT_VERSION;
 pub(crate) use types::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,

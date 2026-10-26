@@ -24,8 +24,9 @@ use overlaybd::config::{ImageConfig, LayerConfig};
 use tracing::{debug, warn};
 
 use crate::cfg::ConfigManager;
+use crate::overlaybd::{compact_layers, OverlaybdCompactOutput};
 use crate::sandbox::ublk::UblkDevice;
-use crate::sandbox::ublk::{compact_layers, OverlaybdCompactOutput, UblkDeviceManager};
+use crate::sandbox::ublk::UblkDeviceManager;
 use crate::sandbox::SandboxCaptureError;
 
 // Preserve the existing host layout: this is shared artifact storage, not a

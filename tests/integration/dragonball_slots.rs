@@ -3,7 +3,7 @@ use agentenv::sandbox::{
     ExtraDrive, SandboxBackend, SandboxBackendFactory, SandboxExecutor,
 };
 use agentenv::snapshot::{
-    repository::backends::{PosixFsBackend, PosixFsBackendConfig},
+    backends::{PosixFsBackend, PosixFsBackendConfig},
     SnapshotManager,
 };
 use agentenv::volume::{VolumeManager, VolumeMode};
@@ -88,7 +88,7 @@ async fn slot_launch_cases(cases: &[(u64, bool, usize)]) -> Result<()> {
         );
     }
     let metadata = publish_metadata(source_id, &build, &assets, &captured)?;
-    let record = snapshots.publish_captured(metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(&snapshots, metadata, captured).await?;
     source.stop().await?;
     drop(source);
     let runnable = snapshots
@@ -249,7 +249,8 @@ async fn slot_launch_cases(cases: &[(u64, bool, usize)]) -> Result<()> {
                         layers: volume.backing_layers,
                     });
             }
-            let bound_record = snapshots.publish_captured(metadata, captured).await?;
+            let bound_record =
+                agentenv::sandbox::publish_captured(&snapshots, metadata, captured).await?;
             let bound = snapshots
                 .load_runnable(bound_record.id.to_string())
                 .await?

@@ -7,7 +7,9 @@ mod version;
 pub use crate::types::{ExternalLayer, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId};
 pub use artifacts::SNAPSHOT_ARTIFACT_LAYOUT;
 pub use drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
-pub(crate) use manifest::{default_backend, MANIFEST_FORMAT_VERSION};
+pub(crate) use manifest::default_backend;
+#[cfg(feature = "hypervisor-dragonball")]
+pub(crate) use manifest::MANIFEST_FORMAT_VERSION;
 pub use manifest::{
     SandboxSnapshotManifest, SnapshotVolumeDevice, SnapshotVolumeSlot, DRAGONBALL_BACKEND,
     FIRECRACKER_BACKEND,

@@ -1,6 +1,8 @@
 #[cfg(test)]
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Error as AnyhowError;

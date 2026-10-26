@@ -1,3 +1,4 @@
+use agentenv::volume::VolumeCatalog;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -25,7 +26,7 @@ use serde_json::Value;
 #[ignore = "real POSIX VM snapshot with managed volumes, attached disk and deleted source catalogs"]
 async fn dragonball_lifecycle_posix_volume_snapshot_rebinds_logical_devices() -> Result<()> {
     use agentenv::snapshot::{
-        repository::backends::{PosixFsBackend, PosixFsBackendConfig},
+        backends::{PosixFsBackend, PosixFsBackendConfig},
         SnapshotManager, SnapshotVolume,
     };
     use agentenv::volume::{VolumeManager, VolumeMode, VolumeRecord};
@@ -145,7 +146,7 @@ async fn dragonball_lifecycle_posix_volume_snapshot_rebinds_logical_devices() ->
             layers: record.backing_layers,
         });
     }
-    let record = snapshots.publish_captured(metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(&snapshots, metadata, captured).await?;
     drop(later_capture);
     source.stop().await?;
     drop(source);
@@ -312,7 +313,7 @@ async fn dragonball_lifecycle_posix_publication_restores_after_source_stop() -> 
     let metadata = publish_metadata(id, &spec, &assets, &captured)?;
     let root = tempfile::tempdir()?;
     let manager = posix_manager(root.path())?;
-    let record = manager.publish_captured(metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     assert!(ram_progress(&source, &marker).await? > before);
     source.stop().await?;
     drop(source);
@@ -377,20 +378,19 @@ async fn m1_publish_failure_does_not_stop_source() -> Result<()> {
     let captured = source.snapshot().await?;
     let mut metadata = publish_metadata(id, &spec, &assets, &captured)?;
     metadata.alias = Some(alias.clone());
-    let record = manager.publish_captured(metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     let before = ram_progress(&source, &marker).await?;
     let captured = source.snapshot().await?;
     let mut metadata = publish_metadata(id, &spec, &assets, &captured)?;
     metadata.alias = Some(alias);
     let rejected = metadata.id.to_string();
-    let error = manager
-        .publish_captured(metadata, captured)
+    let error = agentenv::sandbox::publish_captured(&manager, metadata, captured)
         .await
         .expect_err("real alias-conflicting repository commit");
     assert!(
         matches!(
             error,
-            agentenv::snapshot::RepositoryError::AliasConflict { .. }
+            agentenv::repository::RepositoryError::AliasConflict { .. }
         ),
         "{error:#}"
     );
@@ -418,12 +418,12 @@ async fn m1_record_mismatch_allocates_nothing() -> Result<()> {
     let captured = source.snapshot().await?;
     let root = tempfile::tempdir()?;
     let manager = posix_manager(root.path())?;
-    let record = manager
-        .publish_captured(
-            publish_metadata(launch.sandbox_id, &spec, &assets, &captured)?,
-            captured,
-        )
-        .await?;
+    let record = agentenv::sandbox::publish_captured(
+        &manager,
+        publish_metadata(launch.sandbox_id, &spec, &assets, &captured)?,
+        captured,
+    )
+    .await?;
     let mut changed = record.clone();
     changed
         .committed
@@ -3301,7 +3301,7 @@ async fn dragonball_lifecycle_new_identity_requires_guest_confirmation() -> Resu
     let metadata = publish_metadata(id, &build, &assets, &captured)?;
     let root = tempfile::tempdir()?;
     let manager = posix_manager(root.path())?;
-    let record = manager.publish_captured(metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     source.stop().await?;
     let runnable = manager
         .load_runnable(record.id.to_string())

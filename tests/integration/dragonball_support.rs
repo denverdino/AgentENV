@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 pub(super) fn posix_manager(root: &std::path::Path) -> Result<agentenv::snapshot::SnapshotManager> {
-    use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use agentenv::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     let (repository, resolver) = PosixFsBackend::new(PosixFsBackendConfig {
         root: root.join("repository"),
         cache_root: Some(root.join("cache")),
@@ -41,6 +41,7 @@ pub(super) fn publish_metadata(
         alias: None,
         source: SnapshotPublishSource::Sandbox {
             source_sandbox_id: source.to_string(),
+            source_sandbox_metadata: None,
         },
         context: spec.context.clone(),
         startup: None,

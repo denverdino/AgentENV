@@ -1929,7 +1929,7 @@ impl FirecrackerSandbox {
         );
 
         self.resources.network_slot = Some(warm.slot);
-        self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
+        self.work_dir = Arc::new(warm.work_dir); // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
         let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
         if let Err(err) = relocate_warm_log(warm_stdout.as_deref(), &self.firecracker_stdout_path())
         {
@@ -2167,6 +2167,9 @@ impl FirecrackerSandbox {
             )
             .await
             .context("create or reuse shared memory ublk device for resume")?;
+        if let Some(root) = config.managed_snapshot_root.as_ref() {
+            mem_device.retain_artifact(root.clone());
+        }
         let device_path = mem_device.device_path().to_path_buf();
 
         if let Some(pack) = &config.memory_startup_pack {
@@ -2178,10 +2181,15 @@ impl FirecrackerSandbox {
                     .stop_startup_prefetch(self.runtime_policy.socket_timeout)
                     .await;
                 self.resources.startup_prefetch_task =
-                    Some(super::startup_pack::submit_local_startup_prefetch(
+                    Some(crate::sandbox::startup_pack::submit_local_startup_prefetch(
                         mem_device.clone(),
                         mem_global_config.clone(),
                         pack.clone(),
+                        &ConfigManager::global_config().snapshot.memory_startup_pack,
+                        config
+                            .managed_snapshot_root
+                            .clone()
+                            .map(|root| root as Arc<dyn std::any::Any + Send + Sync>),
                     ));
             }
         }
@@ -2703,7 +2711,7 @@ mod tests {
             sandbox.work_dir = Arc::new(tempfile::tempdir_in(fixture.path())?);
             sandbox.recording_lease = Some(workspace.clone());
             if fail_release {
-                sandbox.mem_dedicated_device =
+                sandbox.resources.mem_dedicated_device =
                     Some(crate::sandbox::ublk::unallocated_test_device());
             }
             drop(workspace); // Publisher/capture no longer owns the workspace.
@@ -2726,7 +2734,8 @@ mod tests {
             sandbox.work_dir = Arc::new(tempfile::tempdir_in(fixture.path())?);
             sandbox.recording_lease = Some(workspace);
             // No RPC runs: this runtime is deliberately never polled.
-            sandbox.mem_dedicated_device = Some(crate::sandbox::ublk::unallocated_test_device());
+            sandbox.resources.mem_dedicated_device =
+                Some(crate::sandbox::ublk::unallocated_test_device());
             drop(sandbox);
         }
         runtime.shutdown_background();
@@ -2742,16 +2751,20 @@ mod tests {
         let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
         sandbox.work_dir = Arc::new(tempfile::tempdir_in(fixture.path())?);
         let backing = sandbox.work_dir.path().to_path_buf();
-        sandbox.mem_dedicated_device = Some(crate::sandbox::ublk::unallocated_test_device());
-        sandbox.extra_drive_runtimes.push(OverlaybdRuntimeHandle {
-            device: crate::sandbox::ublk::unallocated_test_device(),
-            image_config_path: backing.join("extra/image.json"),
-            actual_virtual_size: 4096,
-        });
+        sandbox.resources.mem_dedicated_device =
+            Some(crate::sandbox::ublk::unallocated_test_device());
+        sandbox
+            .resources
+            .extra_drive_runtimes
+            .push(OverlaybdRuntimeHandle {
+                device: crate::sandbox::ublk::unallocated_test_device(),
+                image_config_path: backing.join("extra/image.json"),
+                actual_virtual_size: 4096,
+            });
         let manager = NetworkManager::global_for_cleanup_test();
         let slot = manager.allocate_slot(301)?;
         let index = slot.idx;
-        sandbox.network_slot = Some(slot);
+        sandbox.resources.network_slot = Some(slot);
 
         let error = sandbox.stop().await.unwrap_err();
         let replacement = manager

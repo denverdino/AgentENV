@@ -27,12 +27,12 @@ async fn dragonball_compatibility_previous_kata_snapshots_rejected_without_lease
     source.start().await?;
     let captured = source.snapshot().await?;
     let manager = posix_manager(root.path())?;
-    let mut record = manager
-        .publish_captured(
-            publish_metadata(launch.sandbox_id, &spec, &assets, &captured)?,
-            captured,
-        )
-        .await?;
+    let mut record = agentenv::sandbox::publish_captured(
+        &manager,
+        publish_metadata(launch.sandbox_id, &spec, &assets, &captured)?,
+        captured,
+    )
+    .await?;
     let pause_root = root.path().join("paused");
     let paused = source.pause(Some(&pause_root)).await?;
     let mut paused_record = paused.encode()?;
@@ -227,12 +227,12 @@ async fn dragonball_compatibility_different_builds_restore_published_and_paused(
         reader_identity.restore_abi_id
     );
     let manager = posix_manager(root.path())?;
-    let record = manager
-        .publish_captured(
-            publish_metadata(source_launch.sandbox_id, &spec, &assets, &captured)?,
-            captured,
-        )
-        .await?;
+    let record = agentenv::sandbox::publish_captured(
+        &manager,
+        publish_metadata(source_launch.sandbox_id, &spec, &assets, &captured)?,
+        captured,
+    )
+    .await?;
     let pause_root = root.path().join("paused");
     let paused = source.pause(Some(&pause_root)).await?;
     let encoded = paused.encode()?;

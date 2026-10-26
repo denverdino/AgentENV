@@ -41,7 +41,7 @@ pub struct SandboxSnapshotManifest {
     #[serde(default = "default_backend")]
     pub backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_identity: Option<crate::sandbox::restore_identity::SnapshotRestoreIdentity>,
+    pub restore_identity: Option<agentenv_vmm_protocol::runtime::SnapshotRestoreIdentity>,
     pub vm_state: SnapshotVmStateArtifacts,
     pub memory: SnapshotMemoryArtifacts,
     pub rootfs: SnapshotRootfsArtifacts,
@@ -194,7 +194,7 @@ impl SandboxSnapshotManifest {
     }
 
     pub fn new_dragonball(
-        identity: crate::sandbox::restore_identity::SnapshotRestoreIdentity,
+        identity: agentenv_vmm_protocol::runtime::SnapshotRestoreIdentity,
         vm_state_path: impl Into<PathBuf>,
         mem_image_config_path: impl Into<PathBuf>,
         mem_virtual_size: u64,

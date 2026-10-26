@@ -97,7 +97,7 @@ async fn dragonball_memory_prefetch_failure_keeps_snapshot_runnable() -> Result<
     let metadata = publish_metadata(id, &build, &assets, &captured)?;
     let root = tempfile::tempdir_in(&app.runtime_path)?;
     let manager = posix_manager(root.path())?;
-    let mut record = manager.publish_captured(metadata, captured).await?;
+    let mut record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     vm.stop().await?;
     assert!(record.committed.as_ref().unwrap().memory_startup.is_none());
     let size = u64::from(build.resources.memory_mib) << 20;
@@ -245,8 +245,9 @@ async fn cancellation_case(shutdown: bool) -> Result<()> {
         "hold test publication lock"
     );
     let task_manager = manager.clone();
-    let publish =
-        tokio::spawn(async move { task_manager.publish_captured(metadata, captured).await });
+    let publish = tokio::spawn(async move {
+        agentenv::sandbox::publish_captured(&task_manager, metadata, captured).await
+    });
     let device = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(device) = mapped_memory_device(&app.runtime_path).await {
@@ -398,7 +399,10 @@ async fn recording_case(record: bool, consume: bool, failure: bool) -> Result<()
     };
     // Publication can outlast the recording window. Observe concurrently, not
     // after publication has already allowed the throwaway VM to be reaped.
-    let (published, observed) = tokio::join!(manager.publish_captured(metadata, captured), observe);
+    let (published, observed) = tokio::join!(
+        agentenv::sandbox::publish_captured(&manager, metadata, captured),
+        observe
+    );
     let record = published?;
     vm.stop().await?;
     observed?;
@@ -574,7 +578,7 @@ async fn dragonball_memory_ready_releases_rootfs_and_memory_downloads() -> Resul
     let metadata = publish_metadata(id, &build, &assets, &captured)?;
     let root = tempfile::tempdir_in(&app.runtime_path)?;
     let manager = posix_manager(root.path())?;
-    let record = manager.publish_captured(metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     vm.stop().await?;
     let runnable = manager.resolve_runnable(record.clone()).await?;
     let memory = runnable

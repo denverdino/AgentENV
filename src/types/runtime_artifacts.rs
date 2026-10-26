@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Opaque set of local runtime artifacts a sandbox needs while it is alive.
@@ -5,7 +6,7 @@ use std::path::PathBuf;
 /// Sandbox backends construct this from their runtime config, the orchestrator
 /// carries it across lifecycle boundaries, and the image-liveness layer decides
 /// how to protect the concrete local artifacts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifactSet {
     overlaybd_image_config_paths: Vec<PathBuf>,
 }

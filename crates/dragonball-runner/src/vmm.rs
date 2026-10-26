@@ -262,6 +262,7 @@ impl ProbeVmm for DragonballVmm {
         self.action(VmmAction::SaveMicrovm {
             state_path: state_fd.clone(),
             mem_path: memory_fd,
+            reset_vsock_transport: false,
         })?;
         let machine = self.machine.as_ref().context("probe machine missing")?;
         crate::probe_snapshot::stamp_identity(Path::new(&state_fd), machine)?;
@@ -293,6 +294,7 @@ impl ProbeVmm for DragonballVmm {
         self.action(VmmAction::StartMicroVmFromSnapshot {
             state_path: state_fd,
             mem_path: memory_fd,
+            reset_vsock_pending: false,
         })?;
         Ok(())
     }

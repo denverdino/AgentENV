@@ -11,7 +11,7 @@ fn runtime_identity_cli_reports_reader_build_before_resource_allocation() {
     let identity: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         identity["dragonball_revision"],
-        "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
+        "bc7edb0faf6e109c013a0659dde0c7a502a5f297"
     );
     assert_eq!(identity["feature_profile"], "db-virtio-blk-net-balloon-v2");
     assert_eq!(identity["snapshot_format_epoch"], 2);
@@ -38,7 +38,7 @@ fn identity_cli_reports_pinned_revision_without_kvm() {
     let identity: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         identity["dragonball_revision"],
-        "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e"
+        "bc7edb0faf6e109c013a0659dde0c7a502a5f297"
     );
     assert_eq!(identity["protocol_version"], 1);
     assert_eq!(identity["feature_profile"], "m0-mmio-blk-net");

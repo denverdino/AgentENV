@@ -37,7 +37,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use custom_extension_client::apis::{
     configuration::Configuration, default_api, Error as ClientError,
 };

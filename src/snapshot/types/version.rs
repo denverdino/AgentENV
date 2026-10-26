@@ -7,7 +7,7 @@ pub struct SnapshotRuntimeVersions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vmm_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_identity: Option<crate::sandbox::restore_identity::SnapshotRestoreIdentity>,
+    pub restore_identity: Option<agentenv_vmm_protocol::runtime::SnapshotRestoreIdentity>,
     pub kernel_version: String,
     pub firecracker_version: String,
     pub envd_version: String,
@@ -23,7 +23,7 @@ impl SnapshotRuntimeVersions {
         tools_drive_version: String,
     ) -> Self {
         Self {
-            backend: crate::sandbox::FIRECRACKER_BACKEND.into(),
+            backend: crate::snapshot::FIRECRACKER_BACKEND.into(),
             vmm_version: None,
             restore_identity: None,
             kernel_version,
@@ -34,7 +34,7 @@ impl SnapshotRuntimeVersions {
     }
 
     pub fn from_dragonball(
-        identity: crate::sandbox::restore_identity::SnapshotRestoreIdentity,
+        identity: agentenv_vmm_protocol::runtime::SnapshotRestoreIdentity,
     ) -> anyhow::Result<Self> {
         identity.validate_profile().map_err(anyhow::Error::msg)?;
         Ok(Self {

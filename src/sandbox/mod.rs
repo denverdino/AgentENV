@@ -11,7 +11,9 @@ mod envd;
 mod extra_drive;
 #[cfg(feature = "hypervisor-firecracker")]
 mod firecracker;
+#[cfg(feature = "hypervisor-dragonball")]
 mod guest;
+#[cfg(feature = "hypervisor-firecracker")]
 mod guest_volumes;
 pub(crate) mod logs;
 pub mod selected;
@@ -55,8 +57,6 @@ pub use backend::{
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo, TemplateSandboxFactory,
 };
 pub use envd::EnvdApi;
-#[cfg(feature = "hypervisor-firecracker")]
-pub(crate) use firecracker::record_startup_pack;
 #[cfg(feature = "hypervisor-firecracker")]
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,

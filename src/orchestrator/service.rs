@@ -16,9 +16,9 @@ use crate::image::cache::{
 };
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi, FreshSandboxBuildSpec,
-    PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo, SelectedSandboxFactory,
+    RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureError, SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry,
+    SandboxNetworkPolicy, SandboxRuntimeInfo, SelectedSandboxFactory,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};

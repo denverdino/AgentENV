@@ -27,4 +27,4 @@ libc = "0.2"
 crossbeam-channel = "0.5"
 seccompiler = "0.5"
 vmm-sys-util = "0.15"
-dragonball = { git = "https://github.com/denverdino/kata-containers.git", rev = "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e", default-features = false, features = ["virtio-blk", "virtio-net", "virtio-balloon"] }
+dragonball = { git = "https://github.com/denverdino/kata-containers.git", rev = "bc7edb0faf6e109c013a0659dde0c7a502a5f297", default-features = false, features = ["virtio-blk", "virtio-net", "virtio-balloon"] }

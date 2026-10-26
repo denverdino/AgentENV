@@ -17,13 +17,12 @@ use agentenv::{
         dragonball::{DragonballMemoryMode, DragonballRuntimePolicy, DragonballSandboxFactory},
         SandboxBackend, SandboxBackendFactory, SandboxExecutor,
     },
-    snapshot::{repository::backends::OssBackend, SnapshotManager},
+    snapshot::{backends::OssBackend, SnapshotCatalog, SnapshotManager},
     virtualization::VirtualizationMode,
 };
 use agentenv::{
-    identity::NodeIdentity,
-    p2p::*,
-    snapshot::repository::{backends::build_snapshot_backend, SnapshotRepository},
+    identity::NodeIdentity, p2p::*, repository::Repository,
+    snapshot::backends::build_snapshot_backend,
 };
 use anyhow::{Context, Result};
 use axum::{extract::State, http::StatusCode, Json, Router};
@@ -183,7 +182,7 @@ async fn dragonball_platform_timeout_reaps_native_fixtures() -> Result<()> {
 struct ObservedPeer {
     inner: Arc<dyn P2pTransport>,
     hints: Vec<P2pArtifactProviderHint>,
-    commit: Option<(Arc<dyn SnapshotRepository>, String)>,
+    commit: Option<(Arc<dyn Repository>, String)>,
     publications: AtomicUsize,
     downloads: AtomicUsize,
     fail_publish: AtomicBool,
@@ -320,7 +319,7 @@ async fn dragonball_platform_oss_p2p_commit_and_fallback() -> Result<()> {
     provider.commit = Some((repository.clone(), metadata.id.to_string()));
     let provider = Arc::new(provider);
     let producer = SnapshotManager::from_parts(repository, resolver, Some(provider.clone()));
-    let stored = producer.publish_captured(metadata, captured).await?;
+    let stored = agentenv::sandbox::publish_captured(&producer, metadata, captured).await?;
     assert!(provider.publications.load(Ordering::SeqCst) >= 3);
     source.stop().await?;
     drop(source);
@@ -425,7 +424,7 @@ async fn dragonball_platform_oss_p2p_commit_and_fallback() -> Result<()> {
     failing.fail_publish.store(true, Ordering::SeqCst);
     let failing = Arc::new(failing);
     let manager = SnapshotManager::from_parts(repository, resolver, Some(failing.clone()));
-    let retained = manager.publish_captured(metadata, captured).await?;
+    let retained = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     assert!(failing.publications.load(Ordering::SeqCst) >= 2);
     assert!(
         oss_manager(&s3.config, root.path().join("final-empty-cache"))?
@@ -473,7 +472,7 @@ async fn dragonball_platform_posix_missing_artifact_is_not_peer_repaired() -> Re
     provider.commit = Some((repository.clone(), metadata.id.to_string()));
     let provider = Arc::new(provider);
     let manager = SnapshotManager::from_parts(repository, resolver, Some(provider.clone()));
-    let stored = manager.publish_captured(metadata, captured).await?;
+    let stored = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
     source.stop().await?;
     let mut consumer = ObservedPeer::new(&app, root.path(), "posix-consumer").await?;
     consumer.hints.push(P2pArtifactProviderHint {
@@ -1010,12 +1009,12 @@ async fn dragonball_platform_oss_capture_restore_preserves_identity() -> Result<
         .to_path_buf();
     let identity = capture.manifest().restore_identity.clone();
     let producer = oss_manager(&s3.config, root.path().join("producer"))?;
-    let stored = producer
-        .publish_captured(
-            publish_metadata(initial.sandbox_id, &spec, &assets, &capture)?,
-            capture,
-        )
-        .await?;
+    let stored = agentenv::sandbox::publish_captured(
+        &producer,
+        publish_metadata(initial.sandbox_id, &spec, &assets, &capture)?,
+        capture,
+    )
+    .await?;
     source.stop().await?;
     drop(source);
     drop(producer);
@@ -1192,9 +1191,9 @@ async fn dragonball_platform_extension_patch_roundtrip() -> Result<()> {
     let mut publication =
         publish_metadata(id, &spec(&assets)?, &assets, &captured.captured_snapshot)?;
     publication.custom_extension_params = captured.metadata.custom_extension_params;
-    let record = manager
-        .publish_captured(publication, captured.captured_snapshot)
-        .await?;
+    let record =
+        agentenv::sandbox::publish_captured(&manager, publication, captured.captured_snapshot)
+            .await?;
     let runnable = manager
         .load_runnable(record.id.to_string())
         .await?

@@ -12,7 +12,7 @@ use overlaybd::{virtual_file::VirtualFile, ImageService};
 use serde::Serialize;
 
 use super::sandbox::{DragonballSandbox, RuntimeStarted};
-use crate::sandbox::ublk::OverlaybdCompactOutput;
+use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::{
     storage_snapshot::{
         canonicalized_runtime_owned_roots, managed_snapshot_base,

@@ -15,14 +15,14 @@ SH
 cat > "$work/assets/runner" <<'SH'
 #!/bin/sh
 test "$1 $2" = '--runtime --version-json' || exit 1
-printf '%s\n' '{"dragonball_revision":"9e41795fea9109bc1acf7b1f6d6b878cfff7b72e","feature_profile":"db-virtio-blk-net-balloon-v2","snapshot_format_epoch":2,"runner_build_id":"sha256:fixture"}'
+printf '%s\n' '{"dragonball_revision":"bc7edb0faf6e109c013a0659dde0c7a502a5f297","feature_profile":"db-virtio-blk-net-balloon-v2","snapshot_format_epoch":2,"runner_build_id":"sha256:fixture"}'
 SH
 cp "$work/assets/server" "$work/assets/daemon"
 chmod 755 "$work/assets/"{server,runner,daemon}
 for asset in kernel kernel_config tools license notice; do printf 'fixture %s\n' "$asset" > "$work/assets/$asset"; done
 jq -n --arg dir "$work/assets" '{
   version:"m3-test", source_revision:"1111111111111111111111111111111111111111",
-  kata_revision:"9e41795fea9109bc1acf7b1f6d6b878cfff7b72e",
+  kata_revision:"bc7edb0faf6e109c013a0659dde0c7a502a5f297",
   kernel_version:"6.1.175-dragonball-m2.1",tools_version:"0.1.0",
   sources:{node:"https://github.com/kvcache-ai/AgentENV",kata:"https://github.com/denverdino/kata-containers",kernel:"https://kernel.org",tools:"fixture"},
   assets:(["server","runner","daemon","kernel","kernel_config","tools"] | map({key:.,value:{path:($dir+"/"+.)}}) | from_entries),

@@ -8,10 +8,9 @@ use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 use crate::types::ExtraDrive;
-pub(crate) use crate::types::{
-    validate_mount_path, validate_sub_path, ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID,
-    VOLUME_DRIVE_SLOT_PREFIX,
-};
+pub(crate) use crate::types::VOLUME_DRIVE_SLOT_PREFIX;
+#[cfg(feature = "hypervisor-dragonball")]
+pub(crate) use crate::types::{validate_mount_path, validate_sub_path};
 
 pub(crate) fn prepare_volume_drive_slots(
     physical_extra_drive_count: usize,

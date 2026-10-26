@@ -1,3 +1,4 @@
+use agentenv::volume::VolumeCatalog;
 use std::{
     sync::{Arc, RwLock},
     time::Duration,
@@ -288,15 +289,16 @@ async fn selected_backend_reports_metrics_and_invalidates_dropped_executor() -> 
     source.start().await?;
     let result = async {
         let sample = source
-            .metrics_sample()
+            .envd()
             .context("backend has no guest metrics")?
+            .metrics()
             .await?;
         assert!(sample.cpu_count > 0 && sample.mem_total > 0);
         Ok(())
     }
     .await;
     let executor = source.executor()?;
-    let pending = source.metrics_sample();
+    let pending = source.envd();
     drop(source);
     assert!(
         executor
@@ -307,7 +309,7 @@ async fn selected_backend_reports_metrics_and_invalidates_dropped_executor() -> 
     );
     if let Some(pending) = pending {
         assert!(
-            pending.await.is_err(),
+            pending.metrics().await.is_err(),
             "dropped runtime metrics remained live"
         );
     }
@@ -396,6 +398,7 @@ async fn selected_backend_volume_capture_is_immutable_and_fork_uses_latest_cut()
         alias: None,
         source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
             source_sandbox_id: source_id.to_string(),
+            source_sandbox_metadata: None,
         },
         context: spec.context.clone(),
         startup: None,
@@ -459,7 +462,7 @@ async fn selected_backend_volume_capture_is_immutable_and_fork_uses_latest_cut()
         drop(second);
         source.stop().await?;
         volumes.delete(&volume.id).await?;
-        let record = snapshots.publish_captured(publication, first).await?;
+        let record = agentenv::sandbox::publish_captured(&snapshots, publication, first).await?;
         let captured_volume = &record.committed.as_ref().context("published capture")?.volume_snapshots[0];
         let restored_volume: agentenv::volume::VolumeRecord = serde_json::from_value(serde_json::json!({
             "id": format!("vol_{}", uuid::Uuid::now_v7().simple()), "name": "contract-restored",

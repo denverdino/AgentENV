@@ -76,6 +76,12 @@ read at most 64 KiB, and failure archives retain the existing bounded tails.
 See [component design](../internals/hypervisor-components-design.md) for the
 composition boundary and qualification requirements.
 
+## `[dragonball]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `binary_path` | string | unset | Required path to the matching `aenv-dragonball` runner for a Dragonball-only build. Overridden by `AENV_DRAGONBALL_BINARY_PATH`; setup validates the executable and does not download it |
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.

@@ -57,7 +57,7 @@ impl SnapshotPublishMetadata {
             startup: None,
             resources: SandboxResources::default(),
             runtime_versions: SnapshotRuntimeVersions {
-                backend: crate::sandbox::FIRECRACKER_BACKEND.into(),
+                backend: crate::snapshot::FIRECRACKER_BACKEND.into(),
                 vmm_version: None,
                 restore_identity: None,
                 kernel_version: "kernel".to_string(),
@@ -373,7 +373,7 @@ impl CommittedSnapshot {
             context: CommandContext::default(),
             startup: None,
             runtime_versions: SnapshotRuntimeVersions {
-                backend: crate::sandbox::FIRECRACKER_BACKEND.into(),
+                backend: crate::snapshot::FIRECRACKER_BACKEND.into(),
                 vmm_version: None,
                 restore_identity: None,
                 kernel_version: "kernel".to_string(),

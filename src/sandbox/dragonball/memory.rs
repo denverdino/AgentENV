@@ -1,3 +1,4 @@
+use crate::overlaybd::OverlaybdCompactOutput;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -12,9 +13,7 @@ use crate::sandbox::memory_snapshot::{write_sparse_memory_overlaybd, MemorySegme
 use crate::sandbox::storage_snapshot::{
     build_mem_snapshot_image_config_with_runtime_roots, canonicalized_runtime_owned_roots,
 };
-use crate::sandbox::ublk::{
-    OverlaybdCompactOutput, SharedReadOnlyDevice, UblkCreateSpec, UblkDeviceManager,
-};
+use crate::sandbox::ublk::{SharedReadOnlyDevice, UblkCreateSpec, UblkDeviceManager};
 
 pub(super) async fn write_incremental_memory(
     map: &FrozenMemoryMap,

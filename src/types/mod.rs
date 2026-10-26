@@ -8,11 +8,13 @@ mod runtime_artifacts;
 mod snapshot_id;
 mod volume_mode;
 
+pub(crate) use extra_drive::VOLUME_DRIVE_SLOT_PREFIX;
 pub use extra_drive::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
     validate_sub_path, ExtraDrive, ExtraDriveKind,
 };
-pub(crate) use extra_drive::{ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX};
+#[cfg(feature = "hypervisor-firecracker")]
+pub(crate) use extra_drive::{ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID};
 pub use id::SandboxId;
 pub use image_configs::ImageConfigs;
 pub use image_tag::{ImageName, ImageTag, DEFAULT_IMAGE_TAG};

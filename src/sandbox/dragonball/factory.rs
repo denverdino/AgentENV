@@ -455,12 +455,10 @@ mod component_tests {
         directory: &std::path::Path,
         occupied: bool,
     ) -> (DragonballSandboxFactory, RunnableSnapshot) {
-        use crate::sandbox::manifest::{
-            SandboxSnapshotManifest, SnapshotVolumeDevice, SnapshotVolumeSlot,
-        };
         use crate::snapshot::{
             CommittedSnapshot, SnapshotRecord, SnapshotRuntimeVersions, SnapshotVolume,
         };
+        use crate::snapshot::{SandboxSnapshotManifest, SnapshotVolumeDevice, SnapshotVolumeSlot};
         use agentenv_vmm_protocol::runtime::*;
         use serde_json::json;
 
@@ -470,9 +468,10 @@ mod component_tests {
         factory.policy.tools = asset.clone();
         factory.build.runner_build_id = format!("sha256:{}", "a".repeat(64));
         factory.build.restore_abi_id = agentenv_vmm_protocol::runtime::RESTORE_ABI_ID.into();
-        let reader =
-            super::super::restore_identity::RestoreReader::from_build(factory.build.clone())
-                .unwrap();
+        let reader = crate::sandbox::dragonball::restore_identity::RestoreReader::from_build(
+            factory.build.clone(),
+        )
+        .unwrap();
         let identity = reader.identity(
             factory.policy.app.resolved_kernel_version().into(),
             factory.policy.app.resolved_tools_version().into(),
@@ -581,7 +580,7 @@ mod component_tests {
             });
             committed.volume_snapshots.push(SnapshotVolume {
                 mount_path: "/mnt/data".into(),
-                mode: crate::volume::VolumeMode::Exclusive,
+                mode: crate::types::VolumeMode::Exclusive,
                 size_mb: 64,
                 layers: vec![],
             });

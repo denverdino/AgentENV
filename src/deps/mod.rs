@@ -91,7 +91,7 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
         bail!("PVM virtualization mode is only supported on x86_64 hosts");
     }
 
-    if crate::sandbox::selected::BACKEND == "firecracker" {
+    if cfg!(feature = "hypervisor-firecracker") {
         std::fs::create_dir_all(deps_path)?;
         ensure_firecracker(config, manifest, &arch).await?;
         ensure_kernel(config, manifest, &arch).await?;

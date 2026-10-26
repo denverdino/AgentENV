@@ -86,7 +86,7 @@ impl RestoreReader {
 pub fn validate_artifact_identity(
     reader: &RestoreReader,
     record: &crate::snapshot::SnapshotRecord,
-    manifest: &crate::sandbox::manifest::SandboxSnapshotManifest,
+    manifest: &crate::snapshot::SandboxSnapshotManifest,
     envelope: &RuntimeSnapshotEnvelope,
 ) -> Result<()> {
     let committed = record
@@ -103,7 +103,7 @@ pub fn validate_artifact_identity(
             && manifest.restore_identity.as_ref() == Some(&envelope.identity)
             && versions.backend == envelope.identity.backend
             && manifest.backend == envelope.identity.backend
-            && manifest.version == crate::sandbox::manifest::MANIFEST_FORMAT_VERSION
+            && manifest.version == crate::snapshot::MANIFEST_FORMAT_VERSION
             && versions.firecracker_version.is_empty()
             && versions.vmm_version.as_deref()
                 == Some(envelope.identity.dragonball_revision.as_str())
@@ -213,7 +213,7 @@ pub fn validate_artifact_identity(
                 && saved.backing_read_only.unwrap_or(saved.read_only) == drive.read_only
                 && saved.capacity_bytes == drive.virtual_size
                 && records[0].size_mb.checked_mul(1 << 20) == Some(drive.virtual_size)
-                && (records[0].mode == crate::volume::VolumeMode::ReadOnly) == drive.read_only,
+                && (records[0].mode == crate::types::VolumeMode::ReadOnly) == drive.read_only,
             "volume device topology conflict"
         );
     }
@@ -270,8 +270,8 @@ pub fn validate_artifact_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord, SnapshotRuntimeVersions};
+    use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
     use agentenv_vmm_protocol::runtime::*;
     use serde_json::json;
 

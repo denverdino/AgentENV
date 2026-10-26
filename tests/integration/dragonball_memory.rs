@@ -274,7 +274,7 @@ async fn incremental_case(memory_mib: u32, failed_publish: bool, zero_rewrite: b
         let alias = agentenv::snapshot::SnapshotAlias::parse("db-m2-rejected-delta")?;
         let mut metadata = publish_metadata(id, &build, &assets, &first)?;
         metadata.alias = Some(alias.clone());
-        manager.publish_captured(metadata, first).await?;
+        agentenv::sandbox::publish_captured(&manager, metadata, first).await?;
         command(
             &restored,
             "printf second | dd of=/dev/shm/db-m2-pages bs=1 seek=4096 conv=notrunc status=none",
@@ -283,14 +283,13 @@ async fn incremental_case(memory_mib: u32, failed_publish: bool, zero_rewrite: b
         let rejected = restored.snapshot().await?;
         let mut metadata = publish_metadata(id, &build, &assets, &rejected)?;
         metadata.alias = Some(alias);
-        let error = manager
-            .publish_captured(metadata, rejected)
+        let error = agentenv::sandbox::publish_captured(&manager, metadata, rejected)
             .await
             .expect_err("alias conflict");
         assert!(
             matches!(
                 error,
-                agentenv::snapshot::RepositoryError::AliasConflict { .. }
+                agentenv::repository::RepositoryError::AliasConflict { .. }
             ),
             "{error:#}"
         );

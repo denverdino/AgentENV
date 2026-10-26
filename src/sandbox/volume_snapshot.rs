@@ -1,10 +1,12 @@
-use super::{
-    envd::EnvdInstance, ublk::OverlaybdRuntimeHandle, Executor, ExtraDrive, ProcessOpts,
-    ProcessOutput,
-};
+#[cfg(feature = "hypervisor-dragonball")]
+use super::{envd::EnvdInstance, Executor, ProcessOpts, ProcessOutput};
+use super::{ublk::OverlaybdRuntimeHandle, ExtraDrive};
 use anyhow::{Context, Result};
-use std::{path::Path, time::Duration};
+use std::path::Path;
+#[cfg(feature = "hypervisor-dragonball")]
+use std::time::Duration;
 
+#[cfg(feature = "hypervisor-dragonball")]
 pub(crate) async fn set_volume_freeze(
     envd: EnvdInstance,
     mount: &Path,

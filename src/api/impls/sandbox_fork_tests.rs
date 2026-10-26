@@ -1,5 +1,5 @@
 use super::*;
-use crate::snapshot::SnapshotVolume;
+use crate::snapshot::{SnapshotCatalog, SnapshotVolume};
 use std::sync::Arc;
 use std::{
     future::{poll_fn, Future},
@@ -13,7 +13,7 @@ async fn fixture() -> anyhow::Result<(tempfile::TempDir, ApiImpl, SandboxMetadat
         image::ImageResolver,
         orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator},
         snapshot::{
-            repository::backends::{PosixFsBackend, PosixFsBackendConfig},
+            backends::{PosixFsBackend, PosixFsBackendConfig},
             SnapshotManager,
         },
         template::TemplateBuilder,

@@ -1,9 +1,9 @@
 //! Firecracker dirty-range adapter for the shared memory writer.
 use super::process_vm_reader::ProcessVmReader;
+use crate::overlaybd::OverlaybdCompactOutput;
 #[cfg(test)]
 use crate::sandbox::memory_snapshot::publish_memory_overlaybd_layer;
 use crate::sandbox::memory_snapshot::{write_memory_overlaybd, MemorySegment};
-use crate::sandbox::ublk::OverlaybdCompactOutput;
 use anyhow::{ensure, Context, Result};
 use firecracker_client::models::DirtyMemoryRanges;
 use nix::unistd::Pid;

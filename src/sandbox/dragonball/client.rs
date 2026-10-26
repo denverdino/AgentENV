@@ -10,7 +10,7 @@ use tokio::{
     net::UnixStream,
 };
 
-pub(super) const M0_REVISION: &str = "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e";
+pub(super) const M0_REVISION: &str = "bc7edb0faf6e109c013a0659dde0c7a502a5f297";
 pub(super) const M0_PROFILE: &str = "m0-mmio-blk-net";
 
 pub(super) struct ProbeClient {

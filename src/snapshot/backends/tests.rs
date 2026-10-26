@@ -69,6 +69,7 @@ fn builder_namespace_preserves_oss_bucket_and_prefix() {
             region: Some("test".to_owned()),
             addressing_style: None,
             cache_max_size_gb: None,
+            timeout_secs: None,
         });
         let builder = builder_snapshot_config(&config);
         assert_eq!(

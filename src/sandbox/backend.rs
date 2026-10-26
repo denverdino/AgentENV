@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
@@ -272,9 +271,9 @@ pub async fn publish_captured(
                 .push(crate::snapshot::SnapshotVolume {
                     mount_path: drive.mount_path().to_string_lossy().into_owned(),
                     mode: if drive.read_only() {
-                        crate::volume::VolumeMode::ReadOnly
+                        crate::types::VolumeMode::ReadOnly
                     } else {
-                        crate::volume::VolumeMode::Exclusive
+                        crate::types::VolumeMode::Exclusive
                     },
                     size_mb: size >> 20,
                     layers,

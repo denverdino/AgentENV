@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const QUALIFIED_DRAGONBALL_REVISION: &str = "9e41795fea9109bc1acf7b1f6d6b878cfff7b72e";
+pub const QUALIFIED_DRAGONBALL_REVISION: &str = "bc7edb0faf6e109c013a0659dde0c7a502a5f297";
 pub const RUNTIME_FEATURE_PROFILE: &str = "db-virtio-blk-net-balloon-v2";
 pub const SNAPSHOT_FORMAT_EPOCH: u16 = 2;
 /// Bump when serialized state or restore semantics become incompatible.

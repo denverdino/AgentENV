@@ -615,6 +615,11 @@ impl ApiImpl {
                 }),
                 Err(err) => {
                     cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
+                    if let Some(message) = hook_client_error_message(&err) {
+                        return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                            Self::error(400, message),
+                        ));
+                    }
                     Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
                         err.into(),
                     ))

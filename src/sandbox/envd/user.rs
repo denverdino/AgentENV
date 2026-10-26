@@ -93,35 +93,6 @@ struct ResolvedUser {
     passwd_entry: Option<String>,
 }
 
-fn append_passwd_script(entry: &str, passwd: &str, busybox: &str) -> String {
-    // Cooperate with shadow's passwd.lock protocol. A plain append can be lost
-    // when guest init's usermod replaces the inode from an earlier read.
-    // Publish a complete PID with a hard link; never remove another writer's lock.
-    format!(
-        r#"set -eu
-passwd={passwd}
-bb={busybox}
-ticket="$passwd.agentenv.$$"
-locked=no
-umask 077
-(set -C; printf '%s\000' "$$" > "$ticket")
-trap '[ "$locked" != yes ] || $bb rm -f -- "$passwd.lock"; $bb rm -f -- "$ticket"' EXIT
-trap 'exit 1' HUP INT TERM
-attempt=0
-until $bb ln -T -- "$ticket" "$passwd.lock" 2>/dev/null; do
-    attempt=$((attempt + 1))
-    [ "$attempt" -lt 100 ] || {{ echo 'timed out acquiring passwd lock' >&2; exit 1; }}
-    $bb sleep 0.05
-done
-locked=yes
-printf '\n%s\n' {entry} >> "$passwd"
-"#,
-        passwd = shell_quote(passwd),
-        busybox = shell_quote(busybox),
-        entry = shell_quote(entry),
-    )
-}
-
 fn parse_id(value: &[u8]) -> Result<u32> {
     let value = std::str::from_utf8(value).context("invalid Dockerfile user/group ID")?;
     let id = value
@@ -381,12 +352,11 @@ mod tests {
         fs::write(&passwd, PASSWD)?;
         fs::write(&lock, format!("{}\0", std::process::id()))?;
         let entry = "aenv-1000-1000:x:1000:1000::/:/bin/sh";
-        // Empty busybox prefix uses host utilities for the exact guest script.
+        // Run the production guest script with env dispatching host utilities.
         let mut child = Command::new("sh")
-            .args([
-                "-ec",
-                &append_passwd_script(entry, passwd.to_str().unwrap(), ""),
-            ])
+            .args(["-ec", ADD_PASSWD_ENTRY, "sh", "env"])
+            .arg(&passwd)
+            .arg(entry)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -398,11 +368,9 @@ mod tests {
                     "account append ignored an existing passwd writer lock"
                 );
                 if fs::read_dir(directory.path())?.any(|entry| {
-                    entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("passwd.agentenv.")
+                    let name = entry.unwrap().file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("passwd.") && name != "passwd.lock"
                 }) {
                     break;
                 }

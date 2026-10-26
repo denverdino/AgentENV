@@ -985,11 +985,10 @@ impl SandboxExecutor for DragonballSandbox {
 
 #[async_trait]
 impl SandboxBackend for DragonballSandbox {
-    fn metrics_sample(
-        &self,
-    ) -> Option<futures::future::BoxFuture<'static, Result<crate::sandbox::SandboxMetric>>> {
-        let envd = self.runtime.as_ref()?.envd.clone();
-        Some(Box::pin(async move { envd.metrics().await }))
+    fn envd(&self) -> Option<Arc<dyn crate::sandbox::EnvdApi>> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| Arc::new(runtime.envd.clone()) as Arc<dyn crate::sandbox::EnvdApi>)
     }
 
     async fn start(&mut self) -> Result<()> {

@@ -7,7 +7,7 @@ use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
 use overlaybd::virtual_file::VirtualFile;
 
-use super::ublk::{create_commit_args, OverlaybdCompactOutput};
+use crate::overlaybd::{create_commit_args, OverlaybdCompactOutput};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemorySegment {

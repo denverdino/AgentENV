@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use tracing::warn;
 
-use super::startup_pack::LocalStartupPrefetch;
 use crate::sandbox::custom_extension::CustomExtensionHookGuard;
 use crate::sandbox::network::{NetworkManager, Slot};
+use crate::sandbox::startup_pack::LocalStartupPrefetch;
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, SharedReadOnlyDevice, UblkDevice};
 
 /// Every host resource acquired while starting a sandbox.
 ///
-/// Store each handle here as soon as it is acquired: a later startup failure
-/// is cleaned up by [`release`](Self::release) on `stop()`, or by `Drop`.
+/// Store each handle here as soon as it is acquired. After confirmed VMM exit,
+/// the sandbox moves the handles into its cancellation-safe cleanup task.
 #[derive(Default)]
 pub(super) struct SandboxResources {
     pub(super) network_slot: Option<Slot>,
@@ -33,7 +33,7 @@ pub(super) struct SandboxResources {
     pub(super) mem_dedicated_device: Option<UblkDevice>,
     pub(super) startup_prefetch_task: Option<LocalStartupPrefetch>,
     pub(super) extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
-    /// Delivers the custom extension stop hook exactly once: `release()` calls
+    /// Delivers the custom extension stop hook exactly once: the cleanup task calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
@@ -57,7 +57,7 @@ impl SandboxResources {
     }
 }
 
-/// Handles cases where `release()` wasn't reached (panic, early return, etc.).
+/// Handles cases where the cleanup task was not started.
 ///
 /// For ublk, devices are managed by the daemon process, so we don't need to
 /// kill any server process. The device ID is NOT recycled on abnormal drop
