@@ -427,11 +427,13 @@ impl DragonballSandbox {
             &app.ublk.overlaybd.global_config_path,
             resources.work.path(),
             app.ublk.overlaybd.runtime_upper_mode,
-            if restore.is_some() {
-                ExtraDrivePrepareMode::Resume
-            } else {
-                ExtraDrivePrepareMode::Fresh {
-                    allow_shrink: false,
+            |_| {
+                if restore.is_some() {
+                    ExtraDrivePrepareMode::Resume
+                } else {
+                    ExtraDrivePrepareMode::Fresh {
+                        allow_shrink: false,
+                    }
                 }
             },
         )

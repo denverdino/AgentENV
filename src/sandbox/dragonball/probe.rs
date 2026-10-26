@@ -347,7 +347,7 @@ impl DragonballM0Probe {
                 &app.ublk.overlaybd.global_config_path,
                 resources.runtime.work.path(),
                 app.ublk.overlaybd.runtime_upper_mode,
-                ExtraDrivePrepareMode::Fresh {
+                |_| ExtraDrivePrepareMode::Fresh {
                     allow_shrink: false,
                 },
             )
