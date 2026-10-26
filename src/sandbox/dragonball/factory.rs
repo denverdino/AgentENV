@@ -447,7 +447,7 @@ mod component_tests {
             virtual_size: Some(64 << 20),
             sub_path: None,
             snapshot_output_dir: None,
-            volume: true,
+            kind: crate::types::ExtraDriveKind::Volume,
         }
     }
 

@@ -49,7 +49,7 @@ use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{
     ExtraDrive, ExtraDriveKind, RuntimeArtifactSet, SandboxId, ROOTFS_DRIVE_ID,
-    USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
+    USER_ROOTFS_DRIVE_ID,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────

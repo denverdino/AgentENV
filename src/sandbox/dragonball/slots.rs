@@ -92,7 +92,7 @@ mod tests {
             virtual_size: Some(size),
             sub_path: None,
             snapshot_output_dir: None,
-            volume: true,
+            kind: crate::types::ExtraDriveKind::Volume,
         }
     }
 

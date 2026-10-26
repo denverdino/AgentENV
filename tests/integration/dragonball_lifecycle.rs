@@ -184,7 +184,7 @@ async fn dragonball_lifecycle_posix_volume_snapshot_rebinds_logical_devices() ->
             virtual_size: Some(saved.size_mb << 20),
             sub_path: None,
             snapshot_output_dir: None,
-            volume: true,
+            kind: agentenv::types::ExtraDriveKind::Volume,
         });
     }
     target_launch.extra_drives.reverse(); // Binding must not depend on catalog/launch order.
@@ -1011,7 +1011,7 @@ async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
             virtual_size: Some(1024 * 1024 * 1024),
             sub_path: None,
             snapshot_output_dir: None,
-            volume: true,
+            kind: agentenv::types::ExtraDriveKind::Volume,
         });
         Some(record)
     } else {
@@ -1058,7 +1058,7 @@ async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
                 virtual_size: Some(1024 * 1024 * 1024),
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: true,
+                kind: agentenv::types::ExtraDriveKind::Volume,
             });
             let ro = ro.as_ref().unwrap();
             manager
@@ -1072,7 +1072,7 @@ async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
                 virtual_size: Some(1024 * 1024 * 1024),
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: true,
+                kind: agentenv::types::ExtraDriveKind::Volume,
             });
         }
         manager.reserve(&data.id, &source_id.to_string()).await?;
@@ -1114,7 +1114,7 @@ async fn fork_isolation(invalid_child: bool, volume: bool) -> Result<()> {
                 virtual_size: Some(1024 * 1024 * 1024),
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: true,
+                kind: agentenv::types::ExtraDriveKind::Volume,
             });
         } else {
             bad.replace_drive_ids
@@ -1345,7 +1345,7 @@ async fn dragonball_lifecycle_pause_preserves_dirty_volume_after_ram_is_deleted(
         mount_path: "/mnt/data".into(),
         virtual_size: Some(128 << 20),
         sub_path: None,
-        volume: true,
+        kind: agentenv::types::ExtraDriveKind::Volume,
     });
     let source_launch = launch(&assets)?;
     let owner = source_launch.sandbox_id.to_string();
@@ -1438,7 +1438,7 @@ async fn dragonball_lifecycle_pause_volume_sync_failure_preserves_running() -> R
         mount_path: "/mnt/data".into(),
         virtual_size: Some(128 << 20),
         sub_path: None,
-        volume: true,
+        kind: agentenv::types::ExtraDriveKind::Volume,
     });
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
         &app,
@@ -1551,7 +1551,7 @@ async fn dragonball_lifecycle_volume_freeze_failure_thaws_prior_mount() -> Resul
             read_only: false,
             virtual_size: Some(1024 * 1024 * 1024),
             sub_path: None,
-            volume: true,
+            kind: agentenv::types::ExtraDriveKind::Volume,
         });
     }
     let factory = DragonballSandboxFactory::new(DragonballRuntimePolicy::from_app_config(
@@ -3439,7 +3439,7 @@ async fn dragonball_lifecycle_readiness_with_user_and_volume_workdir() -> Result
         virtual_size: Some(128 << 20),
         sub_path: None,
         snapshot_output_dir: None,
-        volume: true,
+        kind: agentenv::types::ExtraDriveKind::Volume,
     });
     let mut launch = launch(&assets)?;
     launch.env_vars = Some(HashMap::from([(

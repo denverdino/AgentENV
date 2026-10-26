@@ -125,7 +125,7 @@ async fn slot_launch_cases(cases: &[(u64, bool, usize)]) -> Result<()> {
                 virtual_size: Some(size_mb << 20),
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: true,
+                kind: agentenv::types::ExtraDriveKind::Volume,
             });
         }
         // Equal-capacity disks must bind by their explicit slot/mount identity,

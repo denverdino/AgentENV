@@ -390,7 +390,7 @@ async fn selected_backend_volume_capture_is_immutable_and_fork_uses_latest_cut()
         virtual_size: Some(128 << 20),
         sub_path: None,
         snapshot_output_dir: Some(image.parent().unwrap().into()),
-        volume: true,
+        kind: agentenv::types::ExtraDriveKind::Volume,
     });
     let source_id = SandboxId::new();
     let publication = agentenv::snapshot::SnapshotPublishMetadata {
@@ -451,7 +451,7 @@ async fn selected_backend_volume_capture_is_immutable_and_fork_uses_latest_cut()
             extra_drives: vec![ExtraDrive::Overlaybd {
                 drive_id: child_volume.id, image_config_path: child_volume.backing_image_config.context("child backing")?,
                 read_only: false, mount_path: "/mnt/data".into(), virtual_size: Some(128 << 20),
-                sub_path: None, snapshot_output_dir: None, volume: true,
+                sub_path: None, snapshot_output_dir: None, kind: agentenv::types::ExtraDriveKind::Volume,
             }],
         }];
         let mut child = source.fork(&requests).await?.remove(0)?;
@@ -477,7 +477,7 @@ async fn selected_backend_volume_capture_is_immutable_and_fork_uses_latest_cut()
             extra_drives: vec![ExtraDrive::Overlaybd {
                 drive_id: restored_volume.id, image_config_path: restored_volume.backing_image_config.context("restored backing")?,
                 read_only: false, mount_path: "/mnt/data".into(), virtual_size: Some(128 << 20),
-                sub_path: None, snapshot_output_dir: None, volume: true,
+                sub_path: None, snapshot_output_dir: None, kind: agentenv::types::ExtraDriveKind::Volume,
             }], ..Default::default()
         })?;
         let result = async {
