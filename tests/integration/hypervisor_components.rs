@@ -474,6 +474,7 @@ async fn selected_backend_volume_capture_is_immutable_and_fork_uses_latest_cut()
         let runnable = snapshots.resolve_runnable(record).await?;
         let mut restored = factory.build_from_snapshot(&runnable, SandboxLaunchConfig {
             sandbox_id: SandboxId::new(), snapshot_id: runnable.record().id.to_string(),
+            extra_drives_in_snapshot: true,
             extra_drives: vec![ExtraDrive::Overlaybd {
                 drive_id: restored_volume.id, image_config_path: restored_volume.backing_image_config.context("restored backing")?,
                 read_only: false, mount_path: "/mnt/data".into(), virtual_size: Some(128 << 20),
