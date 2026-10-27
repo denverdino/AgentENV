@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-6ff213d4.js";
+            window.path_to_searchindex_js = "../../searchindex-2d206df7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-5404fc80.js"></script>
@@ -185,6 +185,11 @@
 <p>To support the complete sandbox lifecycle, your extension should implement the
 following four APIs. AgentENV sends a JSON request to
 <code>POST {url}/sandbox-hook/&lt;hook&gt;</code> when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
+<p>A hook response with a 4xx status rejects the API request with a client error:
+400 for create, cold-create, fork, connect and patch-params, or 409 for resume.
+A hook response with a 5xx status produces a 500 error. The error message includes
+the extension’s status and response body. Use 4xx for invalid caller parameters
+and 5xx for extension-internal failures.</p>
 <div class="table-wrapper">
 <table>
 <thead>

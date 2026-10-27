@@ -389,6 +389,38 @@ components:
         onTimeout:
           $ref: "#/components/schemas/SandboxOnTimeout"
 
+    SandboxLogEntry:
+      required:
+        - timestamp
+        - level
+        - message
+        - fields
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp of the log entry
+        message:
+          type: string
+          description: Log message content
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+
+    SandboxLogsV2Response:
+      required:
+        - logs
+      properties:
+        logs:
+          default: []
+          description: Sandbox logs structured
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxLogEntry"
+
     SandboxMetric:
       description: Metric entry with timestamp and line
       required:
@@ -654,6 +686,10 @@ components:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
           type: array
+          description: >
+            Volumes to mount. If the snapshot already has volume mounts,
+            providing this field, including an empty array, returns HTTP 400.
+            Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
 
@@ -696,8 +732,21 @@ components:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
           type: array
+          description: >
+            Volumes to mount. If the snapshot already has volume mounts,
+            providing this field, including an empty array, returns HTTP 400.
+            Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        attachedDrives:
+          allOf:
+            - $ref: "#/components/schemas/AttachedDrives"
+          description: >
+            Drives to attach at launch. If the snapshot already has volume
+            mounts or attached drives, providing this field, including an empty
+            array, returns HTTP 400. Omit this field to restore the snapshot's
+            drives. If the sandbox is later snapshotted, current drive state is
+            captured into the snapshot.
 
     ResumedSandbox:
       properties:
@@ -715,7 +764,10 @@ components:
         image:
           type: string
           description: >
-            Explicit external OCI image reference to use as the sandbox rootfs.
+            External OCI image reference, published OverlayBD description
+            digest (sha256:...), or image tag (aenv/name[:tag]) to use as the
+            sandbox rootfs. Published images and tags are resolved from the
+            configured shared repository.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
         timeout:
@@ -1081,6 +1133,16 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        imageOnly:
+          type: boolean
+          default: false
+          description: >
+            AgentENV extension. Build a reusable image instead of a template.
+            The required name and the tags name the image, referenced as
+            aenv/name:tag; an omitted tag means latest. cpuCount and memoryMB
+            do not apply. Start the build with the Dockerfile builder;
+            completion publishes the image and points its tags at it, and no
+            template is created.
 
     TemplateBuilderRequest:
       type: object
@@ -1106,6 +1168,72 @@ components:
           type: string
           description: Required BuildKit image exporter name for this build. The server observes its successful completion and automatically imports and publishes the template.
 
+    FromImageRegistry:
+      oneOf:
+        - $ref: "#/components/schemas/AwsRegistry"
+        - $ref: "#/components/schemas/GcpRegistry"
+        - $ref: "#/components/schemas/GeneralRegistry"
+      discriminator:
+        propertyName: type
+        mapping:
+          aws: "#/components/schemas/AwsRegistry"
+          gcp: "#/components/schemas/GcpRegistry"
+          registry: "#/components/schemas/GeneralRegistry"
+
+    AwsRegistry:
+      type: object
+      required:
+        - type
+        - awsAccessKeyId
+        - awsSecretAccessKey
+        - awsRegion
+      properties:
+        type:
+          type: string
+          enum: [aws]
+          description: Type of registry authentication
+        awsAccessKeyId:
+          type: string
+          description: AWS Access Key ID for ECR authentication
+        awsSecretAccessKey:
+          type: string
+          description: AWS Secret Access Key for ECR authentication
+        awsRegion:
+          type: string
+          description: AWS Region where the ECR registry is located
+
+    GcpRegistry:
+      type: object
+      required:
+        - type
+        - serviceAccountJson
+      properties:
+        type:
+          type: string
+          enum: [gcp]
+          description: Type of registry authentication
+        serviceAccountJson:
+          type: string
+          description: Service Account JSON for GCP authentication
+
+    GeneralRegistry:
+      type: object
+      required:
+        - type
+        - username
+        - password
+      properties:
+        type:
+          type: string
+          enum: [registry]
+          description: Type of registry authentication
+        username:
+          type: string
+          description: Username to use for the registry
+        password:
+          type: string
+          description: Password to use for the registry
+
     TemplateBuildStartV2:
       type: object
       properties:
@@ -1115,6 +1243,9 @@ components:
         fromTemplate:
           type: string
           description: Template to use as a base for the template build
+        fromImageRegistry:
+          $ref: "#/components/schemas/FromImageRegistry"
+          description: Temporary credentials for standard OCI base images.
         force:
           default: false
           type: boolean
@@ -1217,6 +1348,10 @@ components:
           $ref: "#/components/schemas/TemplateBuildStatus"
         reason:
           $ref: "#/components/schemas/BuildStatusReason"
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: AgentENV extension. Published image of a ready imageOnly build, usable as a sandbox image reference.
 
     TemplateBuildLogsResponse:
       required:
@@ -1691,7 +1826,7 @@ paths:
           type: string
     put:
       summary: Prepare the BuildKit worker for a template build
-      description: Start a BuildKit worker for the template build
+      description: Start a BuildKit worker for the template build. For an imageOnly build, completion publishes the image and points its tags at it instead of publishing a template, and startCmd and readyCmd are rejected.
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -1887,6 +2022,65 @@ paths:
           $ref: '#/components/responses/401'
         '500':
           $ref: '#/components/responses/500'
+
+  /v2/sandboxes/{sandboxID}/logs:
+    get:
+      summary: Sandbox logs (v2)
+      description: Get sandbox logs
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+        - in: query
+          name: cursor
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Starting timestamp of the logs that should be returned in milliseconds
+        - in: query
+          name: limit
+          schema:
+            default: 1000
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 1000
+          description: Maximum number of logs that should be returned
+        - in: query
+          name: direction
+          schema:
+            $ref: "#/components/schemas/LogsDirection"
+          description: Direction of the logs that should be returned
+        - in: query
+          name: level
+          schema:
+            $ref: "#/components/schemas/LogLevel"
+          description: Minimum log level to return. Logs below this level are excluded
+        - in: query
+          name: search
+          schema:
+            type: string
+            maxLength: 256
+          description: Case-sensitive substring match on log message content
+      responses:
+        "200":
+          description: Successfully returned the sandbox logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxLogsV2Response"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
 
   /sandboxes/{sandboxID}:
     get:
@@ -2450,11 +2644,31 @@ paths:
           $ref: "#/components/responses/404"
         "500":
           $ref: "#/components/responses/500"
+    delete:
+      description: Delete a single snapshot by its ID or alias. Only sandbox-sourced snapshots can be deleted through this endpoint; template builds must be deleted through the template APIs.
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      responses:
+        "204":
+          description: The snapshot was deleted successfully
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
 
   /v3/templates:
     post:
       summary: Create template (v3)
-      description: Create a new template
+      description: Create a new template, or with imageOnly, a build that publishes a reusable image
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -2593,7 +2807,7 @@ paths:
           $ref: "#/components/responses/500"
     delete:
       summary: Delete template
-      description: Delete a template
+      description: Delete a template. For an imageOnly build, delete its build record and logs; the published image and its tags are kept.
       tags: [templates]
       security:
         - ApiKeyAuth: []

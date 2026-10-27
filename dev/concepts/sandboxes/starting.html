@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-6ff213d4.js";
+            window.path_to_searchindex_js = "../../searchindex-2d206df7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-5404fc80.js"></script>
@@ -206,7 +206,9 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 <tbody>
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="./auto-eviction.html">Auto-Eviction</a>.</td></tr>
-<tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes.</td></tr>
+<tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. Not allowed when the snapshot already has volume mounts.</td></tr>
+<tr><td><code>--image-mount &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a writable drive from an image; see <a href="#attach-image-drives">Attach image drives</a>. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives.</td></tr>
+<tr><td><code>--image-mount-ro &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a read-only drive from an image. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -237,13 +239,15 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference.</td></tr>
+<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference, published image digest (<code>sha256:...</code>), or image tag (<code>aenv/name:tag</code>).</td></tr>
 <tr><td><code>--cold</code></td><td>Required for an OCI image</td><td>Cold start directly from <code>&lt;image&gt;</code>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="./auto-eviction.html">Auto-Eviction</a>.</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Source image virtual size</td><td>Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes.</td></tr>
+<tr><td><code>--image-mount &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a writable drive from an image; see <a href="#attach-image-drives">Attach image drives</a>. Repeatable.</td></tr>
+<tr><td><code>--image-mount-ro &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a read-only drive from an image. Repeatable.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -260,6 +264,84 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as <code>diskSizeMB</code>.</p>
+<h2 id="attach-image-drives"><a class="header" href="#attach-image-drives">Attach image drives</a></h2>
+<p>Warm and cold starts can attach image filesystems as drives at guest paths:</p>
+<pre><code class="language-bash">aenv start my-template \
+  --image-mount /workspace=aenv/repo:main \
+  --image-mount-ro /mnt/models=aenv/models:v1
+</code></pre>
+<p>The CLI sends these as <code>attachedDrives</code> entries, on <code>POST /v2/sandboxes</code> for
+warm starts and on <code>POST /sandboxes-cold</code> for cold starts. Each entry has a
+<code>driveID</code>, a <code>source.image</code>, and optional <code>mountPath</code>, <code>subPath</code>, <code>readOnly</code>,
+and <code>diskSizeMB</code>. The API defaults <code>readOnly</code> to <code>true</code>; the CLI sets it to
+<code>false</code> for <code>--image-mount</code> and derives <code>driveID</code> from the mount path, such as
+<code>image_mnt_models</code> for <code>/mnt/models</code>. The image accepts the same references as
+a cold-start <code>&lt;image&gt;</code>.</p>
+<p>An attached drive belongs to its sandbox and is removed with it. Writes are not
+kept elsewhere; use a <a href="../volumes/index.html">volume</a> for data that must outlive
+the sandbox.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Attached drives</th></tr>
+</thead>
+<tbody>
+<tr><td>Snapshot</td><td>Captures each drive’s current state into the snapshot.</td></tr>
+<tr><td>Launch from a snapshot</td><td>Restores the captured drives. Providing <code>attachedDrives</code>, including an empty array, is rejected when the snapshot has volume mounts or attached drives.</td></tr>
+<tr><td>Fork</td><td>Gives each child its own copy of the drive state.</td></tr>
+<tr><td>Pause and resume</td><td>Keeps the drives and their writes.</td></tr>
+</tbody>
+</table>
+</div>
+<p>On a warm start, attached drives and new volumes share the snapshot’s reserved
+drive slots, so their combined count cannot exceed the slots it has free.
+Snapshots captured before reserved slots existed have none.</p>
+<h2 id="build-reusable-images"><a class="header" href="#build-reusable-images">Build reusable images</a></h2>
+<p>To build a standalone image, run <code>aenv build --image --name my-app ./app</code>. The
+command prints the published <code>sha256:...</code> reference on stdout; build progress
+goes to stderr. Use that reference, or a tag such as <code>aenv/my-app:latest</code>, in a
+sandbox <code>image</code> field, or cold start it with <code>aenv start --cold sha256:...</code>.
+Dockerfile, build arguments, secrets, cache, progress, and timeout flags work as
+for template builds. Startup overrides and sandbox resource flags do not apply
+to image builds; worker resources come from the server configuration.</p>
+<p>Images are referenced by the SHA256 of its canonical OverlayBD
+image description (<code>sha256:...</code>), rather than its original OCI manifest digest.
+The description binds the ordered layer digests, platform, and OCI runtime
+configuration, including entrypoint, command, environment, and healthcheck.
+Descriptions live at <code>images/descriptions/{digest}.json</code>; layer data uses the
+same content-addressed managed-layer storage as snapshots. Node-local paths are
+materialized on resolution and are not part of the image identity.</p>
+<p>Builders and runtime nodes must use the same repository. Every compatible node
+with repository access can resolve an image independently of the build node’s
+cache. Local cache eviction does not remove published images. With a POSIX
+backend, cross-node use requires a shared filesystem. Publication completes
+before status becomes <code>ready</code>; failed publication does not expose a usable build
+result. Uploaded immutable objects may remain for reuse after a failed build.</p>
+<p>Image builds use the template build API. <code>POST /v3/templates</code> with
+<code>"imageOnly": true</code> creates the build; <code>name</code> (optionally <code>name:tag</code>) and <code>tags</code>
+name the image, and no template is created. The builder, status, and logs
+endpoints under <code>/templates/{templateID}/builds/{buildID}</code> then work as for a
+Dockerfile template build, and a ready status reports <code>imageDigest</code>. The build
+record lives at <code>images/builds/{buildID}.json</code>, so any node reports the
+status after the worker exits. <code>DELETE /templates/{templateID}</code> removes the
+build record and logs and keeps the published image and its tags. Upgrade the
+server, gateway, and CLI together to use image builds.</p>
+<h3 id="tag-images"><a class="header" href="#tag-images">Tag images</a></h3>
+<p>An image tag is a mutable <code>name:tag</code> pointer to one image built under that
+name. Reference it as <code>aenv/name:tag</code> wherever a <code>sha256:...</code> image reference
+is accepted, for example <code>aenv start --cold aenv/my-app:v1</code>. Omitting <code>:tag</code>
+means <code>latest</code>. The name uses lowercase letters and digits joined by single
+<code>.</code>, <code>_</code>, or <code>-</code>; the tag uses letters, digits, <code>.</code>, <code>_</code>, and <code>-</code> and does not
+start with <code>.</code> or <code>-</code>. Each is at most 128 characters. Short names under
+<code>aenv/</code> always refer to tags; reference an OCI image in a registry’s <code>aenv</code>
+namespace by its full name, such as <code>docker.io/aenv/app:v1</code>.</p>
+<p>Tags belong to their image name, like template tags. A build points the tag in
+<code>--name NAME:TAG</code> and every <code>--tag TAG</code> at its image, or <code>latest</code> if neither is
+given. Tags live at <code>images/tags/{name}/{tag}.json</code> in the shared repository.</p>
+<p>A tag resolves to its digest when a sandbox, volume, or template build uses it.
+Sandboxes, snapshots, and node caches record only the digest, so moving a tag
+later does not change existing workloads. Each tag resolution reads one more
+repository object than a digest reference.</p>
 
                     </main>
 
